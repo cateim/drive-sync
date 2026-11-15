@@ -187,9 +187,13 @@ that list instead of a fix:
 1. The headline counts the files, the card says "press D", and the bar names
    the cause. Nothing syncs until it is answered.
 2. `D` opens the list, split by side. A file gone from the cloud would be
-   deleted on the notebook, for good: those come first, marked `↓`. A file
-   gone from the notebook would go to the Drive trash (`↑`). The window
-   shows the first 500; `drive-sync deletes --list` prints all of them.
+   deleted on the notebook: those come first, marked `↓`, and the run you
+   let through moves them to
+   `~/.local/state/drive-sync-app/allowed-backup/<time of the stop>` instead
+   (with any notebook file it overwrites). A file gone from the notebook
+   would go to the Drive trash (`↑`). The window shows the first 500;
+   `drive-sync deletes --list` prints all of them. That folder is never
+   emptied by DriveSync: delete it once you are sure.
 3. To let them through, type how many files the list has and press `Enter`.
    One run starts with the guard raised just enough for them, never
    `--force`; the run after it has the guard again.
@@ -199,7 +203,12 @@ that list instead of a fix:
    usual guard, stops again, and `D` shows the new list. The run's own
    listing, a minute after the dry run, still has one raised guard for both
    sides: confirming 1,800 deletions out of 33,000 lets either side lose up to
-   6% in that listing.
+   6% in that listing. Each side's guard is counted against that side's own
+   listing, as bisync checks it.
+5. After that run, DriveSync compares what it deleted with the list you
+   confirmed. Anything more is written to the log, named on a card and in the
+   window, with where it went: the backup folder above for the notebook, the
+   Drive trash for the cloud.
 
 The confirmation lasts for one run and expires after 30 minutes, in case the
 run never started (a pause set right after it). When the files should not go,

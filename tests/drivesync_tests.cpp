@@ -8,6 +8,10 @@
 #include <QJsonObject>
 #include <QMap>
 #include <QProcess>
+#include <QQmlComponent>
+#include <QQmlContext>
+#include <QQmlEngine>
+#include <QQmlPropertyMap>
 #include <QRegularExpression>
 #include <QScopeGuard>
 #include <QStandardPaths>
@@ -227,7 +231,19 @@ bool startNamedHolder(QProcess &holder, const QString &dir, const QString &name)
     if (sleepTool.isEmpty() || !QFile::link(sleepTool, program))
         return false;
     holder.start(program, {"30"});
-    return holder.waitForStarted();
+    if (!holder.waitForStarted())
+        return false;
+    // QProcess can report the start before the child's exec shows in /proc,
+    // and the lock check reads argv[0] there: wait until it does.
+    QDeadlineTimer deadline(5000);
+    while (!deadline.hasExpired()) {
+        QFile cmdline(QString("/proc/%1/cmdline").arg(holder.processId()));
+        if (cmdline.open(QIODevice::ReadOnly)
+            && QFileInfo(QString::fromLocal8Bit(cmdline.readAll().split('\0').value(0))).fileName() == name)
+            return true;
+        QThread::msleep(5);
+    }
+    return false;
 }
 
 QStringList calls(const QString &dir) {
@@ -2101,6 +2117,74 @@ private slots:
         QVERIFY2(sent.at(0).contains("would delete 11 files"), qPrintable(sent.at(0)));
         QVERIFY(sent.at(0).contains("press D"));
         QVERIFY(sent.at(0).contains("-u critical"));  // nothing syncs until it is answered
+    }
+
+    void notifyCardsANewGuardStopAtOnce()
+    {
+        // Every tick stops again at the guard while nobody answers: the same
+        // list is the same stop, shown hourly. Another list, or the run that
+        // was let through stopping again, is news and shows at once.
+        QTemporaryDir dir;
+        const BackendPaths paths = controlPaths(dir.path(), true);
+        const NotifierPaths tools = fakeNotifier(dir.path());
+        const QDateTime t0 = QDateTime::currentDateTime().addSecs(-7200);
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        QString log = abortedRun(t0, {}, numberedFiles("f%1.txt", 11), 21);
+        const auto stop = [&](int minutes, const QString &before, int files) {
+            log += before + abortedRun(t0.addSecs(minutes * 60), {}, numberedFiles("f%1.txt", files), 21);
+            QVERIFY(write(paths.log, log.toUtf8()));
+            QCOMPARE(runNotifyCommand("exit-code", paths, tools, now.addSecs(minutes * 60)), 0);
+        };
+        QVERIFY(write(paths.log, log.toUtf8()));
+        QCOMPARE(runNotifyCommand("exit-code", paths, tools, now), 0);
+        QCOMPARE(notifications(dir.path()).size(), 1);
+        stop(15, QString(), 11);
+        QCOMPARE(notifications(dir.path()).size(), 1);  // the same stop again
+        stop(30, QString(), 13);
+        QCOMPARE(notifications(dir.path()).size(), 2);  // two more files: a new list
+        QVERIFY2(notifications(dir.path()).at(1).contains("would delete 13 files"),
+                 qPrintable(notifications(dir.path()).at(1)));
+        const QString kept = line(t0.addSecs(45 * 60), "INFO",
+                                  "DriveSync kept --max-delete at 5% for this run: a dry run finds 1 deletion not in "
+                                  "the list that was confirmed (gone from the cloud: 0, gone from the notebook: 13)");
+        stop(45, kept, 13);
+        QCOMPARE(notifications(dir.path()).size(), 3);  // the run let through stopped again
+        QVERIFY2(notifications(dir.path()).at(2).contains("The run you let through kept the usual guard"),
+                 qPrintable(notifications(dir.path()).at(2)));
+        stop(60, QString(), 13);
+        QCOMPARE(notifications(dir.path()).size(), 3);
+    }
+
+    void backendShowsWhyTheGuardWasKept()
+    {
+        // The note drive-sync run writes before rclone starts reaches the
+        // window with the stop after it, never with a later one.
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-1800);
+        const QString kept = line(start.addSecs(899), "INFO",
+                                  "DriveSync kept --max-delete at 5% for this run: its dry run with the raised guard "
+                                  "still stopped, so more files would go than the 11 confirmed");
+        const QString log = abortedRun(start, {}, numberedFiles("f%1.txt", 11), 21) + kept
+                            + abortedRun(start.addSecs(900), {}, numberedFiles("f%1.txt", 13), 21);
+        const auto blocked = blockedDeletes(log, 500);
+        QVERIFY(blocked.has_value());
+        QCOMPARE(blocked->keptReason, QString("stillStopped"));
+        const auto later = blockedDeletes(log + abortedRun(start.addSecs(1800), {}, numberedFiles("f%1.txt", 13), 21), 500);
+        QVERIFY(later.has_value());
+        QVERIFY(later->keptReason.isEmpty());
+        // A file named like the note is not one.
+        const QString named = abortedRun(start, {}, {"DriveSync kept --max-delete at 5% for this run: x was dropped"}, 21);
+        QVERIFY(blockedDeletes(named + abortedRun(start.addSecs(900), {}, {"a"}, 21), 500)->keptReason.isEmpty());
+
+        QTemporaryDir dir;
+        QDir(dir.path()).mkpath("Drive");
+        QVERIFY(write(dir.filePath("drive-sync.log"), log.toUtf8()));
+        BackendPaths paths{dir.filePath("drive-sync.log"), dir.filePath("Drive"), dir.filePath("state"),
+                           dir.filePath("proc"), fakeSystemctl(dir.path(), start),
+                           QStandardPaths::findExecutable("find"), dir.filePath("app")};
+        paths.managed = true;
+        Backend backend(paths);
+        QTRY_COMPARE(backend.blockedCount(), 13);
+        QCOMPARE(backend.blockedKeptReason(), QString("stillStopped"));
     }
 
     // The card's time shows the hours of the bar clock, not the language's own.
@@ -4474,6 +4558,49 @@ private slots:
         QVERIFY(fixCommand(s, {"--start"}).contains("too many"));
     }
 
+    void readRecentFindsTheRunStartAtALineStart()
+    {
+        // A file named like the run's start line, near the end of a stop
+        // longer than the tail, must not end the search: only a whole
+        // "Synching Path1" line starts a run. Both sides deleted, so the
+        // log is several times the tail, and the reading stays fast.
+        QTemporaryDir dir;
+        FixSetup s = makeFixSetup(dir.path());
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-600);
+        QStringList notebook = numberedFiles("Projects/a folder with a long name/sub/file-%1.txt", 25000);
+        notebook.last() = "notes/2026/11/12 18:41:19 INFO  : Synching Path1 copy.txt";
+        const QString log = successfulRun(start.addSecs(-7200), 480)
+                            + abortedRun(start, numberedFiles("Photos/an album with a long name/img-%1.jpg", 25000),
+                                         notebook, 50411);
+        QVERIFY(log.toUtf8().size() > 2 * kTailBytes);
+        QVERIFY(write(s.config.logFile, log.toUtf8()));
+
+        bool found = false, truncated = false;
+        const QString text = SyncLog::readRecent(s.config.logFile, kTailBytes, &found, &truncated);
+        QVERIFY(found);
+        // The second step reaches the file's start: every line, none lost or
+        // read twice where the tail and the chunk before it meet.
+        QVERIFY(!truncated);
+        QVERIFY(text == log);
+        const auto blocked = blockedDeletes(text, 500);
+        QVERIFY(blocked.has_value());
+        QCOMPARE(blocked->count, 50000);
+        QCOMPARE(blocked->notebookCount, 25000);
+
+        BackendPaths paths{s.config.logFile, dir.filePath("Drive"), dir.filePath("state"), dir.filePath("proc"),
+                           fakeSystemctl(dir.path(), start), QStandardPaths::findExecutable("find"), dir.filePath("app")};
+        paths.managed = true;
+        QString out, err;
+        QTextStream o(&out), e(&err);
+        QElapsedTimer timer;
+        timer.start();
+        QCOMPARE(runStatusCommand({"--json"}, paths, o, e), 0);
+        const qint64 elapsed = timer.elapsed();
+        qInfo("status --json over a %lld-byte stop: %lld ms", qint64(log.toUtf8().size()), elapsed);
+        QVERIFY2(elapsed < 2000, qPrintable(QString::number(elapsed)));
+        QCOMPARE(QJsonDocument::fromJson(out.toUtf8()).object().value("causeKind").toString(), QString("maxDelete"));
+    }
+
     void maxDeletePercentRoundsUp()
     {
         // rclone compares the real percentage (tried 2026-11-12): 11 of 21
@@ -4578,6 +4705,42 @@ private slots:
         QVERIFY(write(config.filtersFile, "- changed/**\n"));
         QVERIFY(runCommandPlan(config, &refusal, allow).isEmpty());
         QVERIFY(refusal.contains("so bisync would lose its base"));
+    }
+
+    void runPlanRaisesTheGuardPerSide()
+    {
+        // rclone checks each side against that side's own listing, Path1
+        // first, so the abort line's total is Path1's: 10 of 40 there, while
+        // 11 of the notebook's 21 is the side that needs the most.
+        QTemporaryDir dir;
+        SyncConfig config = oldUnitConfig();  // --max-delete 5
+        config.workDir = dir.filePath("work");
+        QVERIFY(QDir().mkpath(config.workDir));
+        config.filtersFile = dir.filePath("filters.txt");
+        QVERIFY(write(config.filtersFile, "- .git/**\n"));
+        QVERIFY(write(config.filtersFile + ".md5", QCryptographicHash::hash("- .git/**\n", QCryptographicHash::Md5).toHex()));
+        const QDateTime when = QDateTime::currentDateTimeUtc().addSecs(-3600);
+        QByteArray cloud = "# bisync listing v1\n", notebook = cloud;
+        for (int i = 1; i <= 40; ++i)
+            cloud += listingLine(QString("f%1.txt").arg(i), 1, when);
+        for (int i = 1; i <= 21; ++i)
+            notebook += listingLine(QString("f%1.txt").arg(i), 1, when);
+        const QString session = config.workDir + "/" + bisyncSessionName(config.remote, config.localPath);
+        QVERIFY(write(session + ".path1.lst", cloud));
+        QVERIFY(write(session + ".path2.lst", notebook));
+        AllowDeletes allow;
+        allow.count = 21;
+        allow.cloudCount = 10;
+        allow.notebookCount = 11;
+        allow.total = 40;
+        QString refusal;
+        const QStringList raised = runCommandPlan(config, &refusal, allow);
+        QCOMPARE(raised.value(raised.indexOf("--max-delete") + 1), QString("53"));
+        // Never below the configured guard.
+        allow.cloudCount = 1;
+        allow.notebookCount = 1;
+        const QStringList small = runCommandPlan(config, &refusal, allow);
+        QCOMPARE(small.value(small.indexOf("--max-delete") + 1), QString("5"));
     }
 
     void allowWritesTheMarkAndStartsARun()
@@ -5007,7 +5170,13 @@ private slots:
             *s = makeFixSetup(dir);
             QVERIFY(write(s->config.filtersFile + ".md5",
                           QCryptographicHash::hash(readBytes(s->config.filtersFile), QCryptographicHash::Md5).toHex()));
-            QVERIFY(baseListings(*s));
+            // 21 files on each side, as the abort line says: the raised guard
+            // is counted against each side's listing.
+            QByteArray body = "# bisync listing v1\n";
+            for (int i = 1; i <= 21; ++i)
+                body += listingLine(QString("f%1.txt").arg(i), 1, QDateTime::currentDateTimeUtc().addSecs(-3600));
+            const QString session = s->config.workDir + "/" + bisyncSessionName(s->config.remote, s->config.localPath);
+            QVERIFY(write(session + ".path1.lst", body) && write(session + ".path2.lst", body));
             const QDateTime start = QDateTime::currentDateTime().addSecs(-300);
             QVERIFY(write(s->config.logFile, (successfulRun(start.addSecs(-1800), 480)
                                               + abortedRun(start, {}, numberedFiles("f%1.txt", 11), 21))
@@ -5054,6 +5223,376 @@ private slots:
             QVERIFY2(normalRun(dir.path()).contains("--max-delete 5 "), qPrintable(normalRun(dir.path())));
             QVERIFY(readBytes(s.config.logFile).contains("not in the list that was confirmed"));
         }
+    }
+
+    void allowAndDAgreeOnAFixAfterTheAnswersFailed()
+    {
+        // The fix's final step stopped at the guard, D sent it back, and this
+        // time it failed on an answer, before its run: the guard stop is still
+        // the newest run, so D and --allow both still offer the run.
+        QTemporaryDir dir;
+        FixSetup s = makeFixSetup(dir.path());
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-300);
+        QVERIFY(write(s.config.logFile, (successfulRun(start.addSecs(-1800), 480)
+                                          + abortedRun(start, {}, numberedFiles("f%1.txt", 11), 21))
+                                             .toUtf8()));
+        FixState failed = fixAt("failed");
+        failed.failedStep = "finishing";
+        failed.error = "could not mark a.txt in the cloud: no network";
+        QVERIFY(writeFix(s.paths.appState, failed));
+
+        QVERIFY(QDir().mkpath(dir.filePath("view")));
+        BackendPaths view{s.config.logFile, s.config.localPath, dir.filePath("state"), dir.filePath("proc"),
+                          fakeSystemctl(dir.filePath("view"), start), QStandardPaths::findExecutable("find"),
+                          s.paths.appState};
+        view.managed = true;
+        Backend backend(view);
+        QTRY_COMPARE(backend.blockedCount(), 11);
+        QTRY_VERIFY(backend.deletesHeld());
+        QCOMPARE(deletesCommand(s.paths, {"--allow", "11"}).value("ok").toBool(), true);
+        QCOMPARE(readFix(s.paths.appState).step, QString("finishing"));
+
+        // A fix at any other step holds every run: neither offers it.
+        QVERIFY(QFile::remove(allowDeletesPath(s.paths.appState)));
+        QVERIFY(writeFix(s.paths.appState, fixAt("questions")));
+        QTRY_VERIFY(!backend.deletesHeld());
+        QVERIFY(deletesCommand(s.paths, {"--allow", "11"}).value("error").toString().contains("a fix is under way"));
+        QVERIFY(!QFile::exists(allowDeletesPath(s.paths.appState)));
+    }
+
+    void deleteDialogClosesWhenNothingIsHeld()
+    {
+        // The real DeleteDialog.qml over a stand-in backend: a run that
+        // starts, or a list that goes, takes the dialog away instead of
+        // leaving it open on a count of 0 with its button off.
+        QQmlEngine engine;
+        QQmlPropertyMap backend, theme;
+        const auto hold = [&backend](bool held, int count) {
+            QVariantList list;
+            for (int i = 1; i <= count; ++i)
+                list << QVariantMap{{"path", QString("f%1.txt").arg(i)}, {"deletedInCloud", false}};
+            backend.insert("blockedList", list);
+            backend.insert("blockedCount", count);
+            backend.insert("blockedCloudCount", 0);
+            backend.insert("blockedNotebookCount", count);
+            backend.insert("deletesHeld", held);
+        };
+        hold(true, 11);
+        theme.insert("radius", 8);
+        theme.insert("accent", QColor("#7aa2f7"));
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        QQmlComponent component(&engine);
+        component.setData(QString("import QtQuick\nimport QtQuick.Controls\nimport \"%1\"\n"
+                                  "ApplicationWindow { width: 800; height: 600; visible: true\n"
+                                  "  property alias dialog: d\n  DeleteDialog { id: d } }\n")
+                              .arg(QUrl::fromLocalFile(QString(SRCDIR) + "/../src").toString())
+                              .toUtf8(),
+                          QUrl());
+        std::unique_ptr<QObject> window(component.create());
+        QVERIFY2(window, qPrintable(component.errorString()));
+        QObject *dialog = window->property("dialog").value<QObject *>();
+        QVERIFY(dialog);
+        const auto open = [dialog]() {
+            QMetaObject::invokeMethod(dialog, "open");
+            QTRY_VERIFY(dialog->property("visible").toBool());
+        };
+
+        open();
+        hold(false, 11);  // a run started: the status is no longer failed
+        QTRY_VERIFY(!dialog->property("visible").toBool());
+
+        hold(true, 11);
+        open();
+        hold(false, 0);  // the stop is gone from the newest run
+        QTRY_VERIFY(!dialog->property("visible").toBool());
+    }
+
+    void allowedRunBacksUpWhatItDeletesOnTheNotebookWithRealRclone()
+    {
+        const QString rclone = QStandardPaths::findExecutable("rclone");
+        if (rclone.isEmpty())
+            QSKIP("rclone is not installed");
+        // 11 files gone from the cloud: the run let through deletes them on
+        // the notebook, and --backup-dir2 keeps them in DriveSync's state.
+        QTemporaryDir dir;
+        QDir d(dir.path());
+        for (const char *folder : {"cloud", "notebook", "work"})
+            d.mkpath(folder);
+        for (int i = 1; i <= 21; ++i)
+            QVERIFY(write(dir.filePath(QString("cloud/f%1.txt").arg(i)), QByteArray::number(i)));
+        SyncConfig config;
+        config.remote = dir.filePath("cloud");
+        config.localPath = dir.filePath("notebook");
+        config.workDir = dir.filePath("work");
+        config.filtersFile = dir.filePath("filters.txt");
+        config.logFile = dir.filePath("drive-sync.log");
+        config.rcloneFlags = {"--config", "/dev/null", "--resilient", "--recover", "--max-lock", "2m",
+                              "--max-delete", "5", "--log-level", "INFO"};
+        QVERIFY(write(config.filtersFile, "- *.skip\n"));
+        QProcess base;
+        base.start(rclone, QStringList{"--config", "/dev/null", "bisync", config.remote, config.localPath, "--workdir",
+                                       config.workDir, "--filters-file", config.filtersFile, "--resync", "-q"});
+        base.waitForFinished(60000);
+        QCOMPARE(base.exitCode(), 0);
+        BackendPaths paths = controlPaths(dir.path(), true);
+        paths.log = config.logFile;
+        const auto run = [&]() {
+            QString refusal, note;
+            const QStringList arguments =
+                runPlanTakingMark(config, paths.appState, rclone, QDateTime::currentDateTimeUtc(), &refusal, &note);
+            if (!note.isEmpty())
+                appendToLog(config.logFile, "INFO", note);
+            QProcess p;
+            p.start(rclone, arguments);
+            p.waitForFinished(60000);
+            return p.exitCode();
+        };
+
+        for (int i = 1; i <= 11; ++i)
+            QVERIFY(QFile::remove(dir.filePath(QString("cloud/f%1.txt").arg(i))));
+        QCOMPARE(run(), 1);
+        const auto stopped = blockedDeletes(SyncLog::readRecent(config.logFile, kTailBytes), 500);
+        QVERIFY(stopped.has_value());
+        QCOMPARE(stopped->cloudCount, 11);
+        QCOMPARE(deletesCommand(paths, {"--allow", "11"}).value("ok").toBool(), true);
+        QCOMPARE(run(), 0);
+        QCOMPARE(QDir(config.localPath).entryList(QDir::Files).size(), 10);
+        const QString backup = paths.appState + "/allowed-backup/"
+                               + stopped->runStart.toLocalTime().toString("yyyyMMdd-HHmmss");
+        QCOMPARE(QDir(backup).entryList(QDir::Files).size(), 11);
+        QCOMPARE(readBytes(backup + "/f1.txt"), QByteArray("1"));
+        // Nothing went that was not confirmed.
+        const UnconfirmedDeletes check = checkConfirmedRun(paths.appState, config.logFile);
+        QCOMPARE(check.cloudCount + check.notebookCount, 0);
+        QVERIFY(!readUnconfirmedDeletes(paths.appState).has_value());
+        QVERIFY(!readBytes(config.logFile).contains("not in the confirmed list"));
+    }
+
+    void notifyNamesDeletionsNobodyConfirmed()
+    {
+        // Between the dry run and the run let through, one more file went on
+        // each side. The run's own lines say so: the log, the card and the
+        // window name them and where they went.
+        QTemporaryDir dir;
+        const BackendPaths paths = controlPaths(dir.path(), true);
+        QDir(dir.path()).mkpath("Drive");
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-30);
+        ConfirmedRun confirmed;
+        confirmed.at = QDateTime::currentDateTimeUtc().addSecs(-60);
+        confirmed.backupDir = paths.appState + "/allowed-backup/20261114-120000";
+        for (int i = 1; i <= 11; ++i)
+            confirmed.confirmed << QString("2:f%1.txt").arg(i);
+        QVERIFY(writeConfirmedRun(paths.appState, confirmed));
+        QString log = line(start, "INFO", R"(Synching Path1 "gdrive{x}:/" with Path2 "/home/someone/Drive/")");
+        log += line(start, "INFO", change("Path1", "File was deleted", "c1.txt"));
+        for (int i = 1; i <= 12; ++i)
+            log += line(start, "INFO", change("Path2", "File was deleted", QString("f%1.txt").arg(i)));
+        log += line(start.addSecs(20), "INFO", "Bisync successful");
+        QVERIFY(write(paths.log, log.toUtf8()));
+
+        const NotifierPaths tools = fakeNotifier(dir.path());
+        QCOMPARE(runNotifyCommand("success", paths, tools, QDateTime::currentDateTimeUtc()), 0);
+        const QStringList sent = notifications(dir.path());
+        QCOMPARE(sent.size(), 1);
+        QVERIFY2(sent.at(0).contains("Drive deleted files you did not confirm"), qPrintable(sent.at(0)));
+        QVERIFY2(sent.at(0).contains("2 files"), qPrintable(sent.at(0)));
+        QVERIFY2(sent.at(0).contains(confirmed.backupDir), qPrintable(sent.at(0)));
+        QVERIFY(readBytes(paths.log).contains("NOTICE: DriveSync: the run let through deleted 2 files that were not "
+                                              "in the confirmed list"));
+        // The log line is no run of its own: the headline stays on the success.
+        QCOMPARE(SyncLog::parse(QString::fromUtf8(readBytes(paths.log))).last().outcome, QString("success"));
+        const auto extra = readUnconfirmedDeletes(paths.appState);
+        QVERIFY(extra.has_value());
+        QCOMPARE(extra->cloudCount, 1);
+        QCOMPARE(extra->notebookCount, 1);
+        // Checked once: the next notify has nothing more to say.
+        QCOMPARE(runNotifyCommand("success", paths, tools, QDateTime::currentDateTimeUtc()), 0);
+        QCOMPARE(notifications(dir.path()).size(), 1);
+
+        BackendPaths view{paths.log, dir.filePath("Drive"), dir.filePath("state"), dir.filePath("proc"),
+                          fakeSystemctl(dir.path(), start), QStandardPaths::findExecutable("find"), paths.appState};
+        view.managed = true;
+        Backend backend(view);
+        QTRY_COMPARE(backend.unconfirmedCloudCount(), 1);
+        QCOMPARE(backend.unconfirmedNotebookCount(), 1);
+        QCOMPARE(backend.unconfirmedBackupDir(), confirmed.backupDir);
+        // The next run takes it out of the window.
+        QVERIFY(write(paths.log, (log + successfulRun(QDateTime::currentDateTime().addSecs(-5), 4)).toUtf8()));
+        QTRY_COMPARE(backend.unconfirmedCloudCount(), 0);
+    }
+
+    void aConfirmedRunThatStoppedDeletedNothing()
+    {
+        // One more file went between the dry run and the run let through, so
+        // the raised guard stopped it too: its deletion lines are what it
+        // would have done, not what it did. Only the stop card goes out.
+        QTemporaryDir dir;
+        const BackendPaths paths = controlPaths(dir.path(), true);
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-30);
+        ConfirmedRun confirmed;
+        confirmed.at = QDateTime::currentDateTimeUtc().addSecs(-60);
+        confirmed.backupDir = paths.appState + "/allowed-backup/20261114-120000";
+        for (int i = 1; i <= 11; ++i)
+            confirmed.confirmed << QString("2:f%1.txt").arg(i);
+        QVERIFY(writeConfirmedRun(paths.appState, confirmed));
+        QVERIFY(write(paths.log, abortedRun(start, {}, numberedFiles("f%1.txt", 12), 21).toUtf8()));
+        QCOMPARE(runNotifyCommand("exit-code", paths, fakeNotifier(dir.path()), QDateTime::currentDateTimeUtc()), 0);
+        const QStringList sent = notifications(dir.path());
+        QCOMPARE(sent.size(), 1);
+        QVERIFY2(sent.at(0).contains("Drive stopped syncing"), qPrintable(sent.at(0)));
+        QVERIFY(!readBytes(paths.log).contains("not in the confirmed list"));
+        QVERIFY(!readUnconfirmedDeletes(paths.appState).has_value());
+
+        // A record left by a run that never reported (a power cut) is not
+        // held against a later run: only the first run after it counts.
+        QVERIFY(writeConfirmedRun(paths.appState, confirmed));
+        QString later = successfulRun(start, 20);
+        const QDateTime next = QDateTime::currentDateTime().addSecs(-5);
+        later += line(next, "INFO", R"(Synching Path1 "gdrive{x}:/" with Path2 "/home/someone/Drive/")");
+        later += line(next, "INFO", "Applying changes");
+        later += line(next, "INFO", change("Path1", "File was deleted", "c1.txt"));
+        later += line(next, "INFO", "Bisync successful");
+        QVERIFY(write(paths.log, later.toUtf8()));
+        const UnconfirmedDeletes check = checkConfirmedRun(paths.appState, paths.log);
+        QCOMPARE(check.cloudCount + check.notebookCount, 0);
+        QVERIFY(!readBytes(paths.log).contains("not in the confirmed list"));
+    }
+
+    void aConfirmedRecordWithNoRunIsDropped()
+    {
+        // drive-sync run wrote the record and the machine died before rclone
+        // logged anything: the next ordinary run, much later, is not the run
+        // let through, and its own deletions are no news.
+        QTemporaryDir dir;
+        const BackendPaths paths = controlPaths(dir.path(), true);
+        ConfirmedRun confirmed;
+        confirmed.at = QDateTime::currentDateTimeUtc().addSecs(-3600);
+        confirmed.backupDir = paths.appState + "/allowed-backup/20261114-120000";
+        confirmed.confirmed << "2:f1.txt";
+        QVERIFY(writeConfirmedRun(paths.appState, confirmed));
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-30);
+        QString log = line(start, "INFO", R"(Synching Path1 "gdrive{x}:/" with Path2 "/home/someone/Drive/")");
+        log += line(start, "INFO", "Applying changes");
+        log += line(start, "INFO", change("Path2", "File was deleted", "other.txt"));
+        log += line(start, "INFO", "Bisync successful");
+        QVERIFY(write(paths.log, log.toUtf8()));
+        const UnconfirmedDeletes check = checkConfirmedRun(paths.appState, paths.log);
+        QCOMPARE(check.cloudCount + check.notebookCount, 0);
+        QVERIFY(!readBytes(paths.log).contains("not in the confirmed list"));
+        QVERIFY(!QFile::exists(paths.appState + "/allowed-run.json"));
+    }
+
+    void aKilledConfirmedRunIsStillChecked()
+    {
+        // The fix's final run, let through, was killed while applying (the
+        // fix unit has no ExecStopPost): what it deleted is checked later,
+        // even with another run after it, and at once when fix-run starts.
+        const auto setUp = [](const QString &appState, const QString &logFile) {
+            ConfirmedRun confirmed;
+            confirmed.at = QDateTime::currentDateTimeUtc().addSecs(-120);
+            confirmed.backupDir = appState + "/allowed-backup/20261114-120000";
+            confirmed.confirmed << "2:f1.txt";
+            QVERIFY(writeConfirmedRun(appState, confirmed));
+            const QDateTime killed = QDateTime::currentDateTime().addSecs(-100);
+            QString log = line(killed, "INFO", R"(Synching Path1 "gdrive{x}:/" with Path2 "/home/someone/Drive/")");
+            log += line(killed, "INFO", "Applying changes");
+            log += line(killed, "INFO", change("Path1", "File was deleted", "c1.txt"));
+            log += line(killed, "INFO", change("Path2", "File was deleted", "f1.txt"));
+            log += successfulRun(QDateTime::currentDateTime().addSecs(-10), 5);
+            QVERIFY(write(logFile, log.toUtf8()));
+        };
+        {
+            QTemporaryDir dir;
+            const BackendPaths paths = controlPaths(dir.path(), true);
+            setUp(paths.appState, paths.log);
+            const UnconfirmedDeletes check = checkConfirmedRun(paths.appState, paths.log);
+            QCOMPARE(check.cloudCount, 1);
+            QCOMPARE(check.notebookCount, 0);
+            // The killed run, not the one after it.
+            QVERIFY(qAbs(check.runStart.secsTo(QDateTime::currentDateTime().addSecs(-100))) <= 2);
+        }
+        QTemporaryDir dir;
+        FixSetup s = makeFixSetup(dir.path());
+        setUp(s.paths.appState, s.config.logFile);
+        FixState failed = fixAt("failed");
+        failed.failedStep = "finishing";
+        QVERIFY(writeFix(s.paths.appState, failed));
+        QCOMPARE(runFixUnit(s.paths, s.config, s.tools, s.notify), 1);
+        QVERIFY2(notifications(dir.path()).join("\n").contains("Drive deleted files you did not confirm"),
+                 qPrintable(notifications(dir.path()).join("\n")));
+    }
+
+    void notifyKeepsTheGuardKeyAcrossOtherCards()
+    {
+        // A card about another failure in between must not make the same
+        // guard stop look new afterwards.
+        QTemporaryDir dir;
+        const BackendPaths paths = controlPaths(dir.path(), true);
+        const NotifierPaths tools = fakeNotifier(dir.path());
+        const QDateTime t0 = QDateTime::currentDateTime().addSecs(-7200);
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        QString log = abortedRun(t0, {}, numberedFiles("f%1.txt", 11), 21);
+        QVERIFY(write(paths.log, log.toUtf8()));
+        QCOMPARE(runNotifyCommand("exit-code", paths, tools, now), 0);
+        log += failedRun(t0.addSecs(3600));
+        QVERIFY(write(paths.log, log.toUtf8()));
+        QCOMPARE(runNotifyCommand("exit-code", paths, tools, now.addSecs(3700)), 0);  // the hourly reminder
+        QCOMPARE(notifications(dir.path()).size(), 2);
+        log += abortedRun(t0.addSecs(3900), {}, numberedFiles("f%1.txt", 11), 21);
+        QVERIFY(write(paths.log, log.toUtf8()));
+        QCOMPARE(runNotifyCommand("exit-code", paths, tools, now.addSecs(3900)), 0);
+        QCOMPARE(notifications(dir.path()).size(), 2);  // the same list, 200 s after a card
+    }
+
+    void keptReasonSurvivesAChunkBoundary()
+    {
+        // A stop longer than the tail, whose note sits right before its
+        // start: where readRecent's step back cuts the file must not drop it.
+        QTemporaryDir dir;
+        const QString path = dir.filePath("drive-sync.log");
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-600);
+        const QString before = successfulRun(start.addSecs(-7200), 480);
+        const QString note = line(start, "INFO",
+                                  "DriveSync kept --max-delete at 5% for this run: a dry run finds 1 deletion not in "
+                                  "the list that was confirmed (gone from the cloud: 0, gone from the notebook: 2000)");
+        const QString stop = abortedRun(start, {}, numberedFiles("Projects/sub/file-%1.txt", 2000), 33411);
+        const QByteArray bytes = (before + note + stop).toUtf8();
+        QVERIFY(write(path, bytes));
+        // The second step starts 20 bytes into the note line.
+        const qint64 noteAt = (before).toUtf8().size();
+        const qint64 maxBytes = (bytes.size() - noteAt - 20) / 4;
+        QVERIFY(bytes.size() - 4 * maxBytes > noteAt);
+        QVERIFY(bytes.size() - 4 * maxBytes < noteAt + note.toUtf8().size());
+        QVERIFY(bytes.size() - maxBytes > noteAt + note.toUtf8().size());  // the tail has no start
+        const auto blocked = blockedDeletes(SyncLog::readRecent(path, maxBytes), 500);
+        QVERIFY(blocked.has_value());
+        QCOMPARE(blocked->keptReason, QString("unconfirmed"));
+    }
+
+    void allowedRunNeedsADryRunThatReachedBisync()
+    {
+        // A dry run that ended well but wrote no "Synching Path1" line found
+        // nothing, which says nothing about what the real run would delete:
+        // the usual guard stays.
+        QTemporaryDir dir;
+        FixSetup s = makeFixSetup(dir.path());
+        QVERIFY(write(s.config.filtersFile + ".md5",
+                      QCryptographicHash::hash(readBytes(s.config.filtersFile), QCryptographicHash::Md5).toHex()));
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-300);
+        QVERIFY(write(s.config.logFile, (successfulRun(start.addSecs(-1800), 480)
+                                          + abortedRun(start, {}, numberedFiles("f%1.txt", 11), 21))
+                                             .toUtf8()));
+        QCOMPARE(deletesCommand(s.paths, {"--allow", "11"}).value("ok").toBool(), true);
+        // The fake rclone's dry run writes nothing when dir/normal-dry is missing.
+        QString refusal, note;
+        const QStringList plan = runPlanTakingMark(s.config, s.paths.appState, s.tools.rclone,
+                                                   QDateTime::currentDateTimeUtc(), &refusal, &note);
+        QCOMPARE(plan.value(plan.indexOf("--max-delete") + 1), QString("5"));
+        QVERIFY2(note.startsWith("DriveSync kept --max-delete at 5% for this run: its dry run with the raised guard "
+                                 "wrote no run to its log"),
+                 qPrintable(note));
+        QVERIFY(!QFile::exists(allowDeletesPath(s.paths.appState)));
     }
 };
 

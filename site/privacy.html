@@ -71,7 +71,10 @@
       <ul class="features">
         <li data-i18n="privacy.store1">
           Your files: in the folder you chose (<code>~/Drive</code> by default) and in your Google
-          Drive. They travel only between your computer and Google's servers, over HTTPS.
+          Drive. They travel only between your computer and Google's servers, over HTTPS. When you
+          let one run past the max-delete guard, the files that run deletes or overwrites on your
+          computer are moved to <code>~/.local/state/drive-sync-app/allowed-backup/</code> instead,
+          and stay there until you delete them.
         </li>
         <li data-i18n="privacy.store2">
           The sign-in token Google gives back: in rclone's configuration file on your computer

@@ -49,7 +49,9 @@ int runConditionCommand(const BackendPaths &paths, const SyncConfig &config, con
 
 // What "drive-sync run" hands to rclone, or nothing with a refusal when the
 // filters check fails (see filtersUsable). With a confirmation of blocked
-// deletions, --max-delete is raised just enough for them.
+// deletions, --max-delete is raised just enough for them: for each side, its
+// deletions against its own count in the current listing (the abort line's
+// total when the listings cannot be read), never below the configured guard.
 QStringList runCommandPlan(const SyncConfig &config, QString *refusal, const std::optional<AllowDeletes> &allow = {});
 
 // The plan for the run that starts now: runCommandPlan, or, when the user

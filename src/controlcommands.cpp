@@ -11,6 +11,7 @@
 #include <unistd.h>
 
 #include "fixstate.h"
+#include "listingdiff.h"
 #include "pausestate.h"
 #include "snapshot.h"
 #include "synclog.h"
@@ -207,9 +208,26 @@ QStringList runCommandPlan(const SyncConfig &config, QString *refusal, const std
     const QStringList arguments = rcloneRunArguments(config);
     if (!allow)
         return arguments;
-    // bisync checks each side on its own, so the side with more deletions sets it.
+    // bisync checks each side against that side's own count in the last
+    // listing (Path1 is the cloud), so the side that needs the most sets it.
+    const int configured = configuredMaxDelete(arguments);
+    const QPair<QString, QString> listings =
+        currentListings(config.workDir, bisyncSessionName(config.remote, config.localPath));
+    QString error;
+    const auto cloud = listings.first.isEmpty() ? std::nullopt : readListing(listings.first, &error);
+    const auto notebook = listings.second.isEmpty() ? std::nullopt : readListing(listings.second, &error);
+    if (cloud && notebook) {
+        int percent = configured;
+        if (allow->cloudCount > 0)
+            percent = qMax(percent, maxDeletePercent(allow->cloudCount, int(cloud->size()), configured));
+        if (allow->notebookCount > 0)
+            percent = qMax(percent, maxDeletePercent(allow->notebookCount, int(notebook->size()), configured));
+        return withMaxDelete(arguments, percent);
+    }
+    // No listings to count (the run would fail on them anyway): the abort
+    // line's total, for the side with more deletions.
     const int largestSide = qMax(allow->cloudCount, allow->notebookCount);
-    return withMaxDelete(arguments, maxDeletePercent(largestSide, allow->total, configuredMaxDelete(arguments)));
+    return withMaxDelete(arguments, maxDeletePercent(largestSide, allow->total, configured));
 }
 
 QString allowedRunLogLine(const AllowDeletes &allow, int percent) {
@@ -244,7 +262,13 @@ QStringList runPlanTakingMark(const SyncConfig &config, const QString &appState,
         *note = kept + "a confirmation of deletions was dropped, since the run it was for is no longer the last one";
         return normal;
     }
-    const QStringList raised = runCommandPlan(config, refusal, allow);
+    // What the run deletes or overwrites on the notebook goes to a folder of
+    // DriveSync's state instead (rclone 1.75.2 bisync takes --backup-dir2 on
+    // local paths); what it deletes in the cloud goes to the Drive trash.
+    const QString backupDir =
+        appState + "/allowed-backup/" + stopped->runStart.toLocalTime().toString("yyyyMMdd-HHmmss");
+    const QStringList raised =
+        runCommandPlan(config, refusal, allow) + QStringList{"--backup-dir2", backupDir};
     const int percent = configuredMaxDelete(raised);
     const QString dryLog = appState + "/allowed-dry-run.log";
     QFile::remove(dryLog);
@@ -253,6 +277,8 @@ QStringList runPlanTakingMark(const SyncConfig &config, const QString &appState,
     const bool dryRunOk = runProcess(rclone, withLogFile(raised, dryLog) + QStringList{"--dry-run"}, -1, nullptr, &error);
     QFile dry(dryLog);
     const QString dryText = dry.open(QIODevice::ReadOnly) ? QString::fromUtf8(dry.readAll()) : QString();
+    // A dry run that never reached bisync found nothing, which proves nothing.
+    const bool dryRunRan = SyncLog::newestRunStart(dryText) >= 0;
     const BlockedDeletes found = deletionsInNewestRun(dryText, std::numeric_limits<int>::max());
     QSet<QString> confirmed;
     for (const BlockedDelete &d : stopped->list)
@@ -261,11 +287,24 @@ QStringList runPlanTakingMark(const SyncConfig &config, const QString &appState,
     for (const BlockedDelete &d : found.list)
         if (!confirmed.contains(QString(d.deletedInCloud ? "1:" : "2:") + d.path))
             ++unconfirmed;
-    if (dryRunOk && unconfirmed == 0) {
-        *note = allowedRunLogLine(*allow, percent);
-        return raised;
+    if (dryRunOk && dryRunRan && unconfirmed == 0) {
+        // Kept for the check after the run: the stopped run is no longer
+        // the newest one by then, and its list may be out of the tail.
+        // Now, after the dry run: the run starts right after this.
+        ConfirmedRun run;
+        run.at = QDateTime::currentDateTimeUtc();
+        run.backupDir = backupDir;
+        run.confirmed = QStringList(confirmed.cbegin(), confirmed.cend());
+        if (writeConfirmedRun(appState, run)) {
+            *note = allowedRunLogLine(*allow, percent);
+            return raised;
+        }
+        *note = kept + QString("its record for the check after the run could not be written in %1").arg(appState);
+        return normal;
     }
-    if (dryRunOk)
+    if (dryRunOk && !dryRunRan)
+        *note = kept + "its dry run with the raised guard wrote no run to its log";
+    else if (dryRunOk)
         *note = kept
                 + QString("a dry run finds %1 deletion%2 not in the list that was confirmed (gone from the cloud: %3, "
                           "gone from the notebook: %4)")

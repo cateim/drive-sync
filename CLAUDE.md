@@ -108,7 +108,7 @@ assets/images/          README pictures: window-*.png from bin/harness over a ma
 
 ```sh
 bin/build            # about 30 s from clean
-bin/test             # 201 cases, about 14 s (four run real rclone on temp folders)
+bin/test             # 215 cases, about 15 s (five run real rclone on temp folders)
 bin/install          # needs sudo (pacman -U); run it in a real terminal
 bin/harness --scenario running --clock "h:mm AP" --out build/shot.png   # the window offscreen, made-up data; options atop tools/harness/harness.cpp
 makepkg -f           # from pkgbuild/, with BUILDDIR and PKGDEST set as in bin/install, to check packaging without sudo
@@ -180,20 +180,50 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   `drive-sync deletes --allow <count>` (the count of that list, typed by the
   user) writes `allow-deletes.json`; the next `drive-sync run` (or the fix's
   final run, when that is what stopped) takes it, removes it, and dry-runs
-  the plan with `--max-delete` raised to `ceil(100 * larger side / total)`
-  into `allowed-dry-run.log`. The mark names the stopped run's start, and it
-  is dropped unless that run is still the newest one; the real run gets the
-  raised guard only when the dry run ends well and every deletion it finds,
-  by side and path, is in that run's list. Otherwise the config's own guard
-  stops it again with the new list. A mark older than 30 minutes is dropped.
-  Never `--force`. `guardStopHolds` looks past open runs and records with no
-  phase, which never reached bisync (a refusal), to the stop before them:
-  the fix's refusal, the card, the headline, `FixBanner` and `F` use it, so
-  filters edited after a stop say "undo the edit first", never "press F".
+  the plan with `--max-delete` raised to the largest of
+  `ceil(100 * side deletions / that side's files in its .lst listing)`
+  (the abort line's total when the listings cannot be read), never below
+  the config's guard, into `allowed-dry-run.log`. The mark names the stopped
+  run's start, and it is dropped unless that run is still the newest one;
+  the real run gets the raised guard only when the dry run reached bisync
+  (a whole "Synching Path1" line in its log), ended well, and every deletion
+  it finds, by side and path, is in that run's list. Otherwise the config's
+  own guard stops it again with the new list, and the "DriveSync kept
+  --max-delete" note before it becomes `BlockedDeletes.keptReason` (the
+  banner says why; the card comes at once). A mark older than 30 minutes is
+  dropped. Never `--force`. `guardStopHolds` looks past open runs and
+  records with no phase, which never reached bisync (a refusal), to the stop
+  before them: the fix's refusal, the card, the headline, `FixBanner` and
+  `F` use it, so filters edited after a stop say "undo the edit first",
+  never "press F".
+- The run that gets the raised guard also gets `--backup-dir2
+  <appState>/allowed-backup/<stop's start>`, and `allowed-run.json` keeps
+  its confirmed list: `drive-sync run` execs rclone, so `checkConfirmedRun`
+  runs after it in `drive-sync notify` (and in the fix's final step, and
+  when `fix-run` starts, for a fix unit killed during that run), only for
+  the first run after the record, when it started within 5 minutes of it
+  and reached "Applying changes" (a guard stop only lists what it would
+  delete), even with later runs after it. A
+  deletion not in the list gives a NOTICE line (never ERROR: after
+  "Bisync successful" the parser would make it a failed run),
+  `unconfirmed-deletes.json` (the banner, while that run is the newest) and
+  a critical card. DriveSync never empties the backup folder.
+- `D`, its banner and its dialog follow `Backend.deletesHeld`: a guard stop,
+  the headline `failed` or `fixFailed` (no run under way), and no fix or
+  `fixWaitsForDeletes` (fix.json failed at `finishing` with the stop still
+  holding, never the error text), the rule `deletes --allow` uses too. The
+  dialog closes when it goes false.
+- A guard stop's card repeats hourly like any problem: each tick stops again
+  with a new start, so a stop is new (card at once) only when its per-side
+  counts differ from the last card's (`key` in `notify-run.json`) or it is
+  the run that took a confirmation.
 - Every reader of the log uses `SyncLog::readRecent`: the tail, extended back
-  (at most 64 MB) until it holds a "Synching Path1" line, because a stop of
-  tens of thousands of deletions writes more than the 3 MB tail, and its
-  start would be cut off.
+  (at most 64 MB) until it holds a whole "Synching Path1" log line
+  (`SyncLog::newestRunStart`, so a file named like one does not count),
+  because a stop of tens of thousands of deletions writes more than the 3 MB
+  tail, and its start would be cut off. Each step back reads only the bytes
+  before what it has, and when the start lands near the cut, 64 KB more:
+  the "DriveSync kept" note sits just above it.
 
 ## Conventions
 
@@ -274,7 +304,11 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   53; 11 of 20 passes at 55); an abort leaves the listings as they were (no
   `-err`); a `--dry-run` writes the deletion lines as NOTICE and leaves the
   `.lst` files alone (it writes `-dry` ones). A name with `"` or `\` is
-  written Go-quoted in those lines.
+  written Go-quoted in those lines. `--backup-dir2 <dir outside Path2>` is
+  accepted with local paths, also with `--dry-run` (tried 2026-11-14): every
+  notebook file the run deletes (gone from the cloud) or overwrites (changed
+  in the cloud) is moved there ("Moved into backup dir"); a file gone from
+  the notebook is deleted in the cloud and never goes there.
 
 - **Never use local-time `QDateTime` in hot paths.** On this machine each
   local-time conversion or comparison costs about 0.2 ms (Qt resolves the

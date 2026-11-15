@@ -42,6 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Edited filters are a cause, not an alarm: the window, the bar and a normal card say to press `F`, where a critical "Drive stopped syncing" card used to repeat every hour. Lost listings and listings out of sync say "Press F" too once DriveSync runs drive-sync, instead of `drivesync takeover --undo` and `drive-sync.sh resync`.
 - The app is now DriveSync, and its machine name is `drive-sync` (it was SyncWatch, then `drivesync`, which the AUR already uses for an unrelated Google Drive client, so `yay` kept offering that package as an upgrade of this one): the command, the package and the bar widget id are `drive-sync`, the package replaces `syncwatch` and `drivesync`, and the window's class and launcher entry follow. The first `drive-sync` command moves `~/.config/{syncwatch,drivesync}` and `~/.local/share/{syncwatch,drivesync}` to `~/.config/drive-sync` and `~/.local/share/drive-sync`, and `~/.local/state/{syncwatch,drivesync}` to `~/.local/state/drive-sync-app` (`~/.local/state/drive-sync` is the old `drive-sync.sh`'s), keeping the filters and their `.md5` byte for byte, so no resync is needed, and points the config and the takeover backups at the new folders. The widget takes the old one's place on the bar by itself the first time the window opens. The takeover lock is held by a process named `drive-sync`, `drivesync` or `syncwatch` by its exact name, no longer by a piece of its command line.
 - The icon is now the cloud and check badge on their own, with a dark outline instead of the dark tile, so it reads on light and dark backgrounds. The Google sign-in screen logo (120 px PNG) is rendered from the same file.
+- The run let through after a `--max-delete` stop moves the notebook files it deletes (and the ones it overwrites) to `~/.local/state/drive-sync-app/allowed-backup/<time of the stop>` with `--backup-dir2`, instead of deleting them for good. Afterwards DriveSync compares what it deleted with the list you confirmed: anything more is written to the log, shown in the window and on a critical card, with where it went.
+- The raised guard for that run is counted per side against each side's own listing, as bisync checks it, so a stop where the smaller side holds more deletions no longer falls short and stops again.
 
 ### 🐛 Fixed
 
@@ -53,6 +55,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The failing line in the bar panel has a sentence for a run stopped at its time limit and for a failure only systemd reports, and is never blank.
 - When `omarchy plugin list` fails as the window opens, the window no longer says it could not put DriveSync on the bar: nobody asked yet. After `B` it still does.
 - `N` also hides the notice that someone else's folder or link holds the widget's place, which came back at every start.
+- A run let through that stops again at the guard gets its card at once, and the window says why it kept the usual guard. So does a stop with a different list; the same stop at every tick still waits for the hourly card.
+- A dry run of the run let through that never reached bisync no longer counts as finding nothing: the usual guard stays.
+- `D` and `drive-sync deletes --allow` agree on a fix whose last step failed after a guard stop, even when that step failed on an answer and not on the guard. `D` is off while a run is under way, and its dialog closes when a run starts or the stop is gone.
+- Reading a guard stop longer than the log's 3 MB tail reads each earlier chunk once, and a file named like a run's start line no longer cuts the search short.
 
 ## Legend
 

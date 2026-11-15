@@ -93,6 +93,10 @@ Backend::Backend(const BackendPaths &paths, QObject *parent) : QObject(parent), 
     m_messageTimer.setInterval(8000);
     connect(&m_messageTimer, &QTimer::timeout, this, [this] { setMessage({}); });
 
+    // deletesHeld follows the snapshot (managed, running), the fix and the stop.
+    for (auto signal : {&Backend::changed, &Backend::fixChanged, &Backend::blockedChanged})
+        connect(this, signal, this, &Backend::deletesHeldChanged);
+
     refresh();
 }
 
@@ -522,6 +526,21 @@ void Backend::updateBlocked(const QString &logText) {
         m_guardStopHolds = holds;
         emit blockedChanged();
     }
+    // Deletions nobody confirmed stay in the window while their run is the
+    // newest one that reached bisync; the card and the log keep them after.
+    UnconfirmedDeletes unconfirmed;
+    if (const auto extra = readUnconfirmedDeletes(m_paths.appState))
+        for (auto it = m_parsed.crbegin(); it != m_parsed.crend(); ++it)
+            if (!it->phase.isEmpty()) {
+                if (it->start.toSecsSinceEpoch() == extra->runStart.toSecsSinceEpoch())
+                    unconfirmed = *extra;
+                break;
+            }
+    if (unconfirmed.cloudCount != m_unconfirmed.cloudCount || unconfirmed.notebookCount != m_unconfirmed.notebookCount
+        || unconfirmed.backupDir != m_unconfirmed.backupDir) {
+        m_unconfirmed = unconfirmed;
+        emit blockedChanged();
+    }
     const bool guardStop = !m_parsed.isEmpty() && m_parsed.last().outcome == "failed"
                            && m_parsed.last().causeKind == "maxDelete";
     // A stopped run never changes: read its list once.
@@ -535,6 +554,15 @@ void Backend::updateBlocked(const QString &logText) {
     for (const BlockedDelete &d : m_blocked.list)
         m_blockedList.append(QVariantMap{{"path", d.path}, {"deletedInCloud", d.deletedInCloud}});
     emit blockedChanged();
+}
+
+bool Backend::deletesHeld() const {
+    // The headline is "failed" or "fixFailed" only while nothing runs: a
+    // run under way (the confirmed one's dry run writes no line to the main
+    // log yet) takes D away.
+    const QString headline = status();
+    return managed() && m_blocked.count > 0 && (headline == "failed" || headline == "fixFailed")
+           && (m_fix.step.isEmpty() || fixWaitsForDeletes(m_fix, m_guardStopHolds));
 }
 
 void Backend::allowDeletes(int count) { control({"deletes", "--allow", QString::number(count)}); }

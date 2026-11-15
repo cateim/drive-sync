@@ -78,6 +78,21 @@ class Backend : public QObject {
     // The newest run that reached bisync stopped at the guard, even with
     // refused runs after it (edited filters): F would bring the files back.
     Q_PROPERTY(bool guardStopHolds READ guardStopHolds NOTIFY blockedChanged)
+    // BlockedDeletes.keptReason: the stop is the run the user let through,
+    // which kept the usual guard. Empty otherwise.
+    Q_PROPERTY(QString blockedKeptReason READ blockedKeptReason NOTIFY blockedChanged)
+    // The newest run is one the user let through, and it deleted files that
+    // were not in the list confirmed (UnconfirmedDeletes): per side, and the
+    // folder that keeps the ones deleted on the notebook. 0 and empty otherwise.
+    Q_PROPERTY(int unconfirmedCloudCount READ unconfirmedCloudCount NOTIFY blockedChanged)
+    Q_PROPERTY(int unconfirmedNotebookCount READ unconfirmedNotebookCount NOTIFY blockedChanged)
+    Q_PROPERTY(QString unconfirmedBackupDir READ unconfirmedBackupDir NOTIFY blockedChanged)
+    // D, its banner and its dialog: a guard stop that DriveSync can let one
+    // run through, with no run under way. A fix holds every run, except one
+    // whose final step failed with that stop still the newest run, which D
+    // sends back to that step; "drive-sync deletes --allow" follows the same
+    // rule (fixWaitsForDeletes).
+    Q_PROPERTY(bool deletesHeld READ deletesHeld NOTIFY deletesHeldChanged)
     Q_PROPERTY(QString logPath READ logPath CONSTANT)
     Q_PROPERTY(QString drivePath READ drivePath CONSTANT)
 
@@ -118,6 +133,11 @@ public:
     int blockedNotebookCount() const { return m_blocked.notebookCount; }
     QVariantList blockedList() const { return m_blockedList; }
     bool guardStopHolds() const { return m_guardStopHolds; }
+    QString blockedKeptReason() const { return m_blocked.keptReason; }
+    int unconfirmedCloudCount() const { return m_unconfirmed.cloudCount; }
+    int unconfirmedNotebookCount() const { return m_unconfirmed.notebookCount; }
+    QString unconfirmedBackupDir() const { return m_unconfirmed.backupDir; }
+    bool deletesHeld() const;
     QString logPath() const { return m_paths.log; }
     QString drivePath() const { return m_paths.drive; }
 
@@ -166,6 +186,7 @@ signals:
     void messageChanged();
     void fixChanged();
     void blockedChanged();
+    void deletesHeldChanged();
 
 private:
     void readLog();
@@ -218,4 +239,5 @@ private:
     BlockedDeletes m_blocked;
     QVariantList m_blockedList;
     bool m_guardStopHolds = false;
+    UnconfirmedDeletes m_unconfirmed;
 };

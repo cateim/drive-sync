@@ -424,7 +424,8 @@ QString baseStep(const SyncConfig &config, const FixTools &tools, FixState *stat
 // check. Safe to run twice: a touch repeats, and a file already deleted
 // answers "not found". A run that stopped at the max-delete guard comes back
 // here with the user's confirmation ("drive-sync deletes --allow").
-QString finishStep(const QString &appState, const SyncConfig &config, const FixTools &tools, FixState *state) {
+QString finishStep(const QString &appState, const SyncConfig &config, const FixTools &tools, FixState *state,
+                   UnconfirmedDeletes *extra) {
     QString error;
     for (const FixQuestion &q : std::as_const(state->questions)) {
         const QString remote = remoteFile(config.remote, q.path);
@@ -456,6 +457,9 @@ QString finishStep(const QString &appState, const SyncConfig &config, const FixT
     if (!note.isEmpty())
         appendToLog(config.logFile, "INFO", note);
     error = runBisync(tools, arguments, config.logFile);
+    // Whatever the run ended with, its deletions are compared with a
+    // confirmation it took, as drive-sync notify does after drive-sync run.
+    *extra = checkConfirmedRun(appState, config.logFile);
     if (!error.isEmpty())
         return error;
     state->step.clear();
@@ -507,6 +511,9 @@ int runFixCommand(const QStringList &arguments, const BackendPaths &paths, QText
 
 int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixTools &tools,
                const NotifierPaths &notify, const QString &configError) {
+    // A fix unit killed during a final run let through (TimeoutStartSec, a
+    // power cut) left that run unchecked, and this unit has no ExecStopPost.
+    notifyUnconfirmedDeletes(notify, checkConfirmedRun(paths.appState, config.logFile));
     // Read again after every step: the unit works until the fix waits for
     // the user, fails or ends, and a step never repeats on its own.
     for (;;) {
@@ -527,8 +534,11 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
                 error = prepareStep(paths, config, tools, &state);
             else if (step == "base")
                 error = baseStep(config, tools, &state);
-            else
-                error = finishStep(paths.appState, config, tools, &state);
+            else {
+                UnconfirmedDeletes extra;
+                error = finishStep(paths.appState, config, tools, &state, &extra);
+                notifyUnconfirmedDeletes(notify, extra);
+            }
         }
         if (!error.isEmpty()) {
             state.failedStep = step;

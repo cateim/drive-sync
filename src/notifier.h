@@ -46,3 +46,8 @@ void notifyFixNeedsYou(const NotifierPaths &tools, const FixState &state, bool s
 // A fix ended with a normal run that worked: the "stopped" card goes, and a
 // normal one says Drive syncs again.
 void notifyFixEnded(const BackendPaths &paths, const NotifierPaths &tools);
+
+// A run let through deleted files that were not in the confirmed list
+// (checkConfirmedRun): a critical card that says how many and where they
+// went. Nothing when there were none.
+void notifyUnconfirmedDeletes(const NotifierPaths &tools, const UnconfirmedDeletes &extra);

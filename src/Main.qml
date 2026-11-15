@@ -117,9 +117,8 @@ ApplicationWindow {
                                        || fixQuestions.visible || deleteDialog.visible
     // The newest run stopped at the max-delete guard and DriveSync runs
     // drive-sync: D reviews what it would delete (spec 5b). Also after a
-    // fix whose final run stopped there.
-    readonly property bool deletesHeld: backend.managed && backend.blockedCount > 0
-                                        && (backend.status === "failed" || backend.status === "fixFailed")
+    // fix whose final run stopped there. Never while a run is under way.
+    readonly property bool deletesHeld: backend.deletesHeld
     Shortcut { sequences: ["Tab", "Backtab"]; context: Qt.ApplicationShortcut; enabled: !win.dialogOpen; onActivated: win.page = 1 - win.page }
     Shortcut { sequence: "1"; context: Qt.ApplicationShortcut; enabled: !win.dialogOpen; onActivated: win.page = 0 }
     Shortcut { sequence: "2"; context: Qt.ApplicationShortcut; enabled: !win.dialogOpen; onActivated: win.page = 1 }

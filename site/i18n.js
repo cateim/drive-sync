@@ -97,7 +97,9 @@ const PT = {
   "privacy.store1": `
           Os seus arquivos: na pasta que você escolheu (<code>~/Drive</code> por padrão) e no seu
           Google Drive. Eles só trafegam entre o seu computador e os servidores do Google, por
-          HTTPS.`,
+          HTTPS. Quando você deixa uma rodada passar pela trava de max-delete, os arquivos que essa
+          rodada apaga ou sobrescreve no seu computador vão para
+          <code>~/.local/state/drive-sync-app/allowed-backup/</code>, e ficam lá até você apagá-los.`,
   "privacy.store2": `
           O token de acesso que o Google devolve: no arquivo de configuração do rclone no seu
           computador (por padrão <code>~/.config/rclone/rclone.conf</code>).`,

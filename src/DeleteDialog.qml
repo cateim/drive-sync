@@ -15,6 +15,10 @@ Popup {
     readonly property bool matches: count > 0 && field.text === String(count)
     // The first path shown in the list, moved by the arrows.
     property int top: 0
+    // A run that starts, or a stop that is no longer the newest run, ends
+    // what this dialog is for: it closes instead of showing a count of 0.
+    readonly property bool held: backend.deletesHeld
+    onHeldChanged: if (!held) close()
 
     // The field takes the keys: Esc, Enter and the arrows reach the window's
     // shortcuts, every other window shortcut is off while a dialog is open.
@@ -70,14 +74,15 @@ Popup {
             color: "#c4c4cc"
             text: qsTr("The last run stopped before deleting anything: it would delete %Ln files, more than the max-delete guard allows.", "", dialog.count)
         }
-        // A file gone from the cloud is deleted on the notebook for good, so
-        // that side is counted apart, listed first and marked.
+        // A file gone from the cloud is deleted on the notebook (the run let
+        // through keeps it in a backup folder), so that side is counted
+        // apart, listed first and marked.
         Label {
             Layout.fillWidth: true
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
             color: backend.blockedCloudCount > 0 ? "#ffb74d" : "#c4c4cc"
-            text: "↓ " + qsTr("Gone from the cloud: %1. Deleted on the notebook, for good.")
+            text: "↓ " + qsTr("Gone from the cloud: %1. Deleted on the notebook, kept in a backup folder.")
                              .arg(Number(backend.blockedCloudCount).toLocaleString(Qt.locale(), "f", 0))
         }
         Label {

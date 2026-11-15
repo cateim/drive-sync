@@ -258,13 +258,68 @@ QString SyncLog::readTail(const QString &path, qint64 maxBytes, bool *found, boo
 
 QString SyncLog::readRecent(const QString &path, qint64 maxBytes, bool *found, bool *truncated) {
     constexpr qint64 kMaxRecentBytes = 64LL * 1024 * 1024;
+    QFile file(path);
+    const bool readable = file.open(QIODevice::ReadOnly);
+    if (found)
+        *found = readable;
+    if (truncated)
+        *truncated = false;
+    if (!readable)
+        return {};
+    // begin is where the text read so far starts in the file, always a line
+    // start. Each step reads only the bytes before it, so no line is lost or
+    // read twice, and only the new chunk is searched: a stop of 50k
+    // deletions used to be read and searched three times over.
+    const qint64 size = file.size();
+    qint64 begin = size;
+    QString text;
     bool cut = false;
-    QString text = readTail(path, maxBytes, found, &cut);
-    while (cut && maxBytes < kMaxRecentBytes && !text.contains(QLatin1String(": Synching Path1 "))) {
+    // The whole lines from `from` up to begin, put in front of the text.
+    const auto readFrom = [&](qint64 from) -> QString {
+        cut = from > 0;
+        if (!file.seek(from))
+            return QString();
+        QByteArray chunk = file.read(begin - from);
+        if (cut) {
+            // The rest of a line cut in half.
+            const qsizetype newline = chunk.indexOf('\n');
+            chunk = newline < 0 ? QByteArray() : chunk.mid(newline + 1);
+        }
+        begin -= chunk.size();
+        const QString earlier = QString::fromUtf8(chunk);
+        text.prepend(earlier);
+        return earlier;
+    };
+    qsizetype runStart = -1;  // in the text, once found
+    while (true) {
+        runStart = newestRunStart(readFrom(qMax<qint64>(0, size - maxBytes)));
+        if (!cut || maxBytes >= kMaxRecentBytes || runStart >= 0)
+            break;
         maxBytes = qMin(maxBytes * 4, kMaxRecentBytes);
-        text = readTail(path, maxBytes, found, &cut);
     }
+    // The lines right before a run's start belong to it: DriveSync's note on
+    // why a confirmed run kept the usual guard is written there. A cut just
+    // above the start would drop them, so a little more is read.
+    constexpr qint64 kMarginBytes = 64 * 1024;
+    if (cut && runStart >= 0 && runStart < kMarginBytes)
+        readFrom(qMax<qint64>(0, begin - kMarginBytes));
     if (truncated)
         *truncated = cut;
     return text;
+}
+
+qsizetype SyncLog::newestRunStart(QStringView text) {
+    static const QRegularExpression synching(R"(^\d{4}/\d\d/\d\d \d\d:\d\d:\d\d [A-Z]+\s*: Synching Path1 )");
+    // Searched from the end for the words, then checked as a whole line.
+    qsizetype from = text.size();
+    while (from > 0) {
+        const qsizetype hit = text.lastIndexOf(QLatin1String(": Synching Path1 "), from - 1);
+        if (hit < 0)
+            return -1;
+        const qsizetype start = text.lastIndexOf('\n', hit) + 1;
+        if (synching.matchView(text.mid(start, hit - start + 17)).hasMatch())
+            return start;
+        from = hit;
+    }
+    return -1;
 }

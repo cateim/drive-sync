@@ -8,7 +8,9 @@
 //   --lang en|pt-BR                      the Omarchy language
 //   --scenario ok|running|failed|clean|empty|maxdelete   clean: no conflict copies; empty: no run in the log;
 //                                        maxdelete: the last run stopped at the guard, 2 + 1800 deletions;
-//                                        guardfilters: that stop, then a run refused for edited filters
+//                                        guardfilters: that stop, then a run refused for edited filters;
+//                                        keptguard: that stop, after a confirmation that kept the guard;
+//                                        unconfirmed: the run let through deleted 2 files nobody confirmed
 //   --clock "<Qt format>"                the bar clock; without it, the system locale's hours
 //   --pause none|hour|forever|ended      a pause mark; --managed: DriveSync's own units
 //   --takeover none|offer|running|blocked|failed
@@ -94,6 +96,7 @@ int main(int argc, char **argv) {
         log += okRun(now.addSecs(-i * 900 - 500), 470 + i * 7, i % 2 ? cloudFiles.mid(0, 1) : cloudFiles,
                      i == 1 ? localFiles : i == 3 ? QStringList{"Notes/groceries.md"} : QStringList{});
     QString active = "inactive";
+    QDateTime confirmedAt;  // unconfirmed: when the run let through took its confirmation
     if (scenario == "failed") {
         const QDateTime s = now.addSecs(-200);
         log += L(s, "INFO", kStart);
@@ -105,10 +108,13 @@ int main(int argc, char **argv) {
         log += L(now.addSecs(-10), "INFO", "");
         log += "Transferred:   \t 0 B / 0 B, -, 0 B/s, ETA -\nChecks:  41000 / 41000, 100%, Listed 41210\nElapsed time:  4m0.0s\n\n";
         active = "activating";
-    } else if (scenario == "maxdelete" || scenario == "guardfilters") {
+    } else if (scenario == "maxdelete" || scenario == "guardfilters" || scenario == "keptguard") {
         // What rclone 1.75.2 writes when --max-delete stops a run: each
         // deletion, both sides, then the abort for the side over the guard.
         const QDateTime s = now.addSecs(-200);
+        if (scenario == "keptguard")
+            log += L(s, "INFO", "DriveSync kept --max-delete at 5% for this run: a dry run finds 3 deletions not in the "
+                                "list that was confirmed (gone from the cloud: 2, gone from the notebook: 1800)");
         log += L(s, "INFO", kStart) + L(s, "INFO", "Building Path1 and Path2 listings");
         log += L(s, "INFO", "Path1 checking for diffs");
         for (const QString &p : {QString("Notes/old-draft.md"), QString("Documents/budget-2025.ods")})
@@ -124,6 +130,14 @@ int main(int argc, char **argv) {
         if (scenario == "guardfilters")
             log += L(now.addSecs(-60), "CRITICAL", "DriveSync did not start rclone: /home/someone/.config/drive-sync/filters.txt "
                                                    "changed since the last resync, so bisync would lose its base");
+    } else if (scenario == "unconfirmed") {
+        // The run let through: one file on each side went after the dry run.
+        const QDateTime s = now.addSecs(-120);
+        confirmedAt = s.toUTC().addSecs(-5);
+        log += L(s, "INFO", kStart) + L(s, "INFO", "Building Path1 and Path2 listings");
+        log += L(s, "INFO", C("Path1", "File was deleted", "Photos/2024/trip-0001.jpg"));
+        log += L(s, "INFO", C("Path2", "File was deleted", "Notes/old-draft.md"));
+        log += L(s.addSecs(30), "INFO", "Bisync successful");
     }
     if (scenario == "empty")
         log.clear();  // a new or just rotated log
@@ -155,6 +169,13 @@ int main(int argc, char **argv) {
                       dir.filePath("proc"), systemctl, QStandardPaths::findExecutable("find"), dir.filePath("app"),
                       QString(), QString()};
     fake.managed = args.contains("--managed") || fix != "none";
+    if (confirmedAt.isValid()) {
+        ConfirmedRun run;
+        run.at = confirmedAt;
+        run.backupDir = "/home/someone/.local/state/drive-sync-app/allowed-backup/20261114-101500";
+        writeConfirmedRun(fake.appState, run);
+        checkConfirmedRun(fake.appState, fake.log);
+    }
     const bool fixLater = args.contains("--fix-later");
     auto writeTheFix = [&] {
         FixState state;

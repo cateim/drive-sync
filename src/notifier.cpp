@@ -26,11 +26,14 @@ constexpr int kPauseReminderSeconds = 86400;
 QString tr(const char *text) { return QCoreApplication::translate("Notifier", text); }
 QString tr(const char *text, int n) { return QCoreApplication::translate("Notifier", text, nullptr, n); }
 
-// One open problem: when it began, when it was last shown, and the card's id.
+// One open problem: when it began, when it was last shown, the card's id,
+// and what the card was about (a guard stop's counts), so another stop of
+// the same problem is told apart from the same one again.
 struct Problem {
     QDateTime since;
     QDateTime last;
     int id = 0;
+    QString key;
 };
 
 Problem readProblem(const QString &file) {
@@ -43,6 +46,7 @@ Problem readProblem(const QString &file) {
     p.since = when(o.value("since").toInteger());
     p.last = when(o.value("last").toInteger());
     p.id = qMax(0, o.value("id").toInt());
+    p.key = o.value("key").toString();
     return p;
 }
 
@@ -52,7 +56,8 @@ void writeProblem(const QString &file, const Problem &p) {
     if (!out.open(QIODevice::WriteOnly))
         return;
     auto seconds = [](const QDateTime &t) { return t.isValid() ? t.toSecsSinceEpoch() : 0; };
-    out.write(QJsonDocument(QJsonObject{{"since", seconds(p.since)}, {"last", seconds(p.last)}, {"id", p.id}})
+    out.write(QJsonDocument(QJsonObject{{"since", seconds(p.since)}, {"last", seconds(p.last)}, {"id", p.id},
+                                        {"key", p.key}})
                   .toJson(QJsonDocument::Compact));
     out.commit();
 }
@@ -86,14 +91,17 @@ void close(const NotifierPaths &tools, int id, const QStringList &titles) {
         runProcess(tools.omarchy, {"notification", "dismiss", title}, kToolTimeoutMs, nullptr, nullptr);
 }
 
-// An ongoing problem: shown the first time, then every hour.
+// An ongoing problem: shown the first time, then every hour. A key other
+// than the last card's (another guard stop's list), or news, shows at once.
 void reportProblem(const NotifierPaths &tools, const QString &file, const QString &firstTitle,
                    const QString &reminderTitle, const QString &text, const QString &footer, const QDateTime &now,
-                   const QString &urgency = "critical") {
+                   const QString &urgency = "critical", const QString &key = QString(), bool news = false) {
     Problem p = readProblem(file);
     QString title;
     if (!p.since.isValid()) {
         p.since = now;
+        title = firstTitle;
+    } else if (news || (!key.isEmpty() && key != p.key)) {
         title = firstTitle;
     } else if (!p.last.isValid() || p.last.secsTo(now) >= kRepeatSeconds) {
         // No card ever reached the screen (last unset): try the first one again.
@@ -107,6 +115,10 @@ void reportProblem(const NotifierPaths &tools, const QString &file, const QStrin
                           text + "\n" + footer.arg(at(tools, p.since)));
     p.last = id > 0 ? now : QDateTime();
     p.id = id;
+    // A card about something else keeps the last guard stop's key, or the
+    // same stop afterwards would look new.
+    if (!key.isEmpty())
+        p.key = key;
     writeProblem(file, p);
 }
 
@@ -137,7 +149,7 @@ QString causeSentence(const QString &kind, const QString &detail) {
 // with it count, as in drive-sync-aviso; the log parser already turns an
 // error before "Synching Path1" (rclone that did not start, or DriveSync's
 // refusal) into a failed run of its own.
-QString cause(const QString &serviceResult, const BackendPaths &paths, QString *kind) {
+QString cause(const QString &serviceResult, const BackendPaths &paths, QString *kind, QString *stopKey, bool *news) {
     if (serviceResult == "timeout")
         return tr("The run went past its time limit (TimeoutStartSec) and was stopped.");
     QByteArray stamp;
@@ -160,11 +172,21 @@ QString cause(const QString &serviceResult, const BackendPaths &paths, QString *
                       "files back. Undo the filters edit first: the next run shows the deletions under D.")
                 .left(200);
         if (*kind == "maxDelete")
-            if (const auto blocked = blockedDeletes(text, 0))
+            if (const auto blocked = blockedDeletes(text, 0)) {
+                // Each tick stops again on the same list: only another list,
+                // or the run the user let through, is a new stop.
+                *stopKey = QString("%1:%2").arg(blocked->cloudCount).arg(blocked->notebookCount);
+                *news = !blocked->keptReason.isEmpty();
+                if (*news)
+                    return tr("The run you let through kept the usual guard and stopped again: it would delete %Ln "
+                              "files. Open DriveSync and press D to review them.",
+                              blocked->count)
+                        .left(200);
                 return tr("A run would delete %Ln files, more than the guard allows, so it stopped and deleted "
                           "nothing. Open DriveSync and press D to review them.",
                           blocked->count)
                     .left(200);
+            }
         const QString sentence = causeSentence(runs.last().causeKind, runs.last().causeDetail);
         if (!sentence.isEmpty())
             return sentence.left(200);
@@ -272,19 +294,23 @@ int runNotifyCommand(const QString &serviceResult, const BackendPaths &paths, co
     const QString stillFilters = tr("Drive filters still changed");
     if (serviceResult == "exec-condition")
         return 0;  // skipped on purpose: paused, a fix under way, or runOnlyWhen said no
+    // drive-sync run became rclone, so the run let through is checked here,
+    // after it, whatever it ended with.
+    notifyUnconfirmedDeletes(tools, checkConfirmedRun(paths.appState, paths.log));
     if (serviceResult == "success") {
         reportSolved(tools, file, tr("Drive is syncing again"), tr("It had stopped at %1."),
                      {stopped, stillStopped, filters, stillFilters});
         return 0;
     }
-    QString kind;
-    const QString text = cause(serviceResult, paths, &kind);
+    QString kind, stopKey;
+    bool news = false;
+    const QString text = cause(serviceResult, paths, &kind, &stopKey, &news);
     // Changed filters are the user's own edit, waiting for F: news, not an alarm.
     if (kind == "filtersChanged")
         reportProblem(tools, file, filters, stillFilters, text, tr("Since %1."), now, "normal");
     else
         reportProblem(tools, file, stopped, stillStopped, text, tr("Stopped since %1. Log: %2").arg("%1", paths.log),
-                      now);
+                      now, "critical", stopKey, news);
     return 0;
 }
 
@@ -331,4 +357,16 @@ void notifyFixEnded(const BackendPaths &paths, const NotifierPaths &tools) {
     QFile::remove(file);
     notify(tools, "normal", "dialog-information", tr("Drive is syncing again"),
            tr("The fix rebuilt the base of both sides."));
+}
+
+void notifyUnconfirmedDeletes(const NotifierPaths &tools, const UnconfirmedDeletes &extra) {
+    const int count = extra.cloudCount + extra.notebookCount;
+    if (count == 0)
+        return;
+    QString text = tr("The run you let through deleted %Ln files that were not in the list you confirmed.", count);
+    if (extra.cloudCount > 0)
+        text += " " + tr("The ones deleted on the notebook are kept in %1.").arg(extra.backupDir);
+    if (extra.notebookCount > 0)
+        text += " " + tr("The ones deleted in the cloud are in the Drive trash.");
+    notify(tools, "critical", "dialog-warning", tr("Drive deleted files you did not confirm"), text);
 }

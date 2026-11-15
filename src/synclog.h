@@ -55,7 +55,14 @@ QString readTail(const QString &path, qint64 maxBytes, bool *found = nullptr, bo
 // readTail, reaching further back (at most 64 MB) when the tail was cut and
 // holds no "Synching Path1" line, so the newest run is whole. A run that
 // --max-delete stopped writes one line per file it would delete: on a wiped
-// ~/Drive that is more than the tail, and the run would go unseen.
+// ~/Drive that is more than the tail, and the run would go unseen. Each step
+// back reads only the bytes before what it already has.
 QString readRecent(const QString &path, qint64 maxBytes, bool *found = nullptr, bool *truncated = nullptr);
+
+// Where the newest run in the text starts: the start of its "Synching
+// Path1" line, or -1. Only a whole log line counts, so a file named like
+// one ("- Path2  File was deleted  - a: Synching Path1 b") is never taken
+// for a run's start.
+qsizetype newestRunStart(QStringView text);
 
 }
