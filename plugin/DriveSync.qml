@@ -31,6 +31,8 @@ Panel {
       case "filtersChanged": return strings.t("cause.filtersChanged")
       case "fixInterrupted": return strings.t("cause.fixInterrupted")
       case "maxDelete": return strings.t("cause.maxDelete")
+      case "signIn": return strings.t("cause.signIn")
+      case "firstSyncPending": return strings.t("cause.firstSyncPending")
     }
     return status.causeDetail !== "" ? status.causeDetail : strings.t("cause.unknown")
   }

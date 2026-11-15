@@ -1,6 +1,8 @@
 #include "fixcommand.h"
 
 #include <QDateTime>
+#include <QDir>
+#include <QJsonArray>
 #include <QFile>
 #include <QFileInfo>
 #include <QJsonDocument>
@@ -194,6 +196,8 @@ QString maxDeleteRefusal(const SyncConfig &config) {
            "them back, so it is refused";
 }
 
+}  // namespace
+
 QString startFix(const BackendPaths &paths) {
     if (!paths.managed)
         return "a fix needs DriveSync to run drive-sync; take it over first";
@@ -221,6 +225,8 @@ QString startFix(const BackendPaths &paths) {
     return QString("could not start %1: %2").arg(kFixUnit, error);
 }
 
+namespace {
+
 // Every question needs "cloud" or "notebook". Only the stored questions are
 // looked up, so a path the fix never asked about is never acted on.
 QString takeAnswers(const QString &file, FixState *state) {
@@ -240,6 +246,41 @@ QString takeAnswers(const QString &file, FixState *state) {
     return QString();
 }
 
+// The fix "drive-sync setup" started, cancelled before any base was built
+// for this config (no listings, no filters .md5): the setup is undone, so
+// the window offers it again and another folder can be picked. Only what
+// the setup's mark lists goes: its config, its filters and the folders it
+// made while they are empty. The timers go off first, so no tick finds a
+// config half gone.
+QString undoFirstSetup(const BackendPaths &paths) {
+    QFile file(firstSetupMarkPath(paths.appState));
+    if (!file.open(QIODevice::ReadOnly))
+        return QString();
+    const QJsonObject mark = QJsonDocument::fromJson(file.readAll()).object();
+    file.close();
+    const auto config = loadSyncConfig(paths.config, nullptr);
+    if (!config || mark.value("config").toString() != paths.config)
+        return QString();
+    const bool baseBuilt = QFile::exists(config->filtersFile + ".md5")
+                           || !currentListings(config->workDir, bisyncSessionName(config->remote, config->localPath))
+                                   .first.isEmpty();
+    if (baseBuilt)
+        return QString();
+    QString error;
+    if (!runProcess(paths.systemctl,
+                    {"--user", "disable", "--now", "drive-sync.timer", "drive-sync-watchdog.timer"},
+                    kSystemctlTimeoutMs, nullptr, &error))
+        return QString("could not turn off drive-sync.timer and drive-sync-watchdog.timer: %1").arg(error);
+    QFile::remove(paths.config);
+    if (const QString filters = mark.value("filters").toString(); filters == config->filtersFile)
+        QFile::remove(filters);
+    const QJsonArray folders = mark.value("createdFolders").toArray();
+    for (qsizetype i = folders.size() - 1; i >= 0; --i)
+        QDir().rmdir(folders.at(i).toString());  // never recursive: a folder that holds anything stays
+    QFile::remove(firstSetupMarkPath(paths.appState));
+    return QString();
+}
+
 QString cancelFix(const BackendPaths &paths) {
     QString error;
     const QString unit = unitState(paths, kFixUnit, &error);
@@ -247,6 +288,8 @@ QString cancelFix(const BackendPaths &paths) {
         return QString("cannot ask systemd whether the fix is running: %1").arg(error);
     if (unitBusy(unit))
         return "a step of the fix is running; wait for it to end, then cancel";
+    if (const QString undo = undoFirstSetup(paths); !undo.isEmpty())
+        return undo;
     return clearFix(paths.appState) ? QString() : QString("cannot remove %1").arg(fixStatePath(paths.appState));
 }
 
@@ -557,6 +600,9 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
             notifyFixNeedsYou(notify, state, true);
             return 1;
         }
+        // From the first base on, the config is no longer one to undo.
+        if (step == "base")
+            QFile::remove(firstSetupMarkPath(paths.appState));
         if (state.step.isEmpty()) {
             {
                 const FixLock lock(paths.appState);

@@ -66,6 +66,13 @@ void classify(SyncRun &run) {
             run.causeDetail.clear();
             return;
         }
+    // DriveSync refused to start rclone before the first base was confirmed.
+    for (const auto &error : run.errors)
+        if (error.contains(kFirstSyncPendingReason)) {
+            run.causeKind = "firstSyncPending";
+            run.causeDetail.clear();
+            return;
+        }
     // DriveSync refused to start rclone over filters without a matching .md5.
     for (const auto &error : run.errors)
         if (error.contains(kFiltersChangedReason)) {
@@ -80,6 +87,16 @@ void classify(SyncRun &run) {
         if (error.contains("Safety abort: too many deletes")) {
             run.causeKind = "maxDelete";
             run.causeDetail = error.left(200);
+            return;
+        }
+    // Google refused the token: expired, revoked, or the client was
+    // deleted. Nothing syncs until the user signs in again, and rclone's own
+    // advice ("rclone config reconnect") needs a terminal, so the detail is
+    // left out and the window offers its sign-in instead.
+    for (const auto &error : run.errors)
+        if (isTokenError(error)) {
+            run.causeKind = "signIn";
+            run.causeDetail.clear();
             return;
         }
     // "Bisync aborted" and "Failed to bisync" only say that it stopped; the
@@ -125,6 +142,18 @@ void addChange(SyncRun &run, const QString &tag, const QString &what, const QStr
 }
 
 }  // namespace
+
+bool isTokenError(const QString &error) {
+    // Only Google's own answers about the grant or the client. rclone 1.75.2
+    // also says "couldn't fetch token" (and oauth2 "cannot fetch token") when
+    // the network fails or Google answers 5xx, which a new sign-in would not
+    // fix (tried with a token URL nobody answers, 2026-11-14).
+    static const QStringList refusals = {"invalid_grant", "invalid_client", "unauthorized_client", "token expired"};
+    for (const QString &needle : refusals)
+        if (error.contains(needle, Qt::CaseInsensitive))
+            return true;
+    return false;
+}
 
 QList<SyncRun> SyncLog::parse(const QString &text, int maxRuns, bool startsMidway) {
     QList<SyncRun> runs;

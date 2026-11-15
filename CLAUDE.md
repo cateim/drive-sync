@@ -22,7 +22,12 @@ dry run and touches single synced files only as the fix's comparison or the
 user's answers say. It never starts a resync or touches a synced file
 otherwise. Since step 5b, after `--max-delete` stopped a run, it lists what
 that run would delete (`D`, `drive-sync deletes`) and lets one run through
-with the guard raised once the user types how many files that is. The plan for growing it into the
+with the guard raised once the user types how many files that is. Since
+step 4a it sets up a drive-sync where none exists (`T`, `drive-sync signin`
+then `drive-sync setup --folder`): rclone's own browser sign-in with the
+DriveSync OAuth client, the default filters, the config, and a fix whose dry
+run the user confirms; and a token Google no longer accepts is the cause
+`signIn`, with `I` to sign in again. The plan for growing it into the
 owner of drive-sync is `docs/superpowers/specs/2026-11-07-drive-sync-manager-design.md`; `docs/` is git-ignored,
 so that file exists only in the maintainer's working copy. The `drive-sync` scripts themselves live
 in the DIY repository (`assets/omarchy/home/.local/bin/drive-sync.sh` and
@@ -56,7 +61,7 @@ bin/build               qmake6 + make into build/drive-sync
 bin/test                builds and runs build/tests/drivesync_tests offscreen
 bin/install             bin/build, then makepkg -fsi with BUILDDIR/PKGDEST under build/
 bin/harness             builds tools/harness into build/harness and runs it with the given options
-src/main.cpp            commands run headless (status, sync, pause, resume, takeover, fix, and run-condition, run, notify, watchdog, fix-run for the units); otherwise the window
+src/main.cpp            commands run headless (status, sync, pause, resume, takeover, fix, deletes, signin, setup, and run-condition, run, notify, watchdog, fix-run for the units); otherwise the window
 src/synclog.{h,cpp}     pure parser of the rclone bisync log into SyncRun records
 src/snapshot.{h,cpp}    buildSnapshot(): the one place the state is decided; tone; the JSON contract
 src/backend.{h,cpp}     the window's state: log watch, systemctl calls, conflict scan, headline rules (summarize)
@@ -73,6 +78,10 @@ src/blockeddeletes.{h,cpp}  a max-delete stop: its deletions from the log, the o
 src/legacymigration.{h,cpp}  moves the SyncWatch and drivesync folders to the drive-sync names (state to drive-sync-app); first thing main() does
 src/notifier.{h,cpp}    notify (ExecStopPost) and watchdog: the port of drive-sync-aviso
 src/takeover.{h,cpp}    detect, apply with rollback, undo; `drive-sync takeover`
+src/oauthclient.{h,cpp}  shippedOAuthClient(): the Google client, compiled in only from the git-ignored src/oauthclient.local.h (template: src/oauthclient.local.h.example)
+src/signin.{h,cpp}      `drive-sync signin [--abandon]`: rclone's browser flow creates the drive-sync remote, or refreshes the config's remote
+src/firstsetup.{h,cpp}  `drive-sync setup --folder`: refusals, default filters, the new user's config, startFix, then the timers
+src/setupcontroller.{h,cpp}  the window's side of signin and setup; Cancel sends SIGTERM to the signin child alone
 src/takeoversetup.{h,cpp}  the window's side of a takeover, through a child process
 src/pluginsetup.{h,cpp} links the shipped bar widget and enables it through `omarchy plugin`
 src/theme.{h,cpp}       Omarchy accent and Hyprland rounding (from the skill template)
@@ -86,6 +95,8 @@ src/BarBanner.qml       offer to put the widget on the bar (B), or why it could 
 src/ControlsRow.qml     sync now (S), pause (P), resume (U), open ~/Drive (O)
 src/PauseMenu.qml       the three pause lengths (1, 2, 3)
 src/TakeoverBanner.qml  offer to take over (T), or what blocks it; TakeoverDialog.qml confirms
+src/SetupBanner.qml     offer first setup (T) when there is no drive-sync at all
+src/SetupDialog.qml     sign in, the folder, start; with "again", only the sign-in (I)
 src/FixBanner.qml       offer to fix (F) after lost listings, out of sync or changed filters
 src/FixDialog.qml       the fix's start, the dry run to confirm (Enter) and a stopped step (retry; X cancels)
 src/FixQuestions.qml    the files that changed in the cloud during the base run: C cloud, L notebook, Enter sends
@@ -108,13 +119,14 @@ assets/images/          README pictures: window-*.png from bin/harness over a ma
 
 ```sh
 bin/build            # about 30 s from clean
-bin/test             # 215 cases, about 15 s (five run real rclone on temp folders)
+bin/test             # 248 cases, about 19 s (seven run real rclone on temp folders)
 bin/install          # needs sudo (pacman -U); run it in a real terminal
 bin/harness --scenario running --clock "h:mm AP" --out build/shot.png   # the window offscreen, made-up data; options atop tools/harness/harness.cpp
 makepkg -f           # from pkgbuild/, with BUILDDIR and PKGDEST set as in bin/install, to check packaging without sudo
 build/drive-sync status --json   # the state as the bar sees it (0.13 s with a fresh conflict cache)
-(cd plugin && node --test tests/*.test.mjs)   # bar widget, 24 cases; the glob is required on Node 22
+(cd plugin && node --test tests/*.test.mjs)   # bar widget, 25 cases; the glob is required on Node 22
 build/drive-sync takeover --check              # read-only: what a takeover would move, or what blocks it
+bin/harness --scenario setup-offer --keys o --out build/shot.png   # first setup; also setup-signing-in, setup-folder, signin-needed
 omarchy plugin validate plugin                # needs the folder path, not the plugin id
 ```
 
@@ -174,6 +186,23 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
 - Runs refused for the filters' md5 have `causeKind` `filtersChanged` (the
   refusal text ends in `kFiltersChangedReason`): a normal card says "press F"
   instead of the critical "stopped syncing" one.
+- A run whose errors say Google refused the token (`isTokenError`:
+  `invalid_grant`, `invalid_client`, `unauthorized_client`, `token expired`,
+  any case) has `causeKind` `signIn` with no detail: the critical card says
+  "Open DriveSync and sign in again", the window offers `I` when it runs
+  drive-sync, and nothing repeats rclone's `rclone config reconnect`. A fix
+  that failed on such an error is `fixFailed` with `causeKind` `signIn` too.
+  `couldn't fetch token` alone is no sign-in: rclone 1.75.2 writes it for a
+  refused connection or a 5xx too (tried 2026-11-14 with a token URL nobody
+  answers).
+- A refused run with no filters `.md5` and no listings has `causeKind`
+  `firstSyncPending` (the refusal ends in `kFirstSyncPendingReason`): no base
+  was ever made, so the window, a normal card and the bar say to press `F`,
+  never "the filters changed". `drive-sync setup` writes
+  `<appState>/first-setup.json` (what it wrote); `fix --cancel` with that
+  mark and no base undoes the setup (timers off, its config and filters
+  removed, its empty folders removed) and the window offers setup again. The
+  base step removes the mark.
 - A run `--max-delete` stopped is `causeKind` `maxDelete` (spec 5b). Its
   deletions come from its own log lines (`blockedDeletes`, only when it is
   the newest run), so the headline, the card and `D` count both sides.
@@ -296,7 +325,10 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   `unix` fails to compile.
 - moc reads a `'` inside a raw string literal as a char literal: a test with
   `R"(q'uote)"` made moc generate nothing ("No relevant classes found") and
-  the link fail on the vtable. Use a plain escaped string there.
+  the link fail on the vtable. Use a plain escaped string there. A `\"`
+  inside a raw string, or a raw string followed by another literal
+  (`R"(...)" "\n"`) inside a macro, breaks moc the same way ("missing ')' in
+  macro usage" on a line far below).
 - **The max-delete guard, as rclone 1.75.2 does it** (tried 2026-11-12):
   each side is checked against its own count in the last listing, Path1
   first, after both sides' "File was deleted" lines are logged; the
@@ -310,6 +342,45 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   in the cloud) is moved there ("Moved into backup dir"); a file gone from
   the notebook is deleted in the cloud and never goes there.
 
+- **Google sign-in goes through rclone, never through DriveSync** (tried with
+  rclone 1.75.2 on 2026-11-14, scratch `RCLONE_CONFIG`, fake client, fake
+  `xdg-open`). `rclone config create <name> drive client_id <id>
+  client_secret <secret> scope drive` with stdin at EOF writes the section
+  first, opens the browser through `xdg-open`, prints `Waiting for code...`
+  and waits on port 53682; the token is written by rclone. `rclone config
+  update <name> config_refresh_token true` runs the same flow on an existing
+  remote (sign in again, with that remote's own client, and the config's
+  `--config` when it has one). stderr carries "go to the following link:
+  http://127.0.0.1:53682/auth?state=...", which `signin` relays (a
+  `{"link"}` line with `--json`). `rclone config reconnect` needs a terminal (`Failed to read line: EOF`): never use it, and
+  never show its advice from the log. A create killed while waiting leaves the
+  section without a token, which `drive-sync signin --abandon` removes (only
+  with no DriveSync config, and only DriveSync's own: type drive with the
+  shipped client id). `signin` reuses such a remote (signed in again when
+  lsjson refuses its token, made again when it has none) and never takes a
+  `drive-sync` remote with another client. `bisync --resync --filters-file F` writes
+  `F.md5`, so a new user's base run makes the md5 the normal runs need; until
+  then `drive-sync run` refuses (cause `filtersChanged`, which offers `F`).
+- **The OAuth client is never printed.** It reaches the code only through
+  `shippedOAuthClient()`; `signin` replaces it in rclone's errors with
+  `<client id>` and `<client secret>`, keeps rclone's stdout (which can hold
+  the section and the token) in memory, and the tests use a made-up client.
+  `src/oauthclient.local.h` is git-ignored and filled by the maintainer by
+  hand; `drivesync.pro` and the test project define `HAVE_LOCAL_OAUTH` only
+  when it exists, and qmake must run again after it appears (`bin/build`
+  does).
+- **Every test reaches rclone in a sandbox.** `initTestCase` points
+  `RCLONE_CONFIG` at a temp file and puts a fake `xdg-open` first on `PATH`
+  for the whole binary. An rclone `alias` remote names bisync's listings after
+  its target, not after the alias, so the end-to-end tests point
+  `config.remote` at a local folder instead.
+- **Cancelling a sign-in signals one pid.** `xdg-open` runs
+  `omarchy-launch-browser`, and the browser can stay in rclone's process
+  group, so a SIGTERM to the group would close it. `SetupController` sends
+  SIGTERM to `drive-sync signin` alone; its handler (async-signal-safe: a
+  flag and `kill()` of the rclone pid) stops rclone, and the command removes
+  the half-made remote itself (Ctrl+C in a terminal too). The QProcess is
+  unparented first, because deleting it would SIGKILL that cleanup.
 - **Never use local-time `QDateTime` in hot paths.** On this machine each
   local-time conversion or comparison costs about 0.2 ms (Qt resolves the
   zone every time). `QDateTime::fromString` per log line made opening the app
@@ -335,7 +406,9 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   the takeover check and a fake shell.json clock, presses `--keys`, and
   saves `window->grabWindow()`; QML warnings go to stderr. It is how the
   README window pictures are made, so it must never read this machine:
-  `--real` exists for local checks only. A new context property in
+  `--real` exists for local checks only. Its takeover answer defaults to
+  `managed`; `--takeover none` (and the `setup-*` scenarios) is a machine
+  with no drive-sync at all, which shows the setup banner. A new context property in
   `main.cpp` needs the same line in `tools/harness/harness.cpp`, and a new
   source file the window uses needs `tools/harness/harness.pro`.
 - The Material `Button` background (an elevation effect) does not render in

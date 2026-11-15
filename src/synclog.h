@@ -11,6 +11,10 @@
 // timestamp.
 
 // One file bisync found changed on one side during a run.
+// An rclone error that says Google refused the sign-in itself (an expired or
+// revoked grant, a client it no longer knows), never a network failure.
+bool isTokenError(const QString &error);
+
 struct SyncChange {
     QString side;  // "cloud" (bisync's Path1), "notebook" (Path2) or "both"
     QString kind;  // "new", "modified", "deleted" or "conflict"
@@ -37,7 +41,7 @@ struct SyncRun {
     QList<SyncChange> changes;
     int changesOmitted = 0;
     QStringList errors;
-    QString causeKind;      // failed runs only: "lostListings", "outOfSync", "filtersChanged", "maxDelete", "error" or "none"
+    QString causeKind;      // failed runs only: "lostListings", "outOfSync", "filtersChanged", "firstSyncPending", "maxDelete", "signIn", "error" or "none"
     QString causeDetail;    // the error line behind "error"
 };
 

@@ -10,13 +10,17 @@ HEADERS += \
     src/clockformat.h \
     src/conflictcache.h \
     src/controlcommands.h \
+    src/firstsetup.h \
     src/fixcommand.h \
     src/fixstate.h \
     src/legacymigration.h \
     src/listingdiff.h \
     src/notifier.h \
+    src/oauthclient.h \
     src/pausestate.h \
     src/pluginsetup.h \
+    src/setupcontroller.h \
+    src/signin.h \
     src/snapshot.h \
     src/statuscommand.h \
     src/syncconfig.h \
@@ -33,13 +37,17 @@ SOURCES += \
     src/clockformat.cpp \
     src/conflictcache.cpp \
     src/controlcommands.cpp \
+    src/firstsetup.cpp \
     src/fixcommand.cpp \
     src/fixstate.cpp \
     src/legacymigration.cpp \
     src/listingdiff.cpp \
     src/notifier.cpp \
+    src/oauthclient.cpp \
     src/pausestate.cpp \
     src/pluginsetup.cpp \
+    src/setupcontroller.cpp \
+    src/signin.cpp \
     src/snapshot.cpp \
     src/statuscommand.cpp \
     src/syncconfig.cpp \
@@ -50,3 +58,8 @@ SOURCES += \
     src/translator.cpp
 
 RESOURCES += src/resources.qrc
+
+# The Google OAuth client is compiled in only from the git-ignored
+# src/oauthclient.local.h (see src/oauthclient.local.h.example); without it
+# the build has no client and first setup says so.
+exists($$PWD/src/oauthclient.local.h): DEFINES += HAVE_LOCAL_OAUTH

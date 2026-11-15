@@ -130,6 +130,8 @@ QString usageText() {
            "       drive-sync sync [--json]\n"
            "       drive-sync pause [--minutes N | --until-tomorrow] [--json]\n"
            "       drive-sync resume [--json]\n"
+           "       drive-sync signin [--abandon] [--json]\n"
+           "       drive-sync setup --folder <path> [--json]\n"
            "       drive-sync takeover --check | --apply | --undo [--json]\n"
            "       drive-sync fix --start | --confirm | --answers <file.json> | --cancel | --retry [--json]\n"
            "       drive-sync deletes --list | --allow <count> [--json]\n"

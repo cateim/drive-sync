@@ -8,6 +8,9 @@ import "format.js" as Format
 Rectangle {
     id: panel
 
+    // I: Google no longer takes the token; the window opens its sign-in.
+    signal signInRequested()
+
     property double now
     readonly property string status: backend.status
     readonly property var current: backend.currentRun
@@ -87,11 +90,17 @@ Rectangle {
         case "filtersChanged": return backend.guardStopHolds
             ? qsTr("The filters changed after a run stopped at the max-delete guard, and a fix would bring those files back. Undo the filters edit first: the next run shows the deletions under D.")
             : qsTr("The filters changed since the last base, so every run waits. Press F to rebuild the base with them.")
+        case "firstSyncPending": return qsTr("The first sync was never confirmed, so nothing syncs yet. Press F to see its dry run.")
         // DriveSync lists the deletions and lets one run through (D); the
         // old scripts leave it to rclone by hand.
         case "maxDelete": return backend.managed && backend.blockedCount > 0
             ? qsTr("A run would delete %Ln files, more than the guard allows, so it stopped and deleted nothing. Press D to review them.", "", backend.blockedCount)
             : qsTr("%1\nA fix would bring the deleted files back, so F is off. Restore them, or let one run through by hand with --force.").arg(detail)
+        // DriveSync signs in again through the browser; rclone's own advice
+        // (rclone config reconnect) needs a terminal.
+        case "signIn": return backend.managed
+            ? qsTr("Google no longer accepts DriveSync's sign-in (it expired or was revoked), so nothing syncs. Press I to sign in again.")
+            : qsTr("Google no longer accepts this rclone remote's sign-in (it expired or was revoked), so nothing syncs. To sign in again: rclone config reconnect, with the remote's name, in a terminal.")
         case "timeout": return qsTr("The run went past its time limit (TimeoutStartSec) and systemd stopped it.")
         case "systemd": return qsTr("systemd says the last run failed (%1), and the log has nothing about it.").arg(detail)
         case "error": return detail
@@ -164,6 +173,10 @@ Rectangle {
                 : qsTr("%Ln files changed in the cloud during the base run. Press F to answer for each one.", "", backend.fixQuestions.length))
             break
         case "fixFailed":
+            if (backend.causeKind === "signIn") {
+                lines.push(qsTr("Google no longer accepts DriveSync's sign-in, so the fix stopped. Press I to sign in again, then F to retry it."))
+                break
+            }
             lines.push(backend.causeKind !== "fixInterrupted" ? backend.causeDetail
                 : backend.causeDetail === "the fix stopped halfway" ? qsTr("It stopped halfway: a logout, a shutdown or a kill.")
                 : qsTr("drive-sync-fix.service ended with %1. See: journalctl --user -u drive-sync-fix.service").arg(backend.causeDetail),
@@ -284,6 +297,32 @@ Rectangle {
             lineHeight: 1.25
             color: "#c4c4cc"
             font.pixelSize: 14
+        }
+
+        RowLayout {
+            visible: backend.managed && (panel.status === "failed" || panel.status === "fixFailed")
+                     && backend.causeKind === "signIn"
+            spacing: 8
+            Button {
+                text: qsTr("Sign in again…")
+                focusPolicy: Qt.NoFocus
+                // Drawn by hand, like the banners' buttons.
+                background: Rectangle {
+                    implicitHeight: 34
+                    radius: Math.min(4, theme.radius)
+                    color: parent.down ? Qt.darker(theme.accent, 1.2) : theme.accent
+                }
+                contentItem: Label {
+                    text: parent.text
+                    textFormat: Text.PlainText
+                    color: "#101010"
+                    font.weight: Font.DemiBold
+                    horizontalAlignment: Text.AlignHCenter
+                    verticalAlignment: Text.AlignVCenter
+                }
+                onClicked: panel.signInRequested()
+            }
+            Label { text: "I"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
         }
 
         ProgressBar {

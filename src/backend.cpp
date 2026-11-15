@@ -362,6 +362,12 @@ SyncSummary Backend::summarize(const SyncInputs &in) {
             s.causeDetail = !in.fixInterrupted ? in.fixError
                             : unitFailed       ? in.fixUnitResult
                                                : QString("the fix stopped halfway");
+            // Google refused the token: sign in again (I), then retry (F);
+            // rclone's own advice needs a terminal.
+            if (!in.fixInterrupted && isTokenError(in.fixError)) {
+                s.causeKind = "signIn";
+                s.causeDetail.clear();
+            }
         } else {
             s.status = fixWaiting(in.fixStep) ? "fixWaiting" : "fixing";
         }

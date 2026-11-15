@@ -49,6 +49,12 @@ struct FixTools {
 // --retry [--json]". --answers takes {"<path>": "cloud" | "notebook"}, and
 // every file the fix asked about must have one. systemctl is the one in paths.
 int runFixCommand(const QStringList &arguments, const BackendPaths &paths, QTextStream &out, QTextStream &err);
+// --start, and first setup after it wrote the config: writes the mark
+// (step "preparing") before anything else, then starts drive-sync-fix.service,
+// and removes the mark again when systemd says no. Refused unless DriveSync
+// runs drive-sync (paths.managed), during a fix or a takeover, and for the
+// config refusals. Call it holding the FixLock. The error, or empty.
+QString startFix(const BackendPaths &paths);
 // --retry: from a failed step, or one the unit left halfway; starts the
 // unit. Call it holding the FixLock. The error, or empty.
 QString retryFix(const BackendPaths &paths, const FixState &state);

@@ -142,6 +142,11 @@ QString causeSentence(const QString &kind, const QString &detail) {
     if (kind == "filtersChanged")
         return tr("The filters changed since the last base, so every run waits. "
                   "Open DriveSync and press F to rebuild the base with them.");
+    if (kind == "firstSyncPending")
+        return tr("The first sync was never confirmed, so nothing syncs yet. Open DriveSync and press F to see "
+                  "its dry run.");
+    if (kind == "signIn")
+        return tr("Google no longer accepts DriveSync's sign-in, so nothing syncs. Open DriveSync and sign in again.");
     return detail;
 }
 
@@ -292,6 +297,8 @@ int runNotifyCommand(const QString &serviceResult, const BackendPaths &paths, co
     const QString stillStopped = tr("Drive is still stopped");
     const QString filters = tr("Drive filters changed");
     const QString stillFilters = tr("Drive filters still changed");
+    const QString firstSync = tr("Drive's first sync waits for you");
+    const QString stillFirstSync = tr("Drive's first sync still waits for you");
     if (serviceResult == "exec-condition")
         return 0;  // skipped on purpose: paused, a fix under way, or runOnlyWhen said no
     // drive-sync run became rclone, so the run let through is checked here,
@@ -299,7 +306,7 @@ int runNotifyCommand(const QString &serviceResult, const BackendPaths &paths, co
     notifyUnconfirmedDeletes(tools, checkConfirmedRun(paths.appState, paths.log));
     if (serviceResult == "success") {
         reportSolved(tools, file, tr("Drive is syncing again"), tr("It had stopped at %1."),
-                     {stopped, stillStopped, filters, stillFilters});
+                     {stopped, stillStopped, filters, stillFilters, firstSync, stillFirstSync});
         return 0;
     }
     QString kind, stopKey;
@@ -308,6 +315,9 @@ int runNotifyCommand(const QString &serviceResult, const BackendPaths &paths, co
     // Changed filters are the user's own edit, waiting for F: news, not an alarm.
     if (kind == "filtersChanged")
         reportProblem(tools, file, filters, stillFilters, text, tr("Since %1."), now, "normal");
+    // A first sync nobody confirmed waits for the user's F, like an edit.
+    else if (kind == "firstSyncPending")
+        reportProblem(tools, file, firstSync, stillFirstSync, text, tr("Since %1."), now, "normal");
     else
         reportProblem(tools, file, stopped, stillStopped, text, tr("Stopped since %1. Log: %2").arg("%1", paths.log),
                       now, "critical", stopKey, news);
@@ -342,7 +352,10 @@ void notifyFixNeedsYou(const NotifierPaths &tools, const FixState &state, bool s
     close(tools, 0, {waiting, halted});
     if (stopped)
         notify(tools, "critical", "dialog-warning", halted,
-               (state.error.isEmpty() ? tr("It stopped halfway.") : state.error.left(200)) + "\n"
+               (state.error.isEmpty()          ? tr("It stopped halfway.")
+                : isTokenError(state.error) ? tr("Google no longer accepts DriveSync's sign-in. Open DriveSync, sign in again and retry the fix.")
+                                               : state.error.left(200))
+                   + "\n"
                    + tr("Drive does not sync until it ends. Open DriveSync to retry or cancel it."));
     else
         notify(tools, "normal", "dialog-information", waiting,

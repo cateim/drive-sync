@@ -30,6 +30,8 @@
   "cause.filtersChanged": "Os filtros mudaram: abra o DriveSync e aperte F",
   "cause.fixInterrupted": "O conserto parou no meio: abra o DriveSync para tentar de novo",
   "cause.maxDelete": "Uma rodada apagaria arquivos demais: abra o DriveSync e aperte D",
+  "cause.signIn": "O Google desconectou o DriveSync: abra o DriveSync e faça login de novo",
+  "cause.firstSyncPending": "A primeira sincronização nunca foi confirmada: abra o DriveSync e aperte F",
   "row.lastSuccess": "Última sincronização",
   "row.lastSuccessValue": "%1 (%2)",
   "row.lastRun": "Última rodada",

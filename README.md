@@ -27,6 +27,9 @@ and a bar widget, driven from the keyboard.
 - **Notifications**: a card when a run fails, a reminder every hour while it
   keeps failing, and a note once it works again; an hourly check for a timer
   that is off; a daily reminder of a pause with no end.
+- **First setup**: with no drive-sync at all, signs in to Google in the
+  browser, takes the folder you pick and starts the sync after a dry run you
+  confirm; when Google later drops the sign-in, `I` signs in again.
 - **Takeover**: runs an existing drive-sync from DriveSync's own units with
   the same rclone command, so no resync is needed, and can go back.
 - **Fix**: rebuilds the base of both sides after lost listings, listings out
@@ -36,8 +39,9 @@ and a bar widget, driven from the keyboard.
 It starts a resync only as a fix you confirmed, and touches no synced file
 otherwise. It writes its own state in `~/.local/state/drive-sync-app/`, the link
 to its bar widget and, when you accept, the bar layout through
-`omarchy plugin`. After a takeover it also owns `~/.config/drive-sync/` and
-the `drive-sync` user timers.
+`omarchy plugin`. After a takeover or a first setup it also owns
+`~/.config/drive-sync/` and the `drive-sync` user timers, and a first setup
+adds the `drive-sync` remote to `rclone.conf` through rclone itself.
 
 ## Screens
 
@@ -63,7 +67,8 @@ the `drive-sync` user timers.
 | `O`              | Open the Drive folder                                           |
 | `P`              | Pause for 1 hour, until 8:00 or until resumed                   |
 | `U`              | Resume, and start a run                                         |
-| `T`              | Let DriveSync run drive-sync, when offered                      |
+| `T`              | Set up drive-sync, or take over the one you have, when offered  |
+| `I`              | Sign in to Google again, when Google no longer accepts it       |
 | `F`, `X`         | Fix a broken sync, or cancel the fix in its dialog              |
 | `C`, `L`         | Keep the cloud's or the notebook's file, in the fix's questions |
 | `D`              | Review what a max-delete stop would delete                      |
@@ -88,6 +93,7 @@ the `drive-sync` user timers.
 | `~/.local/state/drive-sync-app/paused.json`                      | A pause, and when it ends                                    |
 | `~/.local/state/drive-sync-app/fix.json`                         | A fix: its step, the dry run's count and its questions       |
 | `find ~/Drive -name '*.conflict[0-9]*'`                     | Conflict copies (`.git`, `node_modules` and `.venv` skipped) |
+| `rclone listremotes`, `rclone config dump`                  | Sign-in only: whether the `drive-sync` remote exists and holds a token, read in memory and never shown |
 
 The log is watched, systemd is polled every 30 seconds (5 while a run is
 going), and conflict copies are looked for again every 2 minutes and after
@@ -112,6 +118,55 @@ offer does not come back; delete `~/.local/state/drive-sync-app/bar-declined` to
 be asked again. After a package upgrade, `omarchy restart shell` loads the new
 widget. In its panel, `S` syncs now, `P` pauses for an hour or resumes, and
 `?` lists every key; hovering an icon says what it does.
+
+## First setup
+
+With no drive-sync at all, the window offers to set one up (`T`). The
+dialog goes through three steps, and nothing is copied before the last one:
+
+1. **Sign in to Google.** Your browser opens Google's sign-in page for
+   DriveSync, through rclone's own flow (`rclone config create`): the token
+   goes from Google into `rclone.conf` and never through DriveSync. The new
+   rclone remote is called `drive-sync`. If the browser does not open, the
+   dialog shows the local address to open by hand. Closing the dialog or the
+   window while the browser waits (or Ctrl+C on `drive-sync signin`) stops
+   rclone alone, never the browser, and removes the half-made remote. A
+   `drive-sync` remote DriveSync made earlier is used again (signed in again
+   when its token no longer works); one you made yourself is never touched.
+2. **Choose the folder,** `~/Drive` by default. Files already in it stay and
+   go to the cloud; where both sides have a file at the same path, the newer
+   copy wins on both, and the dry run lists every copy.
+3. **Start.** DriveSync writes its default filters
+   (`~/.config/drive-sync/filters.txt`: `.git`, `node_modules`, `.venv`,
+   Python caches, Google Docs shortcuts and system junk) and its config, and
+   starts a fix (see below): a dry run lists every copy in both directions,
+   and the base run waits for your confirmation. The timers come on at the
+   same time, but every tick waits until the fix ends.
+
+Setup needs rclone 1.66 or newer, and refuses when a drive-sync already
+exists (take it over instead), when the folder is the home folder or holds or
+sits inside `~/.config`, `~/.local/state` or the folders of DriveSync and
+rclone, or when `~/.config/drive-sync/filters.txt` already exists.
+
+Cancelling that first fix (`X`) before its base run undoes the setup: the
+timers go off, the config and the filters it wrote go, and the window offers
+setup again, so another folder can be picked. A run refused because no first
+sync was ever confirmed says so ("press F"), never that the filters changed.
+
+The Google client DriveSync signs in with is compiled in from
+`src/oauthclient.local.h`, which is not in the repository; a build without it
+says "this build has no Google client" (see `src/oauthclient.local.h.example`).
+
+### Signing in again
+
+When Google no longer accepts the token (it expired, or the access was
+revoked in the Google account), every run fails with the cause "sign in
+again" in the window, the card and the bar, never rclone's own advice, which
+needs a terminal. `I` opens the browser sign-in again for the remote the
+config uses, with that remote's own client (a taken-over setup keeps the one
+it was made with), and then starts a run. A fix that stopped on the token
+says the same: sign in again (`I`), then retry it (`F`). A network failure
+while fetching the token is an ordinary error, not a sign-in.
 
 ## Taking over drive-sync
 
@@ -223,13 +278,18 @@ drive-sync status --json    # the same state as JSON, for the bar and scripts
 drive-sync sync             # one run now
 drive-sync pause [--minutes N | --until-tomorrow]   # no flag: until resumed
 drive-sync resume           # end the pause and start a run
+drive-sync signin           # sign in to Google in the browser (first setup, or again)
+drive-sync signin --abandon # remove a drive-sync remote whose sign-in never finished
+drive-sync setup --folder <path>   # first setup, after signin: filters, config, the fix
 drive-sync takeover --check | --apply | --undo
 drive-sync fix --start | --confirm | --answers <file.json> | --cancel | --retry
 drive-sync deletes --list | --allow <count>   # after a max-delete stop
 ```
 
-`sync`, `pause`, `resume`, `takeover`, `fix` and `deletes` take `--json` and
-answer `{"ok": ..., "error": ...}`. `fix --answers` reads `{"<path>": "cloud" |
+`sync`, `pause`, `resume`, `signin`, `setup`, `takeover`, `fix` and `deletes`
+take `--json` and answer `{"ok": ..., "error": ...}`. `signin --json` first
+prints `{"link": ...}` once rclone has its local sign-in address, and refuses a
+`drive-sync` remote it did not make with `reason` `remoteExists`. `fix --answers` reads `{"<path>": "cloud" |
 "notebook"}` with an answer for every file the fix asked about. `deletes
 --list --json` adds `count`, `cloudCount`, `notebookCount`, `guardCount`,
 `guardTotal`, `runStart` and `list` (at most 500 `{path, deletedInCloud}`);
@@ -260,6 +320,7 @@ of the Google Drive mirror.
 bin/build            # build/drive-sync
 build/drive-sync      # run it
 bin/test             # Qt Test, offscreen
+cp src/oauthclient.local.h.example src/oauthclient.local.h   # then fill in the Google client, to sign in
 (cd plugin && node --test tests/*.test.mjs)   # the bar widget's logic
 ```
 

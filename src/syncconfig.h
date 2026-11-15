@@ -35,3 +35,7 @@ bool filtersUsable(const QString &filtersFile, QString *why);
 // Ends every refusal of filtersUsable, so the log parser can tell a run
 // refused for changed filters (which a fix repairs) from any other error.
 inline constexpr char kFiltersChangedReason[] = "so bisync would lose its base";
+// Ends the refusal of a run before the first base was ever made (a first
+// setup whose dry run was not confirmed): no .md5 and no listings. The log
+// parser gives it a cause of its own, so it never reads as edited filters.
+inline constexpr char kFirstSyncPendingReason[] = "open DriveSync and press F to see its dry run";

@@ -12,6 +12,11 @@
 .env
 .env.*
 !.env.example
+# The Google OAuth client this build ships (drivesync.pro picks it up when it
+# exists). The maintainer fills it by hand; it never enters the repository, so
+# a fork builds without a client instead of signing in as DriveSync.
+# src/oauthclient.local.h.example is the committed template.
+/src/oauthclient.local.h
 
 # ---- Logs ----
 *.log

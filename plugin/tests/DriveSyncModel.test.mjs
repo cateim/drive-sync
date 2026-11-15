@@ -281,12 +281,23 @@ test("warnings get the window's orange on the bar and in the panel", () => {
 
 test("the failing line has a sentence for every cause the app names", () => {
   const qml = readFileSync(new URL("../DriveSync.qml", import.meta.url), "utf8")
-  for (const kind of ["lostListings", "outOfSync", "timeout", "systemd", "filtersChanged", "fixInterrupted", "maxDelete"])
+  for (const kind of ["lostListings", "outOfSync", "timeout", "systemd", "filtersChanged", "fixInterrupted", "maxDelete",
+                      "signIn", "firstSyncPending"])
     assert.match(qml, new RegExp(`case "${kind}": return strings\\.t\\("cause\\.${kind}"\\)`), kind)
   // A fix that stopped says why too, not only a failed run.
   assert.match(qml, /root\.syncState === "failing" \|\| root\.status\.status === "fixFailed"/)
   // An "error" with no line, or a kind this widget does not know, still says something.
   assert.match(qml, /status\.causeDetail !== "" \? status\.causeDetail : strings\.t\("cause\.unknown"\)/)
+})
+
+test("an expired or revoked sign-in asks to sign in again, never for a terminal", () => {
+  for (const lang of ["en", "pt-BR"]) {
+    const catalog = JSON.parse(readFileSync(new URL(`../i18n/${lang}.json`, import.meta.url), "utf8"))
+    assert.ok("cause.signIn" in catalog, lang)
+    assert.doesNotMatch(catalog["cause.signIn"], /reconnect/, lang)
+  }
+  const en = JSON.parse(readFileSync(new URL("../i18n/en.json", import.meta.url), "utf8"))
+  assert.match(en["cause.signIn"], /sign in again/)
 })
 
 test("every status the app prints has a headline in both catalogs", () => {

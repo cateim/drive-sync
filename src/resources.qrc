@@ -16,6 +16,8 @@
         <file alias="FixQuestions.qml">FixQuestions.qml</file>
         <file alias="DeleteBanner.qml">DeleteBanner.qml</file>
         <file alias="DeleteDialog.qml">DeleteDialog.qml</file>
+        <file alias="SetupBanner.qml">SetupBanner.qml</file>
+        <file alias="SetupDialog.qml">SetupDialog.qml</file>
         <file alias="format.js">format.js</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="i18n/pt-BR.json">i18n/pt-BR.json</file>

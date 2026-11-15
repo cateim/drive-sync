@@ -1,0 +1,8 @@
+// The Google OAuth client DriveSync signs in with: copy this file to
+// src/oauthclient.local.h (git-ignored) and fill in the desktop client of the
+// DriveSync Google Cloud project. Without that file, or with these values
+// left empty, the build has no client and "drive-sync signin" says so.
+#pragma once
+
+#define DRIVESYNC_OAUTH_ID ""      // ends with .apps.googleusercontent.com
+#define DRIVESYNC_OAUTH_SECRET ""

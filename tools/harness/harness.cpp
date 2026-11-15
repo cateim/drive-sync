@@ -10,17 +10,24 @@
 //                                        maxdelete: the last run stopped at the guard, 2 + 1800 deletions;
 //                                        guardfilters: that stop, then a run refused for edited filters;
 //                                        keptguard: that stop, after a confirmation that kept the guard;
-//                                        unconfirmed: the run let through deleted 2 files nobody confirmed
+//                                        unconfirmed: the run let through deleted 2 files nobody confirmed;
+//                                        setup-offer: no drive-sync at all (empty log, takeover "none");
+//                                        setup-signing-in: that, with a sign-in that waits for the browser;
+//                                        setup-folder: that, with a sign-in that ends at once;
+//                                        signin-needed: the last run failed on a revoked token (implies --managed;
+//                                        with --fix failed, the fix stopped on it)
 //   --clock "<Qt format>"                the bar clock; without it, the system locale's hours
 //   --pause none|hour|forever|ended      a pause mark; --managed: DriveSync's own units
-//   --takeover none|offer|running|blocked|failed
+//   --takeover managed|none|offer|running|blocked|failed   managed by default: "none" means no
+//                                        drive-sync at all, which offers first setup
 //   --bar none|offer|blocked             what the fake omarchy says about the widget
 //   --fix none|fixing|confirm|questions|failed   a fix at that step (implies --managed);
 //                                        confirm comes with a dry run of 1200 copies
 //   --fix-later                          writes that fix after the window is up, so it opens by itself
 //   --keys <letters>                     t Tab, digits (1 and 2 the tabs), h ?, d Down, e Esc,
 //                                        s Space, p P, o T, f F, D D, c C, l L, x X, r Enter,
-//                                        b Backspace, w waits a second
+//                                        b Backspace, w waits a second, I I, Q Q (typed into a field
+//                                        it must not quit)
 //   --width N --height N                 1000x700 by default
 //   --real                               this machine's drive-sync: never for the README
 
@@ -43,6 +50,7 @@
 #include "fixstate.h"
 #include "pausestate.h"
 #include "pluginsetup.h"
+#include "setupcontroller.h"
 #include "takeoversetup.h"
 #include "theme.h"
 #include "translator.h"
@@ -130,6 +138,12 @@ int main(int argc, char **argv) {
         if (scenario == "guardfilters")
             log += L(now.addSecs(-60), "CRITICAL", "DriveSync did not start rclone: /home/someone/.config/drive-sync/filters.txt "
                                                    "changed since the last resync, so bisync would lose its base");
+    } else if (scenario == "signin-needed") {
+        // What rclone 1.75 writes when Google refuses the refresh token.
+        log += L(now.addSecs(-200), "ERROR",
+                 "Failed to create file system for \"gdrive:\": couldn't find root directory ID: Get "
+                 "\"https://www.googleapis.com/drive/v3/files/root\": couldn't fetch token: invalid_grant: maybe token "
+                 "expired? - try refreshing with \"rclone config reconnect gdrive:\"");
     } else if (scenario == "unconfirmed") {
         // The run let through: one file on each side went after the dry run.
         const QDateTime s = now.addSecs(-120);
@@ -139,11 +153,13 @@ int main(int argc, char **argv) {
         log += L(s, "INFO", C("Path2", "File was deleted", "Notes/old-draft.md"));
         log += L(s.addSecs(30), "INFO", "Bisync successful");
     }
-    if (scenario == "empty")
+    // No drive-sync at all: nothing has run yet.
+    const bool firstSetup = scenario.startsWith("setup-");
+    if (scenario == "empty" || firstSetup)
         log.clear();  // a new or just rotated log
     put(dir.filePath("drive-sync.log"), log.toUtf8());
 
-    if (scenario != "clean" && scenario != "empty") {
+    if (scenario != "clean" && scenario != "empty" && !firstSetup) {
         put(dir.filePath("Drive/Notes/ideas.md.conflict1"), QByteArray(2400, 'x'));
         put(dir.filePath("Drive/Spreadsheets/bills.xlsx.conflict1"), QByteArray(18300, 'x'));
     } else {
@@ -168,7 +184,7 @@ int main(int argc, char **argv) {
     BackendPaths fake{dir.filePath("drive-sync.log"), dir.filePath("Drive"), dir.filePath("state"),
                       dir.filePath("proc"), systemctl, QStandardPaths::findExecutable("find"), dir.filePath("app"),
                       QString(), QString()};
-    fake.managed = args.contains("--managed") || fix != "none";
+    fake.managed = args.contains("--managed") || fix != "none" || scenario == "signin-needed";
     if (confirmedAt.isValid()) {
         ConfirmedRun run;
         run.at = confirmedAt;
@@ -204,7 +220,10 @@ int main(int argc, char **argv) {
         }
         if (fix == "failed") {
             state.failedStep = "base";
-            state.error = "Bisync critical error: prior lock file found: ~/.local/state/rclone/bisync/gdrive_..lck";
+            state.error = scenario == "signin-needed"
+                ? "Failed to create file system for \"gdrive:\": couldn't fetch token: invalid_grant: maybe token expired? - "
+                  "try refreshing with \"rclone config reconnect gdrive:\""
+                : "Bisync critical error: prior lock file found: ~/.local/state/rclone/bisync/gdrive_..lck";
         }
         writeFix(fake.appState, state);
     };
@@ -219,22 +238,32 @@ int main(int argc, char **argv) {
         if (pause == "ended") mark.until = QDateTime::currentDateTimeUtc().addSecs(-60);
         writePause(pauseFilePath(fake.appState), mark);
     }
-    const QString takeover = opt("--takeover", "none");
+    // The README pictures show a drive-sync DriveSync already runs; "none"
+    // (no drive-sync at all) is what offers first setup.
+    const QString takeover = firstSetup ? QString("none") : opt("--takeover", "managed");
     const QByteArray answer =
         takeover == "offer" ? R"({"ok":true,"error":"","state":"found","found":["/home/someone/.config/systemd/user/drive-sync.service","/home/someone/.config/systemd/user/drive-sync.timer","/home/someone/.local/bin/drive-sync.sh","/home/someone/.config/rclone/gdrive-filtros.txt"],"blockers":[]})"
         : takeover == "running" ? R"({"ok":true,"error":"","state":"found","found":[],"blockers":["running"]})"
         : takeover == "blocked" ? R"({"ok":true,"error":"","state":"found","found":[],"blockers":["running","differentValue:Nice"]})"
         : takeover == "failed" ? R"({"ok":false,"error":"could not stop the old timers: Access denied","state":"","found":[],"blockers":[]})"
-        : R"({"ok":true,"error":"","state":"none","found":[],"blockers":[]})";
+        : takeover == "none" ? R"({"ok":true,"error":"","state":"none","found":[],"blockers":[]})"
+        : R"({"ok":true,"error":"","state":"managed","found":[],"blockers":[]})";
     put(dir.filePath("answer.json"), answer);
     // The fake drive-sync answers every child call with the takeover check,
-    // and logs the calls, which are printed at the end.
-    put(dir.filePath("drive-sync"), QString("#!/bin/sh\necho \"$*\" >> '%2'\ncat '%1'\n").arg(dir.filePath("answer.json"), dir.filePath("calls.log")).toUtf8());
+    // and logs the calls, which are printed at the end. Its sign-in waits for
+    // a browser that never answers, or, for setup-folder, ends at once. The
+    // window's "signin --abandon" runs detached and can outlive the temp dir.
+    const QString signinAnswer = scenario == "setup-folder"
+        ? "echo '{\"ok\":true,\"error\":\"\"}'; exit 0"
+        : "echo '{\"link\":\"http://127.0.0.1:53682/auth?state=k3Jv9QxT2mWb7LpA\"}'; exec sleep 30";
+    put(dir.filePath("drive-sync"), QString("#!/bin/sh\necho \"$*\" >> '%2'\n[ \"$*\" = 'signin --json' ] && { %3; }\ncat '%1' 2>/dev/null\n")
+                                        .arg(dir.filePath("answer.json"), dir.filePath("calls.log"), signinAnswer).toUtf8());
     QFile::setPermissions(dir.filePath("drive-sync"), QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     fake.self = dir.filePath("drive-sync");
     Backend backend(real ? BackendPaths::defaults() : fake);
     TakeoverSetup takeoverSetup(dir.filePath("drive-sync"));
     takeoverSetup.check();
+    SetupController setupController(dir.filePath("drive-sync"), "/home/someone/Drive");
 
     // none: the widget is already on the bar, so no banner shows.
     const QString bar = opt("--bar", "none");
@@ -268,6 +297,7 @@ int main(int argc, char **argv) {
     engine.rootContext()->setContextProperty("backend", &backend);
     engine.rootContext()->setContextProperty("pluginSetup", &pluginSetup);
     engine.rootContext()->setContextProperty("takeoverSetup", &takeoverSetup);
+    engine.rootContext()->setContextProperty("setupController", &setupController);
     engine.load(QUrl("qrc:/Main.qml"));
     if (engine.rootObjects().isEmpty())
         return 1;
@@ -295,6 +325,8 @@ int main(int argc, char **argv) {
         else if (k == 'x') QTest::keyClick(window, Qt::Key_X);
         else if (k == 'r') QTest::keyClick(window, Qt::Key_Return);
         else if (k == 'w') QTest::qWait(1100);
+        else if (k == 'I') QTest::keyClick(window, Qt::Key_I);
+        else if (k == 'Q') QTest::keyClick(window, Qt::Key_Q, Qt::NoModifier);
         else if (k.isDigit()) QTest::keyClick(window, Qt::Key(Qt::Key_0 + k.digitValue()));
         QTest::qWait(250);
     }

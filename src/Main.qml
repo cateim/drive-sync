@@ -41,6 +41,12 @@ ApplicationWindow {
                 else if (step === "questions")
                     fixQuestions.openGuarded()
             }
+            // A fix gone: a cancelled first setup also took its config away,
+            // and the window offers setup again.
+            if (step === "" && win.lastFixStep !== "") {
+                backend.reloadConfig()
+                takeoverSetup.check()
+            }
             win.lastFixStep = step
         }
     }
@@ -64,6 +70,30 @@ ApplicationWindow {
                 takeoverDialog.open()
         }
     }
+
+    // First setup: once it started, its fix takes over (the dry run opens
+    // the fix dialog by itself), so the dialog goes first. A sign-in again
+    // ends with a run, which shows whether Google takes the new token.
+    Connections {
+        target: setupController
+        function onSetupStarted() {
+            setupDialog.close()
+            takeoverSetup.check()
+            backend.reloadConfig()
+        }
+        function onSignedIn() {
+            if (!setupDialog.again)
+                return
+            setupDialog.close()
+            if (backend.canSyncNow)
+                backend.syncNow()
+        }
+    }
+    // No drive-sync at all: T offers first setup instead of a takeover.
+    readonly property bool setupOffered: takeoverSetup.state === "none" && !backend.managed
+    // Google no longer takes the token of the drive-sync DriveSync runs.
+    readonly property bool signInNeeded: backend.managed && (backend.status === "failed" || backend.status === "fixFailed")
+                                         && backend.causeKind === "signIn"
 
     // Runs take about half of each 15 min tick, so the offer is often away
     // when the user looks. T during a run arms it: the dialog opens by itself
@@ -96,6 +126,7 @@ ApplicationWindow {
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: fixDialog.visible; onActivated: fixDialog.close() }
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: fixQuestions.visible; onActivated: fixQuestions.close() }
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: deleteDialog.visible; onActivated: deleteDialog.close() }
+    Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: setupDialog.visible; onActivated: setupDialog.close() }
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; onActivated: Qt.quit() }
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; onActivated: backend.refresh() }
     Shortcut { sequence: "O"; context: Qt.ApplicationShortcut; enabled: !win.dialogOpen; onActivated: backend.openDriveFolder() }
@@ -114,7 +145,7 @@ ApplicationWindow {
     // While a dialog is open its own keys win: two enabled shortcuts on the
     // same key cancel each other out.
     readonly property bool dialogOpen: pauseMenu.visible || takeoverDialog.visible || fixDialog.visible
-                                       || fixQuestions.visible || deleteDialog.visible
+                                       || fixQuestions.visible || deleteDialog.visible || setupDialog.visible
     // The newest run stopped at the max-delete guard and DriveSync runs
     // drive-sync: D reviews what it would delete (spec 5b). Also after a
     // fix whose final run stopped there. Never while a run is under way.
@@ -146,9 +177,11 @@ ApplicationWindow {
     Shortcut {
         sequence: "T"
         context: Qt.ApplicationShortcut
-        enabled: !win.dialogOpen && (takeoverSetup.state === "offer" || win.takeoverWaitsForRun)
+        enabled: !win.dialogOpen && (takeoverSetup.state === "offer" || win.takeoverWaitsForRun || win.setupOffered)
         onActivated: {
-            if (takeoverSetup.state === "offer")
+            if (win.setupOffered)
+                setupDialog.openSetup()
+            else if (takeoverSetup.state === "offer")
                 takeoverDialog.open()
             else if (takeoverSetup.pending)
                 takeoverSetup.cancelPending()
@@ -167,6 +200,18 @@ ApplicationWindow {
         enabled: !win.dialogOpen && backend.managed && backend.status !== "fixing"
                  && !(backend.status === "failed" && backend.guardStopHolds)
         onActivated: win.openFix()
+    }
+    Shortcut {
+        sequence: "I"
+        context: Qt.ApplicationShortcut
+        enabled: !win.dialogOpen && win.signInNeeded
+        onActivated: setupDialog.openAgain()
+    }
+    Shortcut {
+        sequence: "X"
+        context: Qt.ApplicationShortcut
+        enabled: setupDialog.visible && setupController.state === "signingIn"
+        onActivated: setupController.cancel()
     }
     Shortcut {
         sequence: "X"
@@ -214,6 +259,12 @@ ApplicationWindow {
         enabled: deleteDialog.visible
         onActivated: deleteDialog.accept()
     }
+    Shortcut {
+        sequences: ["Return", "Enter"]
+        context: Qt.ApplicationShortcut
+        enabled: setupDialog.visible
+        onActivated: setupDialog.accept()
+    }
 
     // Right-to-left languages mirror the window; the Translator sets the
     // application's layout direction.
@@ -230,6 +281,7 @@ ApplicationWindow {
             StatusPanel {
                 Layout.fillWidth: true
                 now: win.now
+                onSignInRequested: setupDialog.openAgain()
             }
 
             ControlsRow {
@@ -254,6 +306,11 @@ ApplicationWindow {
                 armed: win.takeoverArmed
                 waitsForRun: win.takeoverWaitsForRun
                 onConfirmRequested: takeoverDialog.open()
+            }
+
+            SetupBanner {
+                Layout.fillWidth: true
+                onSetupRequested: setupDialog.openSetup()
             }
 
             BarBanner {
@@ -322,5 +379,6 @@ ApplicationWindow {
         FixDialog { id: fixDialog }
         FixQuestions { id: fixQuestions; now: win.now }
         DeleteDialog { id: deleteDialog }
+        SetupDialog { id: setupDialog }
     }
 }

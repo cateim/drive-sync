@@ -203,8 +203,15 @@ int runConditionCommand(const BackendPaths &paths, const SyncConfig &config, con
 }
 
 QStringList runCommandPlan(const SyncConfig &config, QString *refusal, const std::optional<AllowDeletes> &allow) {
-    if (!filtersUsable(config.filtersFile, refusal))
+    if (!filtersUsable(config.filtersFile, refusal)) {
+        // No .md5 and no listings: no base was ever built (a first setup whose
+        // dry run nobody confirmed), which is not an edit of the filters.
+        if (!QFile::exists(config.filtersFile + ".md5")
+            && currentListings(config.workDir, bisyncSessionName(config.remote, config.localPath)).first.isEmpty())
+            *refusal = QString("the first sync of %1 has not been confirmed yet, so nothing syncs; %2")
+                           .arg(config.localPath, kFirstSyncPendingReason);
         return {};
+    }
     const QStringList arguments = rcloneRunArguments(config);
     if (!allow)
         return arguments;

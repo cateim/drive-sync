@@ -4,7 +4,8 @@ import QtQuick.Controls.Material
 import QtQuick.Layouts
 
 // Offers the fix when a run failed in a way only a new base repairs: lost
-// listings, listings out of sync, or filters edited since the last base.
+// listings, listings out of sync, filters edited since the last base, or a
+// first sync whose dry run nobody confirmed.
 // Nothing starts until the user confirms in the dialog that F opens.
 Rectangle {
     id: banner
@@ -13,7 +14,7 @@ Rectangle {
 
     readonly property color accent: theme.accent
     readonly property bool needsBase: backend.status === "failed"
-        && ["lostListings", "outOfSync", "filtersChanged"].indexOf(backend.causeKind) >= 0
+        && ["lostListings", "outOfSync", "filtersChanged", "firstSyncPending"].indexOf(backend.causeKind) >= 0
 
     // After a guard stop a fix would bring the deleted files back (spec 5b),
     // even when edited filters made the runs after it refuse.

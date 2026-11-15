@@ -23,6 +23,9 @@
 #include <memory>
 #include <atomic>
 #include <thread>
+#include <signal.h>
+#include <sys/resource.h>
+#include <unistd.h>
 
 #include "backend.h"
 #include "blockeddeletes.h"
@@ -31,11 +34,15 @@
 #include "controlcommands.h"
 #include "legacymigration.h"
 #include "fixcommand.h"
+#include "firstsetup.h"
 #include "fixstate.h"
 #include "listingdiff.h"
 #include "notifier.h"
+#include "oauthclient.h"
 #include "pausestate.h"
 #include "pluginsetup.h"
+#include "setupcontroller.h"
+#include "signin.h"
 #include "snapshot.h"
 #include "statuscommand.h"
 #include "syncconfig.h"
@@ -662,12 +669,257 @@ QString fakeDrivesync(const QString &dir, const QByteArray &takeoverAnswer, bool
     return path;
 }
 
+// The client the sign-in tests hand to the command: made up, so the shipped
+// one (when this build has it) never reaches a fake rclone's call log.
+OAuthClient fakeClient() {
+    return {"fake-client.apps.googleusercontent.com", "fake-secret"};
+}
+
+// An rclone for "drive-sync signin" and "drive-sync setup" that writes each
+// call to rclone-calls.log, one line, arguments separated by tabs. Files in
+// dir steer it: remotes (what listremotes prints), dump (config dump),
+// version (the version line), create-exit, update-exit, lsjson-exit,
+// lsjson-fails-once, create-hangs (create waits until killed), create-notice
+// (printed on stderr first), create-stderr (printed on a failed create).
+QString fakeSignInRclone(const QString &dir) {
+    const QString path = dir + "/rclone";
+    write(path, QString(R"sh(#!/bin/sh
+for a in "$@"; do printf '%s\t' "$a"; done >> '%1/rclone-calls.log'
+echo >> '%1/rclone-calls.log'
+case "$1 $2" in
+  "listremotes "*) cat '%1/remotes' 2>/dev/null ;;
+  "version "*) cat '%1/version' 2>/dev/null || echo 'rclone v1.75.2' ;;
+  "config create")
+    [ -f '%1/create-notice' ] && cat '%1/create-notice' >&2
+    [ -f '%1/create-hangs' ] && exec sleep 5
+    code=$(cat '%1/create-exit' 2>/dev/null || echo 0)
+    [ "$code" = 0 ] || cat '%1/create-stderr' >&2 2>/dev/null
+    exit "$code" ;;
+  "config update") exit "$(cat '%1/update-exit' 2>/dev/null || echo 0)" ;;
+  "config dump") cat '%1/dump' 2>/dev/null || echo '{}' ;;
+  "config delete") exit 0 ;;
+  "lsjson "*)
+    echo '[]'
+    if [ -f '%1/lsjson-fails-once' ]; then rm '%1/lsjson-fails-once'; exit 1; fi
+    exit "$(cat '%1/lsjson-exit' 2>/dev/null || echo 0)" ;;
+esac
+exit 0
+)sh").arg(dir).toUtf8());
+    QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    return path;
+}
+
+// The calls the fake rclone recorded, each as its arguments.
+QList<QStringList> rcloneCalls(const QString &dir) {
+    QList<QStringList> calls;
+    QFile file(dir + "/rclone-calls.log");
+    if (!file.open(QIODevice::ReadOnly))
+        return calls;
+    for (const QByteArray &line : file.readAll().split('\n')) {
+        if (line.isEmpty())
+            continue;
+        QStringList arguments = QString::fromUtf8(line).split('\t');
+        arguments.removeLast();  // every argument ends with a tab
+        calls << arguments;
+    }
+    return calls;
+}
+
+struct CommandResult {
+    int code = -1;
+    QString out;
+    QString err;
+};
+
+CommandResult signInCommand(const BackendPaths &paths, const SignInTools &tools, const QStringList &arguments) {
+    CommandResult result;
+    QTextStream out(&result.out);
+    QTextStream err(&result.err);
+    result.code = runSignInCommand(arguments, paths, tools, out, err);
+    out.flush();
+    err.flush();
+    return result;
+}
+
+SignInTools signInTools(const QString &dir) {
+    SignInTools tools;
+    tools.rclone = fakeSignInRclone(dir);
+    tools.client = fakeClient();
+    return tools;
+}
+
+
+// A systemctl for first setup: records each call in calls.log; an enable
+// records "mark preparing" when fix.json already holds that step, and exits
+// with enable-exit; a start exits with start-exit; show answers inactive.
+QString setupSystemctl(const QString &dir, const QString &appState) {
+    const QString path = dir + "/systemctl";
+    write(path, QString(R"sh(#!/bin/sh
+echo "systemctl $*" >> '%1/calls.log'
+case "$*" in
+  *" enable "*)
+    if grep -q preparing '%2/fix.json' 2>/dev/null; then echo 'mark preparing' >> '%1/calls.log'; fi
+    code=$(cat '%1/enable-exit' 2>/dev/null || echo 0)
+    [ "$code" = 0 ] || echo 'Failed to enable unit: denied' >&2
+    exit "$code" ;;
+  *" start "*) exit "$(cat '%1/start-exit' 2>/dev/null || echo 0)" ;;
+  *" show "*) echo inactive ;;
+esac
+exit 0
+)sh").arg(dir, appState).toUtf8());
+    QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    return path;
+}
+
+// Everything first setup reads and writes, inside dir: no config, no old
+// drive-sync, rclone that knows the drive-sync remote.
+struct SetupFixture {
+    BackendPaths paths;
+    TakeoverPaths takeover;
+    QString folder;
+};
+
+SetupFixture makeSetupFixture(const QString &dir) {
+    SetupFixture s;
+    s.paths = controlPaths(dir, false);
+    s.paths.systemctl = setupSystemctl(dir, s.paths.appState);
+    s.takeover.userUnits = dir + "/units";
+    s.takeover.binDir = dir + "/bin";
+    s.takeover.oldStateDir = dir + "/state";
+    s.takeover.appConfigDir = dir + "/config";
+    s.takeover.backupRoot = dir + "/backup";
+    s.takeover.systemctl = s.paths.systemctl;
+    s.takeover.rclone = fakeSignInRclone(dir);
+    s.takeover.packagedUnits = dir + "/packaged";
+    s.takeover.appState = s.paths.appState;
+    s.takeover.systemUserUnits = dir + "/etc";
+    s.paths.config = s.takeover.appConfigDir + "/config.json";
+    // The log in a folder of its own, as ~/.local/state is: setup refuses a
+    // folder inside the log's.
+    QDir().mkpath(dir + "/logs");
+    s.paths.log = dir + "/logs/drive-sync.log";
+    write(dir + "/remotes", "drive-sync:\n");
+    s.folder = dir + "/Drive";
+    return s;
+}
+
+CommandResult setupCommand(const SetupFixture &s, const QString &folder) {
+    CommandResult result;
+    QTextStream out(&result.out);
+    QTextStream err(&result.err);
+    result.code = runSetupCommand({"--folder", folder, "--json"}, s.paths, s.takeover, out, err);
+    out.flush();
+    err.flush();
+    return result;
+}
+
+QString setupError(const CommandResult &r) {
+    return QJsonDocument::fromJson(r.out.toUtf8()).object().value("error").toString("no JSON answer");
+}
+
+
+// A drive-sync for SetupController: records each call in calls.log.
+// "signin --json" prints signin-link first when it exists; then it prints
+// signin-answer once signin-release exists (at once when there is no
+// signin-link), or, with no answer, starts two sleeping processes in its own
+// group, rclone (grandchild.pid) and a browser (browser.pid), and waits.
+// Like the real command, a SIGTERM stops only its rclone and logs "cleaned".
+// "setup" prints setup-answer.
+QString fakeSetupDrivesync(const QString &dir) {
+    const QString path = dir + "/drive-sync";
+    write(path, QString(R"sh(#!/bin/sh
+echo "$*" >> '%1/calls.log'
+case "$*" in
+  "signin --json")
+    if [ -f '%1/signin-link' ]; then
+      cat '%1/signin-link'
+      while [ ! -f '%1/signin-release' ]; do sleep 0.05; done
+    fi
+    if [ -f '%1/signin-answer' ]; then cat '%1/signin-answer'; exit 0; fi
+    sleep 300 &
+    rc=$!
+    sleep 300 &
+    echo $! > '%1/browser.pid'
+    echo $rc > '%1/grandchild.pid'
+    echo $$ > '%1/child.pid'
+    trap 'kill $rc; echo cleaned >> %1/calls.log; exit 1' TERM INT
+    wait $rc ;;
+  "setup "*) cat '%1/setup-answer' ;;
+esac
+exit 0
+)sh").arg(dir).toUtf8());
+    QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    return path;
+}
+
+// Whether the real FixBanner.qml offers F over a stand-in backend with this
+// status and cause: what the window shows.
+bool fixBannerOffers(const QString &status, const QString &causeKind) {
+    QQmlEngine engine;
+    QQmlPropertyMap backend, theme;
+    backend.insert("status", status);
+    backend.insert("causeKind", causeKind);
+    backend.insert("managed", true);
+    backend.insert("fixStep", "");
+    backend.insert("guardStopHolds", false);
+    theme.insert("radius", 8);
+    theme.insert("accent", QColor("#7aa2f7"));
+    engine.rootContext()->setContextProperty("backend", &backend);
+    engine.rootContext()->setContextProperty("theme", &theme);
+    QQmlComponent component(&engine);
+    component.setData(QString("import QtQuick\nimport \"%1\"\nFixBanner {}\n")
+                          .arg(QUrl::fromLocalFile(QString(SRCDIR) + "/../src").toString())
+                          .toUtf8(),
+                      QUrl());
+    std::unique_ptr<QObject> banner(component.create());
+    return banner && banner->property("visible").toBool();
+}
+
+// Gone, or a zombie nobody reaped yet: either way it runs no more.
+bool processGone(qint64 pid) {
+    QFile stat(QString("/proc/%1/stat").arg(pid));
+    if (!stat.open(QIODevice::ReadOnly))
+        return true;
+    const QByteArray text = stat.readAll();
+    return text.mid(text.lastIndexOf(')') + 2, 1) == "Z";
+}
+
 }  // namespace
 
 class DrivesyncTests : public QObject {
     Q_OBJECT
 
+    // Every rclone a test starts, real or through a command under test, reads
+    // this scratch config and finds this xdg-open first on PATH: no test may
+    // touch ~/.config/rclone/rclone.conf or open a real Google sign-in.
+    QTemporaryDir m_sandbox;
+
 private slots:
+    void initTestCase()
+    {
+        QVERIFY(m_sandbox.isValid());
+        QVERIFY(write(m_sandbox.filePath("rclone.conf"), ""));
+        qputenv("RCLONE_CONFIG", m_sandbox.filePath("rclone.conf").toLocal8Bit());
+        const QString opener = m_sandbox.filePath("bin/xdg-open");
+        QVERIFY(QDir().mkpath(m_sandbox.filePath("bin")));
+        QVERIFY(write(opener, QString("#!/bin/sh\necho \"$*\" >> '%1'\n").arg(m_sandbox.filePath("opened.log")).toUtf8()));
+        QFile::setPermissions(opener, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        qputenv("PATH", m_sandbox.filePath("bin").toLocal8Bit() + ":" + qgetenv("PATH"));
+    }
+
+    // The client is whole or absent: half a client would send a sign-in
+    // Google rejects. Only lengths are printed, never the values.
+    void shippedOAuthClientIsWholeOrMissing()
+    {
+        const auto client = shippedOAuthClient();
+        if (!client)
+            return;
+        QVERIFY2(!client->id.isEmpty(), "the shipped client has no id");
+        QVERIFY2(!client->secret.isEmpty(), qPrintable(QString("id of %1 characters, no secret").arg(client->id.size())));
+        QVERIFY2(client->id.endsWith(".apps.googleusercontent.com"),
+                 qPrintable(QString("the id (%1 characters) is not a Google client id").arg(client->id.size())));
+    }
+
     void parsesASuccessfulRun()
     {
         const QDateTime start(QDate(2026, 11, 7), QTime(15, 28, 19));
@@ -2032,9 +2284,20 @@ private slots:
         SyncConfig config = oldUnitConfig();
         config.filtersFile = dir.filePath("filters.txt");
         QVERIFY(write(config.filtersFile, "- .git/**\n"));
+        // No base at all (no listings either): the first sync was never
+        // confirmed, which is no edit of the filters.
+        config.workDir = dir.filePath("work");
         QString refusal;
         QVERIFY(runCommandPlan(config, &refusal).isEmpty());
+        QVERIFY2(refusal.contains(kFirstSyncPendingReason), qPrintable(refusal));
+        // A base whose .md5 went missing: the filters' refusal.
+        const QString session = config.workDir + "/" + bisyncSessionName(config.remote, config.localPath);
+        QVERIFY(QDir().mkpath(config.workDir));
+        QVERIFY(write(session + ".path1.lst", "# bisync listing v1\n") && write(session + ".path2.lst", "# bisync listing v1\n"));
+        refusal.clear();
+        QVERIFY(runCommandPlan(config, &refusal).isEmpty());
         QVERIFY(refusal.contains("filters.txt.md5"));
+        QVERIFY(refusal.contains(kFiltersChangedReason));
 
         QVERIFY(write(config.filtersFile + ".md5",
                       QCryptographicHash::hash("- .git/**\n", QCryptographicHash::Md5).toHex()));
@@ -5593,6 +5856,882 @@ private slots:
                                  "wrote no run to its log"),
                  qPrintable(note));
         QVERIFY(!QFile::exists(allowDeletesPath(s.paths.appState)));
+    }
+
+    void signinCreatesTheRemoteWhenNoConfig()
+    {
+        QTemporaryDir dir;
+        const BackendPaths paths = controlPaths(dir.path(), false);
+        const CommandResult r = signInCommand(paths, signInTools(dir.path()), {});
+        QVERIFY2(r.code == 0, qPrintable(r.err));
+        const QList<QStringList> calls = rcloneCalls(dir.path());
+        QVERIFY(calls.size() >= 2);
+        QCOMPARE(calls.at(0), QStringList{"listremotes"});
+        QVERIFY(calls.at(1) == createRemoteArguments(kNewRemoteName, fakeClient()));
+        // The token is proven before the window moves on.
+        QCOMPARE(calls.last().mid(0, 2), (QStringList{"lsjson", "drive-sync:"}));
+        QCOMPARE(remoteName("gdrive:"), QString("gdrive"));
+        QCOMPARE(remoteName("gdrive:sub/dir"), QString("gdrive"));
+        QCOMPARE(createRemoteArguments("x", {"i", "s"}),
+                 (QStringList{"config", "create", "x", "drive", "client_id", "i", "client_secret", "s", "scope", "drive"}));
+        QCOMPARE(refreshTokenArguments("x"), (QStringList{"config", "update", "x", "config_refresh_token", "true"}));
+    }
+
+    void signinRefusesAnExistingRemote()
+    {
+        QTemporaryDir dir;
+        const BackendPaths paths = controlPaths(dir.path(), false);
+        QVERIFY(write(dir.filePath("remotes"), "gdrive:\ndrive-sync:\n"));
+        // A remote of that name the user made with another client: never
+        // taken, never touched, whether it has a token or not.
+        for (const char *dump : {R"({"drive-sync":{"type":"drive","client_id":"mine","token":"an-access-token"}})",
+                                 R"({"drive-sync":{"type":"drive","client_id":"mine"}})",
+                                 R"({"drive-sync":{"type":"s3"}})"}) {
+            QVERIFY(write(dir.filePath("dump"), dump));
+            const CommandResult r = signInCommand(paths, signInTools(dir.path()), {});
+            QCOMPARE(r.code, 1);
+            QVERIFY2(r.err.contains("drive-sync") && r.err.contains("did not make"), qPrintable(r.err));
+            const QJsonObject answer = QJsonDocument::fromJson(signInCommand(paths, signInTools(dir.path()), {"--json"}).out.toUtf8()).object();
+            QCOMPARE(answer.value("ok").toBool(true), false);
+            QCOMPARE(answer.value("reason").toString(), QString("remoteExists"));
+        }
+        for (const QStringList &call : rcloneCalls(dir.path()))
+            QVERIFY2(call.first() != "lsjson" && call.mid(0, 2) != (QStringList{"config", "create"})
+                         && call.mid(0, 2) != (QStringList{"config", "update"}) && !call.contains("delete"),
+                     qPrintable(call.join(' ')));
+    }
+
+    void signinAdoptsOrRepairsItsOwnRemote()
+    {
+        QTemporaryDir dir;
+        const BackendPaths paths = controlPaths(dir.path(), false);
+        QVERIFY(write(dir.filePath("remotes"), "drive-sync:\n"));
+        const auto configCalls = [&dir] {
+            QList<QStringList> found;
+            for (const QStringList &call : rcloneCalls(dir.path()))
+                if (call.first() == "config" && call.value(1) != "dump")
+                    found << call;
+            return found;
+        };
+        // DriveSync's own remote with a token Drive takes: signed in already.
+        QVERIFY(write(dir.filePath("dump"),
+                      R"({"drive-sync":{"type":"drive","client_id":"fake-client.apps.googleusercontent.com","token":"t"}})"));
+        CommandResult r = signInCommand(paths, signInTools(dir.path()), {});
+        QVERIFY2(r.code == 0, qPrintable(r.err));
+        QVERIFY(configCalls().isEmpty());
+        QCOMPARE(rcloneCalls(dir.path()).last().first(), QString("lsjson"));
+        // Its token no longer works: the browser signs it in again.
+        QVERIFY(write(dir.filePath("lsjson-fails-once"), ""));
+        r = signInCommand(paths, signInTools(dir.path()), {});
+        QVERIFY2(r.code == 0, qPrintable(r.err));
+        QCOMPARE(configCalls(), QList<QStringList>{refreshTokenArguments(kNewRemoteName)});
+        // No token at all (a sign-in cut short): made again from scratch.
+        QVERIFY(QFile::remove(dir.filePath("rclone-calls.log")));
+        QVERIFY(write(dir.filePath("dump"), R"({"drive-sync":{"type":"drive","client_id":"fake-client.apps.googleusercontent.com"}})"));
+        r = signInCommand(paths, signInTools(dir.path()), {});
+        QVERIFY2(r.code == 0, qPrintable(r.err));
+        QCOMPARE(configCalls(), (QList<QStringList>{{"config", "delete", "drive-sync"},
+                                                   createRemoteArguments(kNewRemoteName, fakeClient())}));
+    }
+
+    void signinStopsCleanlyOnSigterm()
+    {
+        QTemporaryDir dir;
+        QVERIFY(write(dir.filePath("create-hangs"), ""));
+        SignInTools tools = signInTools(dir.path());
+        tools.timeoutMs = 20000;
+        // Without the command's own handler this one takes the signal, so a
+        // missing handler fails the test instead of killing the suite.
+        static std::atomic<bool> caught{false};
+        caught = false;
+        struct sigaction mine {}, previous {};
+        mine.sa_handler = [](int) { caught = true; };
+        sigemptyset(&mine.sa_mask);
+        QCOMPARE(sigaction(SIGTERM, &mine, &previous), 0);
+        const auto restore = qScopeGuard([&previous] { sigaction(SIGTERM, &previous, nullptr); });
+        std::thread window([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            ::kill(::getpid(), SIGTERM);
+        });
+        QElapsedTimer clock;
+        clock.start();
+        const CommandResult r = signInCommand(controlPaths(dir.path(), false), tools, {});
+        window.join();
+        QCOMPARE(r.code, 1);
+        QVERIFY2(clock.elapsed() < 4000, qPrintable(QString::number(clock.elapsed())));
+        QVERIFY(rcloneCalls(dir.path()).contains(QStringList({"config", "delete", "drive-sync"})));
+        QVERIFY2(r.err.contains("stopped"), qPrintable(r.err));
+        // The test's own handler is back.
+        struct sigaction now {};
+        sigaction(SIGTERM, nullptr, &now);
+        QVERIFY(now.sa_handler == mine.sa_handler);
+    }
+
+    void signinRelaysTheBrowserLink()
+    {
+        QTemporaryDir dir;
+        const QByteArray notice = "2026/11/14 23:00:00 NOTICE: If your browser doesn't open automatically go to the "
+                                  "following link: http://127.0.0.1:53682/auth?state=abc\n"
+                                  "2026/11/14 23:00:00 NOTICE: Log in and authorize rclone for access\n";
+        QVERIFY(write(dir.filePath("create-notice"), notice));
+        const CommandResult json = signInCommand(controlPaths(dir.path(), false), signInTools(dir.path()), {"--json"});
+        QCOMPARE(json.code, 0);
+        const QStringList lines = json.out.split('\n', Qt::SkipEmptyParts);
+        QCOMPARE(lines.size(), 2);
+        QCOMPARE(QJsonDocument::fromJson(lines.first().toUtf8()).object().value("link").toString(),
+                 QString("http://127.0.0.1:53682/auth?state=abc"));
+        QCOMPARE(QJsonDocument::fromJson(lines.last().toUtf8()).object().value("ok").toBool(), true);
+        QTemporaryDir second;
+        QVERIFY(write(second.filePath("create-notice"), notice));
+        const CommandResult text = signInCommand(controlPaths(second.path(), false), signInTools(second.path()), {});
+        QCOMPARE(text.code, 0);
+        QVERIFY2(text.err.contains("http://127.0.0.1:53682/auth?state=abc"), qPrintable(text.err));
+    }
+
+    void signinDeletesTheHalfMadeRemote()
+    {
+        QTemporaryDir dir;
+        const BackendPaths paths = controlPaths(dir.path(), false);
+        QVERIFY(write(dir.filePath("create-exit"), "1\n"));
+        // rclone's own error may quote the client: it never reaches the output.
+        QVERIFY(write(dir.filePath("create-stderr"), "boom: fake-client.apps.googleusercontent.com fake-secret\n"));
+        CommandResult r = signInCommand(paths, signInTools(dir.path()), {});
+        QCOMPARE(r.code, 1);
+        QVERIFY(rcloneCalls(dir.path()).contains(QStringList({"config", "delete", "drive-sync"})));
+        QVERIFY2(!r.err.contains("fake-secret") && !r.err.contains("fake-client"), qPrintable(r.err));
+        QVERIFY2(r.err.contains("boom"), qPrintable(r.err));
+
+        // The browser never answered: killed at the timeout, then cleaned up.
+        QTemporaryDir second;
+        QVERIFY(write(second.filePath("create-hangs"), ""));
+        SignInTools tools = signInTools(second.path());
+        tools.timeoutMs = 200;
+        QElapsedTimer clock;
+        clock.start();
+        r = signInCommand(controlPaths(second.path(), false), tools, {});
+        QCOMPARE(r.code, 1);
+        QVERIFY2(clock.elapsed() < 4000, qPrintable(QString::number(clock.elapsed())));
+        QVERIFY(rcloneCalls(second.path()).contains(QStringList({"config", "delete", "drive-sync"})));
+    }
+
+    void signinRefreshesTheConfiguredRemote()
+    {
+        QTemporaryDir dir;
+        BackendPaths paths = controlPaths(dir.path(), true);
+        paths.config = dir.filePath("config.json");
+        QString error;
+        QVERIFY(saveSyncConfig(paths.config, oldUnitConfig(), &error));
+        const CommandResult r = signInCommand(paths, signInTools(dir.path()), {});
+        QVERIFY2(r.code == 0, qPrintable(r.err));
+        QList<QStringList> configCalls;
+        for (const QStringList &call : rcloneCalls(dir.path())) {
+            if (call.first() == "config")
+                configCalls << call;
+            // The remote keeps its own client: the shipped one never shows up.
+            QVERIFY2(!call.join(' ').contains("fake-client") && !call.join(' ').contains("fake-secret"),
+                     qPrintable(call.join(' ')));
+        }
+        QCOMPARE(configCalls, QList<QStringList>{refreshTokenArguments("gdrive")});
+        QCOMPARE(rcloneCalls(dir.path()).last().mid(0, 2), (QStringList{"lsjson", "gdrive:"}));
+
+        // A fix that waits for the user, or stopped (on the token, say),
+        // lets the sign-in through; one at work does not.
+        for (const QString &step : {QString("confirm"), QString("failed")}) {
+            QVERIFY(writeFix(paths.appState, fixAt(step)));
+            const CommandResult waiting = signInCommand(paths, signInTools(dir.path()), {});
+            QVERIFY2(waiting.code == 0, qPrintable(step + ": " + waiting.err));
+        }
+        QVERIFY(writeFix(paths.appState, fixAt("base")));
+        const CommandResult held = signInCommand(paths, signInTools(dir.path()), {});
+        QCOMPARE(held.code, 1);
+        QVERIFY2(held.err.contains("fix"), qPrintable(held.err));
+        QVERIFY(clearFix(paths.appState));
+
+        // The config's own rclone.conf goes along.
+        SyncConfig own = oldUnitConfig();
+        own.rcloneFlags << "--config" << dir.filePath("own.conf");
+        QVERIFY(saveSyncConfig(paths.config, own, &error));
+        QVERIFY(QFile::remove(dir.filePath("rclone-calls.log")));
+        QCOMPARE(signInCommand(paths, signInTools(dir.path()), {}).code, 0);
+        const QList<QStringList> owned = rcloneCalls(dir.path());
+        QCOMPARE(owned.first(), refreshTokenArguments("gdrive") + QStringList({"--config", dir.filePath("own.conf")}));
+        QVERIFY2(owned.last().join(' ').endsWith("--config " + dir.filePath("own.conf")), qPrintable(owned.last().join(' ')));
+    }
+
+    void signinWithoutShippedClientSaysSo()
+    {
+        QTemporaryDir dir;
+        SignInTools tools = signInTools(dir.path());
+        tools.client.reset();
+        const CommandResult r = signInCommand(controlPaths(dir.path(), false), tools, {});
+        QCOMPARE(r.code, 1);
+        QVERIFY2(r.err.contains("this build has no Google client"), qPrintable(r.err));
+        QVERIFY(rcloneCalls(dir.path()).isEmpty());
+    }
+
+    void abandonKeepsASignedInRemote()
+    {
+        QTemporaryDir dir;
+        BackendPaths paths = controlPaths(dir.path(), false);
+        QVERIFY(write(dir.filePath("dump"), R"({"drive-sync":{"type":"drive","token":"an-access-token"}})"));
+        QCOMPARE(signInCommand(paths, signInTools(dir.path()), {"--abandon"}).code, 0);
+        for (const QStringList &call : rcloneCalls(dir.path()))
+            QVERIFY2(!call.contains("delete"), qPrintable(call.join(' ')));
+
+        // Someone else's remote with no token stays too.
+        QVERIFY(write(dir.filePath("dump"), R"({"gdrive":{"type":"drive","token":"t"},"drive-sync":{"type":"drive","client_id":"c"}})"));
+        QCOMPARE(signInCommand(paths, signInTools(dir.path()), {"--abandon", "--json"}).code, 0);
+        for (const QStringList &call : rcloneCalls(dir.path()))
+            QVERIFY2(!call.contains("delete"), qPrintable(call.join(' ')));
+        // A build with no client cannot tell its own: nothing goes.
+        SignInTools clientless = signInTools(dir.path());
+        clientless.client.reset();
+        QVERIFY(write(dir.filePath("dump"), R"({"drive-sync":{"type":"drive","client_id":"fake-client.apps.googleusercontent.com"}})"));
+        QCOMPARE(signInCommand(paths, clientless, {"--abandon"}).code, 0);
+        for (const QStringList &call : rcloneCalls(dir.path()))
+            QVERIFY2(!call.contains("delete"), qPrintable(call.join(' ')));
+        QCOMPARE(signInCommand(paths, signInTools(dir.path()), {"--abandon", "--json"}).code, 0);
+        int deletes = 0;
+        for (const QStringList &call : rcloneCalls(dir.path()))
+            deletes += call == QStringList({"config", "delete", "drive-sync"}) ? 1 : 0;
+        QCOMPARE(deletes, 1);
+
+        // Once DriveSync runs drive-sync, the remote belongs to it: never deleted.
+        QTemporaryDir managed;
+        paths = controlPaths(managed.path(), true);
+        paths.config = managed.filePath("config.json");
+        QString error;
+        QVERIFY(saveSyncConfig(paths.config, oldUnitConfig(), &error));
+        QVERIFY(write(managed.filePath("dump"), R"({"drive-sync":{"type":"drive"}})"));
+        QCOMPARE(signInCommand(paths, signInTools(managed.path()), {"--abandon"}).code, 0);
+        QVERIFY(rcloneCalls(managed.path()).isEmpty());
+    }
+
+    void newUserConfigHasTheProvenFlags()
+    {
+        const SyncConfig config = newUserConfig("/h/Drive", "/h");
+        QCOMPARE(config.remote, QString("drive-sync:"));
+        QCOMPARE(config.localPath, QString("/h/Drive"));
+        QCOMPARE(config.workDir, QString("/h/.local/state/drive-sync-app/bisync"));
+        QCOMPARE(config.filtersFile, QString("/h/.config/drive-sync/filters.txt"));
+        QCOMPARE(config.logFile, QString("/h/.local/state/drive-sync.log"));
+        QVERIFY(config.runOnlyWhen.isEmpty());
+        const QString line = rcloneRunArguments(config).join(' ');
+        for (const char *flag : {"--drive-skip-gdocs", "--drive-skip-shortcuts", "--resilient", "--recover",
+                                 "--max-lock 2m", "--max-delete 5", "--conflict-resolve newer", "--log-level INFO",
+                                 "--fast-list", "--log-file /h/.local/state/drive-sync.log"})
+            QVERIFY2(line.contains(flag), flag);
+        // The generic rules of spec 6, and none of the maintainer's own.
+        const QByteArray filters = defaultFilters();
+        for (const char *rule : {"- .git/**", "- node_modules/**", "- .venv/**", "- __pycache__/**", "- *.pyc",
+                                 "- *.gdoc", "- *.gsheet", "- *.gvid", "- desktop.ini", "- Thumbs.db", "- .DS_Store",
+                                 "- .~lock.*#", "- .tmp.drivedownload/**", "- .tmp.driveupload/**"})
+            QVERIFY2(filters.contains(QByteArray(rule) + "\n"), rule);
+        QVERIFY(!filters.contains("/GitHub/"));
+        QVERIFY(filters.contains("press F"));
+    }
+
+    void setupRefusesWhenAConfigExists()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QString error;
+        QVERIFY(QDir().mkpath(s.takeover.appConfigDir));
+        QVERIFY(saveSyncConfig(s.paths.config, oldUnitConfig(), &error));
+        const QString refusal = setupRefusal(s.paths, s.takeover, s.folder, s.takeover.rclone);
+        QVERIFY2(refusal.contains("already"), qPrintable(refusal));
+        QCOMPARE(setupCommand(s, s.folder).code, 1);
+        QVERIFY(!QFile::exists(s.folder));
+    }
+
+    void setupRefusesWhenAnOldDriveSyncIsFound()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QVERIFY(QDir().mkpath(s.takeover.userUnits));
+        QVERIFY(write(s.takeover.userUnits + "/drive-sync.service", "[Service]\nExecStart=/bin/true\n"));
+        const QString refusal = setupRefusal(s.paths, s.takeover, s.folder, s.takeover.rclone);
+        QVERIFY2(refusal.contains("take it over"), qPrintable(refusal));
+    }
+
+    void setupRefusesWithoutTheRemote()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QVERIFY(write(dir.filePath("remotes"), "gdrive:\n"));
+        const QString refusal = setupRefusal(s.paths, s.takeover, s.folder, s.takeover.rclone);
+        QVERIFY2(refusal.contains("sign in"), qPrintable(refusal));
+    }
+
+    void setupRefusesWhenFiltersFileExists()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QVERIFY(QDir().mkpath(s.takeover.appConfigDir));
+        QVERIFY(write(s.takeover.appConfigDir + "/filters.txt", "- mine/**\n"));
+        const QString refusal = setupRefusal(s.paths, s.takeover, s.folder, s.takeover.rclone);
+        QVERIFY2(refusal.contains("filters.txt"), qPrintable(refusal));
+        QCOMPARE(setupCommand(s, s.folder).code, 1);
+        QCOMPARE(readBytes(s.takeover.appConfigDir + "/filters.txt"), QByteArray("- mine/**\n"));
+    }
+
+    void setupRefusesForHomeItself()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        for (const QString &folder : {QDir::homePath(), QDir::homePath() + "/", QDir::rootPath(), QString("Drive"), QString()}) {
+            const QString refusal = setupRefusal(s.paths, s.takeover, folder, s.takeover.rclone);
+            QVERIFY2(!refusal.isEmpty(), qPrintable(folder));
+        }
+        // Refused before rclone is even asked.
+        QVERIFY(rcloneCalls(dir.path()).isEmpty());
+    }
+
+    void setupRefusesForOldRclone()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QVERIFY(write(dir.filePath("version"), "rclone v1.65.0\n- os/version: arch\n"));
+        QString refusal = setupRefusal(s.paths, s.takeover, s.folder, s.takeover.rclone);
+        QVERIFY2(refusal.contains("1.65.0") && refusal.contains("1.66"), qPrintable(refusal));
+        QVERIFY(write(dir.filePath("version"), "rclone v1.66.0\n"));
+        refusal = setupRefusal(s.paths, s.takeover, s.folder, s.takeover.rclone);
+        QVERIFY2(refusal.isEmpty(), qPrintable(refusal));
+    }
+
+    void setupWritesFixMarkBeforeEnablingTimers()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        const CommandResult r = setupCommand(s, s.folder + "/");
+        QVERIFY2(r.code == 0, qPrintable(r.out + r.err));
+        const QStringList log = calls(dir.path());
+        const qsizetype start = log.indexOf("systemctl --user start --no-block drive-sync-fix.service");
+        const qsizetype enable = log.indexOf("systemctl --user enable --now drive-sync.timer drive-sync-watchdog.timer");
+        QVERIFY2(start >= 0 && enable > start, qPrintable(log.join('\n')));
+        QCOMPARE(log.value(enable + 1), QString("mark preparing"));
+        QString error;
+        const auto config = loadSyncConfig(s.paths.config, &error);
+        QVERIFY2(config, qPrintable(error));
+        // The folder is written without the slash: bisync names its listings
+        // after this string.
+        QCOMPARE(config->localPath, s.folder);
+        QCOMPARE(config->remote, QString("drive-sync:"));
+        QCOMPARE(config->filtersFile, s.takeover.appConfigDir + "/filters.txt");
+        QCOMPARE(config->workDir, s.paths.appState + "/bisync");
+        QCOMPARE(config->logFile, s.paths.log);
+        QCOMPARE(readBytes(config->filtersFile), defaultFilters());
+        QVERIFY(!QFile::exists(config->filtersFile + ".md5"));  // the base run writes it
+        QVERIFY(QFileInfo(s.folder).isDir());
+        QVERIFY(QFileInfo(config->workDir).isDir());
+        QCOMPARE(readFix(s.paths.appState).step, QString("preparing"));
+        // What this setup wrote, so cancelling before the base can undo it.
+        QVERIFY(QFile::exists(firstSetupMarkPath(s.paths.appState)));
+    }
+
+    void setupKeepsTheFixWhenEnableFails()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QVERIFY(write(dir.filePath("enable-exit"), "1\n"));
+        const CommandResult r = setupCommand(s, s.folder);
+        QCOMPARE(r.code, 1);
+        const QString error = setupError(r);
+        QVERIFY2(error.contains("drive-sync.timer") && error.contains("denied"), qPrintable(error));
+        // The fix owns the state from its mark on: nothing is rolled back.
+        QVERIFY(fixPresent(s.paths.appState));
+        QVERIFY(QFile::exists(s.paths.config));
+    }
+
+    void setupRollsBackWhenTheFixCannotStart()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QVERIFY(write(dir.filePath("start-exit"), "1\n"));
+        const CommandResult r = setupCommand(s, s.folder);
+        QCOMPARE(r.code, 1);
+        QVERIFY2(setupError(r).contains("drive-sync-fix.service"), qPrintable(setupError(r)));
+        QVERIFY(!QFile::exists(s.paths.config));
+        QVERIFY(!QFile::exists(s.takeover.appConfigDir + "/filters.txt"));
+        QVERIFY(!QFile::exists(s.folder));  // made by this run, still empty
+        QVERIFY(!fixPresent(s.paths.appState));
+        QVERIFY(calls(dir.path()).filter("enable").isEmpty());
+        // A folder that was there before stays, with what it holds.
+        QVERIFY(QDir().mkpath(s.folder));
+        QVERIFY(write(s.folder + "/keep.txt", "mine\n"));
+        QCOMPARE(setupCommand(s, s.folder).code, 1);
+        QCOMPARE(readBytes(s.folder + "/keep.txt"), QByteArray("mine\n"));
+    }
+
+    void firstSetupBaseRunWritesTheMd5()
+    {
+        const QString rclone = QStandardPaths::findExecutable("rclone");
+        if (rclone.isEmpty())
+            QSKIP("rclone is not installed");
+        // Setup with the fake rclone (it knows the drive-sync remote), then
+        // the fix with real rclone on two local folders: the config's remote
+        // becomes the "cloud" folder, since an rclone alias would name the
+        // listings after its target instead.
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QVERIFY(QDir().mkpath(dir.filePath("cloud")));
+        // A folder that already holds files, on both sides (review focus 2).
+        QVERIFY(write(dir.filePath("cloud/one.txt"), "one\n"));
+        QVERIFY(QDir().mkpath(s.folder + "/.git"));
+        QVERIFY(write(s.folder + "/two.txt", "two\n"));
+        QVERIFY(write(s.folder + "/.git/skipped", "x\n"));
+        const auto cloudBefore = filesUnder(dir.filePath("cloud"));
+        const auto notebookBefore = filesUnder(s.folder);
+
+        const CommandResult r = setupCommand(s, s.folder);
+        QVERIFY2(r.code == 0, qPrintable(r.out + r.err));
+        QString error;
+        auto config = loadSyncConfig(s.paths.config, &error);
+        QVERIFY2(config, qPrintable(error));
+        config->remote = dir.filePath("cloud");
+        QVERIFY(saveSyncConfig(s.paths.config, *config, &error));
+        BackendPaths managed = s.paths;
+        managed.managed = true;
+        managed.log = config->logFile;
+        managed.drive = config->localPath;
+        FixTools tools;
+        tools.rclone = rclone;
+        tools.wait = [](int) {};
+        const NotifierPaths notify = fakeNotifier(dir.path());
+
+        // The dry run lists both directions and writes nothing.
+        QCOMPARE(runFixUnit(managed, *config, tools, notify), 0);
+        FixState state = readFix(s.paths.appState);
+        QVERIFY2(state.step == "confirm", qPrintable(state.step + ": " + state.error));
+        int total = 0;
+        int toNotebook = 0;
+        dryRunCopies(readBytes(fixDryRunLogPath(s.paths.appState)), 10, &total, &toNotebook);
+        QCOMPARE(total, 2);
+        QCOMPARE(toNotebook, 1);
+        QCOMPARE(filesUnder(dir.filePath("cloud")), cloudBefore);
+        QCOMPARE(filesUnder(s.folder), notebookBefore);
+
+        FixSetup fix;
+        fix.paths = managed;
+        QCOMPARE(fixCommand(fix, {"--confirm"}), QString());
+        const int unit = runFixUnit(managed, *config, tools, notify);
+        state = readFix(s.paths.appState);
+        QVERIFY2(unit == 0 && !fixPresent(s.paths.appState),
+                 qPrintable(state.step + " after " + state.failedStep + ": " + state.error));
+        QVERIFY(QFile::exists(config->filtersFile + ".md5"));
+        QString why;
+        QVERIFY2(filtersUsable(config->filtersFile, &why), qPrintable(why));
+        QVERIFY(QFile::exists(s.folder + "/one.txt"));
+        QVERIFY(QFile::exists(dir.filePath("cloud/two.txt")));
+        QVERIFY(!QFile::exists(dir.filePath("cloud/.git/skipped")));
+        QVERIFY(QFile::exists(config->workDir + "/" + bisyncSessionName(config->remote, config->localPath) + ".path1.lst"));
+        QVERIFY(readBytes(config->logFile).contains("Bisync successful"));
+    }
+
+    void normalRunBeforeTheBaseTouchesNothing()
+    {
+        const QString rclone = QStandardPaths::findExecutable("rclone");
+        if (rclone.isEmpty())
+            QSKIP("rclone is not installed");
+        // As above: setup with the fake rclone, then real rclone on two
+        // local folders.
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QVERIFY(QDir().mkpath(dir.filePath("cloud")));
+        QVERIFY(write(dir.filePath("cloud/one.txt"), "one\n"));
+        QVERIFY(QDir().mkpath(s.folder));
+        QVERIFY(write(s.folder + "/two.txt", "two\n"));
+        QCOMPARE(setupCommand(s, s.folder).code, 0);
+        QString error;
+        auto config = loadSyncConfig(s.paths.config, &error);
+        QVERIFY2(config, qPrintable(error));
+        config->remote = dir.filePath("cloud");
+        QVERIFY(saveSyncConfig(s.paths.config, *config, &error));
+        // The first-setup fix goes away without the undo (a setup whose mark
+        // is gone), with the timers already on.
+        QVERIFY(QFile::remove(firstSetupMarkPath(s.paths.appState)));
+        FixSetup fix;
+        fix.paths = s.paths;
+        fix.paths.managed = true;
+        QCOMPARE(fixCommand(fix, {"--cancel"}), QString());
+        QVERIFY(QFile::exists(s.paths.config));
+        const auto cloudBefore = filesUnder(dir.filePath("cloud"));
+        const auto notebookBefore = filesUnder(s.folder);
+
+        // The next tick: no .md5 and no listings, so drive-sync run refuses
+        // before rclone with its own cause, never "the filters changed".
+        QString refusal;
+        QVERIFY(runCommandPlan(*config, &refusal).isEmpty());
+        QVERIFY2(refusal.contains(kFirstSyncPendingReason) && !refusal.contains(kFiltersChangedReason),
+                 qPrintable(refusal));
+        appendToLog(config->logFile, "CRITICAL", "DriveSync did not start rclone: " + refusal);
+        QList<SyncRun> runs = SyncLog::parse(QString::fromUtf8(readBytes(config->logFile)));
+        QVERIFY(!runs.isEmpty());
+        QCOMPARE(runs.last().outcome, QString("failed"));
+        QCOMPARE(runs.last().causeKind, QString("firstSyncPending"));
+        QVERIFY(!guardStopHolds(runs));
+        QVERIFY(fixBannerOffers("failed", "firstSyncPending"));
+        // Its card is news, not an alarm, and says what to press.
+        BackendPaths cardPaths = controlPaths(dir.path(), true);
+        cardPaths.log = config->logFile;
+        const NotifierPaths tools = fakeNotifier(dir.path());
+        QCOMPARE(runNotifyCommand("exit-code", cardPaths, tools, QDateTime::currentDateTimeUtc()), 0);
+        const QStringList sent = notifications(dir.path());
+        QCOMPARE(sent.size(), 1);
+        QVERIFY2(sent.at(0).contains("-u normal") && sent.at(0).contains("press F") && !sent.at(0).contains("filters"),
+                 qPrintable(sent.at(0)));
+
+        // Even with an .md5 in place, bisync without listings aborts and
+        // touches no file: a cause that offers F too.
+        QVERIFY(write(config->filtersFile + ".md5",
+                      QCryptographicHash::hash(readBytes(config->filtersFile), QCryptographicHash::Md5).toHex()));
+        QProcess run;
+        run.start(rclone, rcloneRunArguments(*config));
+        QVERIFY(run.waitForFinished(60000));
+        QVERIFY(run.exitCode() != 0);
+        QCOMPARE(filesUnder(dir.filePath("cloud")), cloudBefore);
+        QCOMPARE(filesUnder(s.folder), notebookBefore);
+        runs = SyncLog::parse(QString::fromUtf8(readBytes(config->logFile)));
+        QCOMPARE(runs.last().outcome, QString("failed"));
+        QVERIFY2(runs.last().causeKind == "lostListings",
+                 qPrintable(runs.last().causeKind + ": " + runs.last().errors.join(" | ")));
+        QVERIFY(fixBannerOffers("failed", "lostListings"));
+    }
+
+    void tokenErrorIsSignIn()
+    {
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-60);
+        // What rclone 1.75 writes when Google refuses the refresh token: the
+        // remote fails before bisync starts.
+        const QString revoked = line(start, "ERROR",
+            "Failed to create file system for \"gdrive:\": couldn't find root directory ID: Get "
+            "\"https://www.googleapis.com/drive/v3/files/root\": couldn't fetch token: invalid_grant: maybe token "
+            "expired? - try refreshing with \"rclone config reconnect gdrive:\"");
+        QList<SyncRun> runs = SyncLog::parse(successfulRun(start.addSecs(-900), 60) + revoked);
+        QCOMPARE(runs.last().outcome, QString("failed"));
+        QCOMPARE(runs.last().causeKind, QString("signIn"));
+        // rclone's advice needs a terminal: the detail never carries it.
+        QVERIFY2(runs.last().causeDetail.isEmpty(), qPrintable(runs.last().causeDetail));
+        // Any case, and inside a bisync run too.
+        for (const char *refused : {"oauth2: cannot fetch token: 401 Unauthorized Response: {\"error\": \"UNAUTHORIZED_CLIENT\"}",
+                                    "oauth2: cannot fetch token: 401 Unauthorized Response: {\"error\": \"invalid_client\"}"}) {
+            runs = SyncLog::parse(line(start, "INFO", R"(Synching Path1 "gdrive:" with Path2 "/home/someone/Drive/")")
+                                  + line(start, "ERROR", QString("Path1 listing failed: %1").arg(refused))
+                                  + line(start, "ERROR", "Bisync aborted. Must run --resync to recover."));
+            QVERIFY2(runs.last().causeKind == "signIn", refused);
+        }
+        // The network, not the sign-in: rclone 1.75.2 says "couldn't fetch
+        // token" for those too (tried with a token URL nobody answers).
+        for (const char *network : {
+                 "Failed to create file system for \"x:\": couldn't find root directory ID: Get \"https://www.googleapis.com/drive/v3/files/root\": couldn't fetch token: Post \"http://127.0.0.1:9/token\": dial tcp 127.0.0.1:9: connect: connection refused",
+                 "couldn't fetch token: Post \"https://oauth2.googleapis.com/token\": dial tcp: lookup oauth2.googleapis.com: no such host",
+                 "oauth2: cannot fetch token: 503 Service Unavailable"}) {
+            runs = SyncLog::parse(line(start, "ERROR", network));
+            QVERIFY2(runs.last().causeKind == "error", network);
+        }
+    }
+
+    void otherErrorStaysError()
+    {
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-60);
+        const QList<SyncRun> runs = SyncLog::parse(
+            line(start, "ERROR", "Failed to create file system for \"gdrive:\": didn't find section in config file (\"gdrive\")"));
+        QCOMPARE(runs.last().outcome, QString("failed"));
+        QCOMPARE(runs.last().causeKind, QString("error"));
+        QVERIFY(runs.last().causeDetail.contains("didn't find section"));
+    }
+
+    void notifyAsksToSignInAgain()
+    {
+        QTemporaryDir dir;
+        const BackendPaths paths = controlPaths(dir.path(), true);
+        QVERIFY(write(paths.log, line(QDateTime::currentDateTime(), "ERROR",
+                                      "Failed to create file system for \"gdrive:\": couldn't fetch token: invalid_grant: maybe token "
+                                      "expired? - try refreshing with \"rclone config reconnect gdrive:\"").toUtf8()));
+        const NotifierPaths tools = fakeNotifier(dir.path());
+        QCOMPARE(runNotifyCommand("exit-code", paths, tools, QDateTime::currentDateTimeUtc()), 0);
+        const QStringList sent = notifications(dir.path());
+        QCOMPARE(sent.size(), 1);
+        // Nothing syncs until the user signs in: the critical card.
+        QVERIFY2(sent.at(0).contains("-u critical") && sent.at(0).contains("Drive stopped syncing"), qPrintable(sent.at(0)));
+        QVERIFY2(sent.at(0).contains("Open DriveSync and sign in again"), qPrintable(sent.at(0)));
+        QVERIFY2(!sent.at(0).contains("reconnect"), qPrintable(sent.at(0)));
+        QFile catalog(QString(SRCDIR) + "/../src/i18n/pt-BR.json");
+        QVERIFY(catalog.open(QIODevice::ReadOnly));
+        const QJsonObject strings = QJsonDocument::fromJson(catalog.readAll()).object();
+        QVERIFY(strings.contains("Google no longer accepts DriveSync's sign-in, so nothing syncs. Open DriveSync and sign in again."));
+    }
+
+    void setupControllerCancelStopsOnlyTheSignIn()
+    {
+        QTemporaryDir dir;
+        SetupController controller(fakeSetupDrivesync(dir.path()), dir.filePath("Drive"));
+        QCOMPARE(controller.state(), QString("idle"));
+        QCOMPARE(controller.folder(), dir.filePath("Drive"));
+        controller.signIn();
+        QCOMPARE(controller.state(), QString("signingIn"));
+        QTRY_VERIFY(QFile::exists(dir.filePath("child.pid")) && QFile::exists(dir.filePath("grandchild.pid")));
+        const qint64 child = readBytes(dir.filePath("child.pid")).trimmed().toLongLong();
+        const qint64 grandchild = readBytes(dir.filePath("grandchild.pid")).trimmed().toLongLong();
+        const qint64 browser = readBytes(dir.filePath("browser.pid")).trimmed().toLongLong();
+        const auto noBrowser = qScopeGuard([browser] { ::kill(static_cast<pid_t>(browser), SIGKILL); });
+        QVERIFY(child > 0 && grandchild > 0 && browser > 0);
+        QVERIFY(!processGone(grandchild));
+        controller.cancel();
+        QCOMPARE(controller.state(), QString("idle"));
+        // The command stops its rclone and cleans up; the browser, in the
+        // same group, is the user's and stays.
+        QTRY_VERIFY(processGone(child) && processGone(grandchild));
+        QTRY_VERIFY(calls(dir.path()).contains("cleaned"));
+        QTRY_VERIFY(calls(dir.path()).contains("signin --abandon"));
+        QVERIFY(!processGone(browser));
+
+        // Closing the window while it waits does the same.
+        QTemporaryDir second;
+        auto window = std::make_unique<SetupController>(fakeSetupDrivesync(second.path()), second.filePath("Drive"));
+        window->signIn();
+        QTRY_VERIFY(QFile::exists(second.filePath("grandchild.pid")) && QFile::exists(second.filePath("child.pid")));
+        const qint64 orphan = readBytes(second.filePath("grandchild.pid")).trimmed().toLongLong();
+        const qint64 secondBrowser = readBytes(second.filePath("browser.pid")).trimmed().toLongLong();
+        const auto noSecondBrowser = qScopeGuard([secondBrowser] { ::kill(static_cast<pid_t>(secondBrowser), SIGKILL); });
+        window.reset();
+        QTRY_VERIFY(processGone(orphan));
+        QTRY_VERIFY(calls(second.path()).contains("cleaned"));
+        QVERIFY(!processGone(secondBrowser));
+    }
+
+    void setupControllerFollowsTheCommands()
+    {
+        QTemporaryDir dir;
+        SetupController controller(fakeSetupDrivesync(dir.path()), dir.filePath("Drive"));
+        QSignalSpy signedIn(&controller, &SetupController::signedIn);
+        QSignalSpy started(&controller, &SetupController::setupStarted);
+        // A failed sign-in says why.
+        QVERIFY(write(dir.filePath("signin-answer"), R"({"ok":false,"error":"the browser said no"})"));
+        controller.signIn();
+        QTRY_COMPARE(controller.state(), QString("failed"));
+        QCOMPARE(controller.detail(), QString("the browser said no"));
+        // A remote of that name the user made is never adopted.
+        QVERIFY(write(dir.filePath("signin-answer"), R"({"ok":false,"error":"not ours","reason":"remoteExists","signedIn":true})"));
+        controller.signIn();
+        QTRY_COMPARE(controller.detail(), QString("not ours"));
+        QCOMPARE(controller.state(), QString("failed"));
+        // The browser link shows while the sign-in waits, and goes after it.
+        QVERIFY(write(dir.filePath("signin-link"), "{\"link\":\"http://127.0.0.1:53682/auth?state=abc\"}\n"));
+        QVERIFY(write(dir.filePath("signin-answer"), R"({"ok":true,"error":""})"));
+        controller.signIn();
+        QTRY_COMPARE(controller.link(), QString("http://127.0.0.1:53682/auth?state=abc"));
+        QCOMPARE(controller.state(), QString("signingIn"));
+        QVERIFY(write(dir.filePath("signin-release"), ""));
+        QTRY_COMPARE(controller.state(), QString("signedIn"));
+        QCOMPARE(controller.link(), QString());
+        QCOMPARE(controller.detail(), QString());
+        QCOMPARE(signedIn.size(), 1);
+        QVERIFY(QFile::remove(dir.filePath("signin-link")));
+        // A failed setup keeps the sign-in.
+        QVERIFY(write(dir.filePath("setup-answer"), R"({"ok":false,"error":"no room"})"));
+        controller.start(dir.filePath("Elsewhere"));
+        QCOMPARE(controller.state(), QString("settingUp"));
+        QTRY_COMPARE(controller.state(), QString("signedIn"));
+        QCOMPARE(controller.detail(), QString("no room"));
+        QCOMPARE(controller.folder(), dir.filePath("Elsewhere"));
+        QVERIFY(calls(dir.path()).contains("setup --folder " + dir.filePath("Elsewhere") + " --json"));
+        QVERIFY(write(dir.filePath("setup-answer"), R"({"ok":true,"error":""})"));
+        controller.start(dir.filePath("Elsewhere"));
+        QTRY_COMPARE(started.size(), 1);
+        QCOMPARE(controller.state(), QString("idle"));
+        // The dialog shows the home as "~"; the command gets the real path.
+        controller.signIn();
+        QTRY_COMPARE(controller.state(), QString("signedIn"));
+        controller.start("~/Drive");
+        QTRY_COMPARE(started.size(), 2);
+        QVERIFY(calls(dir.path()).contains("setup --folder " + QDir::homePath() + "/Drive --json"));
+        // Nothing to cancel once setup started: no abandon.
+        controller.cancel();
+        QVERIFY(!calls(dir.path()).contains("signin --abandon"));
+    }
+
+    // The window after "drive-sync setup" answers ok: it started with no
+    // config and no state folder, then reloads the config, and must follow
+    // the fix that setup started up to the dry run waiting for the user.
+    void backendFollowsTheFixFirstSetupStarts()
+    {
+        QTemporaryDir dir;
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-600);
+        BackendPaths paths{dir.filePath("drive-sync.log"), dir.filePath("Drive"), dir.filePath("state"),
+                           dir.filePath("proc"), fakeSystemctl(dir.path(), start),
+                           QStandardPaths::findExecutable("find"), dir.filePath("app")};
+        paths.config = dir.filePath("config/config.json");
+        paths.self = fakeDrivesync(dir.path(), "{}");
+        Backend backend(paths);
+        QVERIFY(!backend.managed());
+        QCOMPARE(backend.fixStep(), QString());
+
+        SyncConfig config = newUserConfig(dir.filePath("Drive"), dir.path());
+        config.logFile = paths.log;
+        QVERIFY(QDir().mkpath(dir.filePath("config")));
+        QString error;
+        QVERIFY(saveSyncConfig(paths.config, config, &error));
+        FixState state = fixAt("preparing");
+        QVERIFY(writeFix(paths.appState, state));
+        backend.reloadConfig();
+        QTRY_VERIFY(backend.managed());
+        QTRY_COMPARE(backend.fixStep(), QString("preparing"));
+
+        QSignalSpy changed(&backend, &Backend::fixChanged);
+        state = fixAt("confirm");
+        state.copies = 2;
+        QVERIFY(writeFix(paths.appState, state));
+        QTRY_COMPARE(backend.fixStep(), QString("confirm"));
+        QVERIFY(changed.size() >= 1);
+        QTRY_COMPARE(backend.status(), QString("fixWaiting"));
+    }
+
+    void setupDialogStaysOpenWhileSigningIn()
+    {
+        // The real SetupDialog.qml over a stand-in controller: a click
+        // outside must not drop a sign-in that waits for the browser.
+        QQmlEngine engine;
+        QQmlPropertyMap controller, theme, translator;
+        controller.insert("state", "idle");
+        controller.insert("detail", "");
+        controller.insert("folder", "/home/someone/Drive");
+        controller.insert("link", "");
+        theme.insert("radius", 8);
+        theme.insert("accent", QColor("#7aa2f7"));
+        translator.insert("language", "en");
+        engine.rootContext()->setContextProperty("setupController", &controller);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        QQmlComponent component(&engine);
+        component.setData(QString("import QtQuick\nimport QtQuick.Controls\nimport \"%1\"\n"
+                                  "ApplicationWindow { width: 800; height: 600; visible: true\n"
+                                  "  property alias dialog: d\n  SetupDialog { id: d } }\n")
+                              .arg(QUrl::fromLocalFile(QString(SRCDIR) + "/../src").toString())
+                              .toUtf8(),
+                          QUrl());
+        std::unique_ptr<QObject> window(component.create());
+        QVERIFY2(window, qPrintable(component.errorString()));
+        QObject *dialog = window->property("dialog").value<QObject *>();
+        QVERIFY(dialog);
+        constexpr int noAutoClose = 0;  // Popup.NoAutoClose
+        QVERIFY(dialog->property("closePolicy").toInt() != noAutoClose);
+        controller.insert("state", "signingIn");
+        QTRY_COMPARE(dialog->property("closePolicy").toInt(), noAutoClose);
+        controller.insert("state", "signedIn");
+        QTRY_VERIFY(dialog->property("closePolicy").toInt() != noAutoClose);
+    }
+
+    void cancellingAFirstSetupFixUndoesTheSetup()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QCOMPARE(setupCommand(s, s.folder).code, 0);
+        FixSetup fix;
+        fix.paths = s.paths;
+        fix.paths.managed = true;
+        // X on the dry run: no base was ever built for this config.
+        QCOMPARE(fixCommand(fix, {"--cancel"}), QString());
+        QVERIFY(!QFile::exists(s.paths.config));
+        QVERIFY(!QFile::exists(s.takeover.appConfigDir + "/filters.txt"));
+        QVERIFY(!QFile::exists(s.folder));  // made by setup, still empty
+        QVERIFY(!QFile::exists(s.paths.appState + "/bisync"));
+        QVERIFY(!fixPresent(s.paths.appState));
+        QVERIFY(!QFile::exists(firstSetupMarkPath(s.paths.appState)));
+        QVERIFY2(calls(dir.path()).contains("systemctl --user disable --now drive-sync.timer drive-sync-watchdog.timer"),
+                 qPrintable(calls(dir.path()).join('\n')));
+        // The window can offer setup again, for another folder.
+        const QString refusal = setupRefusal(s.paths, s.takeover, s.folder, s.takeover.rclone);
+        QVERIFY2(refusal.isEmpty(), qPrintable(refusal));
+
+        // What the user had before setup stays.
+        QVERIFY(QDir().mkpath(s.folder));
+        QVERIFY(write(s.folder + "/keep.txt", "mine\n"));
+        QCOMPARE(setupCommand(s, s.folder).code, 0);
+        QCOMPARE(fixCommand(fix, {"--cancel"}), QString());
+        QCOMPARE(readBytes(s.folder + "/keep.txt"), QByteArray("mine\n"));
+        QVERIFY(!QFile::exists(s.paths.config));
+
+        // Once the base ran (its .md5 is there), a cancel undoes nothing.
+        QCOMPARE(setupCommand(s, s.folder).code, 0);
+        const QString filters = s.takeover.appConfigDir + "/filters.txt";
+        QVERIFY(write(filters + ".md5", QCryptographicHash::hash(readBytes(filters), QCryptographicHash::Md5).toHex()));
+        QVERIFY(QFile::remove(dir.filePath("calls.log")));
+        QCOMPARE(fixCommand(fix, {"--cancel"}), QString());
+        QVERIFY(QFile::exists(s.paths.config));
+        QVERIFY(QFile::exists(filters));
+        QVERIFY(calls(dir.path()).filter("disable").isEmpty());
+
+        // A taken-over drive-sync has no setup mark: never undone.
+        QTemporaryDir other;
+        const FixSetup taken = makeFixSetup(other.path());
+        QVERIFY(writeFix(taken.paths.appState, fixAt("confirm")));
+        QCOMPARE(fixCommand(taken, {"--cancel"}), QString());
+        QVERIFY(QFile::exists(taken.paths.config));
+        QVERIFY(QFile::exists(taken.config.filtersFile));
+    }
+
+    void setupRefusesFoldersThatHoldItsOwnFiles()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        const QString sandbox = QFileInfo(QString::fromLocal8Bit(qgetenv("RCLONE_CONFIG"))).absolutePath();
+        for (const QString &folder : {s.paths.appState, s.paths.appState + "/Drive", s.paths.appState + "/bisync/x",
+                                      s.takeover.appConfigDir + "/Drive", dir.filePath("logs"), dir.filePath("logs/Drive"),
+                                      dir.path(), sandbox, sandbox + "/Drive", QDir::homePath() + "/.config/Drive",
+                                      QDir::homePath() + "/.local/state/Drive", QDir::homePath() + "/.local"}) {
+            const QString refusal = setupRefusal(s.paths, s.takeover, folder, s.takeover.rclone);
+            QVERIFY2(!refusal.isEmpty(), qPrintable(folder));
+        }
+        const QString refusal = setupRefusal(s.paths, s.takeover, s.folder, s.takeover.rclone);
+        QVERIFY2(refusal.isEmpty(), qPrintable(refusal));
+    }
+
+    void setupRemovesAHalfWrittenFilters()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        // A disk that fills up while the filters are written: no file may be
+        // larger than this, so the filters stop halfway and the config fits.
+        const rlim_t limit = rlim_t(defaultFilters().size() / 2);
+        struct rlimit previous {};
+        QCOMPARE(getrlimit(RLIMIT_FSIZE, &previous), 0);
+        const auto oldHandler = ::signal(SIGXFSZ, SIG_IGN);
+        struct rlimit small = previous;
+        small.rlim_cur = limit;
+        QCOMPARE(setrlimit(RLIMIT_FSIZE, &small), 0);
+        CommandResult r = setupCommand(s, s.folder);
+        setrlimit(RLIMIT_FSIZE, &previous);
+        ::signal(SIGXFSZ, oldHandler);
+        QCOMPARE(r.code, 1);
+        QVERIFY2(setupError(r).contains("filters.txt"), qPrintable(setupError(r)));
+        QVERIFY(!QFile::exists(s.takeover.appConfigDir + "/filters.txt"));
+        QVERIFY(!QFile::exists(s.paths.config));
+        QVERIFY(!fixPresent(s.paths.appState));
+    }
+
+    void aFixStoppedOnTheTokenAsksToSignInAgain()
+    {
+        SyncInputs in = healthy();
+        in.fixStep = "failed";
+        in.fixError = "Failed to create file system for \"drive-sync:\": couldn't fetch token: invalid_grant: maybe "
+                      "token expired? - try refreshing with \"rclone config reconnect drive-sync:\"";
+        const SyncSummary summary = Backend::summarize(in);
+        QCOMPARE(summary.status, QString("fixFailed"));
+        QCOMPARE(summary.causeKind, QString("signIn"));
+        QVERIFY2(!summary.causeDetail.contains("reconnect"), qPrintable(summary.causeDetail));
+        // Any other stop keeps its own line.
+        in.fixError = "boom";
+        QCOMPARE(Backend::summarize(in).causeKind, QString("fix"));
+
+        QTemporaryDir dir;
+        const NotifierPaths tools = fakeNotifier(dir.path());
+        FixState state = fixAt("failed");
+        state.error = "couldn't fetch token: invalid_grant: maybe token expired? - try refreshing with \"rclone config reconnect drive-sync:\"";
+        notifyFixNeedsYou(tools, state, true);
+        const QStringList sent = notifications(dir.path());
+        QVERIFY(!sent.isEmpty());
+        QVERIFY2(sent.last().contains("sign in again") && !sent.last().contains("reconnect"), qPrintable(sent.last()));
     }
 };
 

@@ -14,10 +14,13 @@
 #include "blockeddeletes.h"
 #include "clockformat.h"
 #include "controlcommands.h"
+#include "firstsetup.h"
 #include "fixcommand.h"
 #include "legacymigration.h"
 #include "notifier.h"
 #include "pluginsetup.h"
+#include "setupcontroller.h"
+#include "signin.h"
 #include "statuscommand.h"
 #include "takeover.h"
 #include "takeoversetup.h"
@@ -36,7 +39,7 @@ int main(int argc, char *argv[]) {
     // Commands that need no display run without a GUI application, so the
     // bar and the units can call them without touching Wayland.
     static const QStringList headless{"status", "sync", "pause", "resume", "run-condition", "run", "notify",
-                                      "watchdog", "takeover", "fix", "fix-run", "deletes"};
+                                      "watchdog", "takeover", "fix", "fix-run", "deletes", "signin", "setup"};
     if (headless.contains(command)) {
         QCoreApplication app(argc, argv);
         app.setApplicationName("drive-sync");
@@ -61,6 +64,10 @@ int main(int argc, char *argv[]) {
             return runFixCommand(rest, paths, out, err);
         if (command == "deletes")
             return runDeletesCommand(rest, paths, out, err);
+        if (command == "signin")
+            return runSignInCommand(rest, paths, SignInTools::defaults(), out, err);
+        if (command == "setup")
+            return runSetupCommand(rest, paths, TakeoverPaths::defaults(), out, err);
         if (command == "notify" || command == "watchdog" || command == "fix-run") {
             // The cards are read by a person, in the Omarchy language.
             Translator translator;
@@ -125,6 +132,8 @@ int main(int argc, char *argv[]) {
     // Asks this same program, in a child process, whether drive-sync can be taken over.
     TakeoverSetup takeoverSetup(QCoreApplication::applicationFilePath());
     takeoverSetup.check();
+    // First setup and signing in again, through the same program as children.
+    SetupController setupController(QCoreApplication::applicationFilePath(), QDir::homePath() + "/Drive");
 
     QQmlApplicationEngine engine;
     QObject::connect(&translator, &Translator::changed, &engine, &QQmlEngine::retranslate);
@@ -134,6 +143,7 @@ int main(int argc, char *argv[]) {
     engine.rootContext()->setContextProperty("backend", &backend);
     engine.rootContext()->setContextProperty("pluginSetup", &pluginSetup);
     engine.rootContext()->setContextProperty("takeoverSetup", &takeoverSetup);
+    engine.rootContext()->setContextProperty("setupController", &setupController);
     engine.load(QUrl("qrc:/Main.qml"));
     if (engine.rootObjects().isEmpty())
         return 1;

@@ -33,6 +33,10 @@ struct FixState {
 QString fixStatePath(const QString &appState);     // <appState>/fix.json
 QString fixDryRunLogPath(const QString &appState);  // <appState>/fix-dry-run.log
 bool fixPresent(const QString &appState);
+// <appState>/first-setup.json: what "drive-sync setup" wrote (the config, the
+// filters, the folders it made), so cancelling its fix before any base undoes
+// exactly that. The base run removes it.
+QString firstSetupMarkPath(const QString &appState);
 // No file: an empty step. A file that cannot be read is a failed fix with
 // that error: holding the timer is the safer mistake, and
 // "drive-sync fix --cancel" clears it.
