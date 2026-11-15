@@ -25,9 +25,9 @@
 
 namespace {
 
-// The timer fires every 15 minutes and a run takes about 8, so a success
-// older than this means runs have stopped happening.
-constexpr int kStaleSeconds = 45 * 60;
+// Three missed runs: 45 minutes at the default 15-minute interval (spec 4).
+// A fixed 45 would show "late" between normal runs at a 30 or 60 minute one.
+constexpr int kStaleIntervals = 3;
 
 QVariantMap countsToMap(const SyncCounts &counts) {
     return {{"added", counts.added}, {"modified", counts.modified}, {"deleted", counts.deleted}};
@@ -48,12 +48,16 @@ BackendPaths BackendPaths::defaults() {
                        home + "/.local/state/drive-sync-app"};
     paths.config = defaultSyncConfigPath();
     paths.self = QCoreApplication::applicationFilePath();
-    if (const auto config = loadSyncConfig(paths.config, nullptr)) {
-        paths.log = config->logFile;
-        paths.drive = config->localPath;
-        paths.managed = true;
-    }
+    if (const auto config = loadSyncConfig(paths.config, nullptr))
+        applySyncConfig(&paths, *config);
     return paths;
+}
+
+void applySyncConfig(BackendPaths *paths, const SyncConfig &config) {
+    paths->log = config.logFile;
+    paths->drive = config.localPath;
+    paths->managed = true;
+    paths->intervalSeconds = config.intervalMinutes * 60;
 }
 
 Backend::Backend(const BackendPaths &paths, QObject *parent) : QObject(parent), m_paths(paths) {
@@ -73,6 +77,13 @@ Backend::Backend(const BackendPaths &paths, QObject *parent) : QObject(parent), 
         querySystemd();
         recompute();
     });
+
+    // QSaveFile replaces the config by a rename, which the folder's watch
+    // sees and a watch on the file alone would lose.
+    m_configDebounce.setSingleShot(true);
+    m_configDebounce.setInterval(300);
+    connect(&m_configWatcher, &QFileSystemWatcher::directoryChanged, this, [this] { m_configDebounce.start(); });
+    connect(&m_configDebounce, &QTimer::timeout, this, &Backend::reloadConfig);
 
     // systemd has no change signal worth a D-Bus subscription here; polling
     // also moves the relative times and the stale check along.
@@ -112,6 +123,7 @@ Backend::~Backend() {
 
 void Backend::refresh() {
     watchAppState();
+    watchConfig();
     readLog();
     querySystemd();
     scanConflicts();
@@ -138,6 +150,13 @@ void Backend::watchAppState() {
     if (!m_paths.appState.isEmpty() && QFileInfo(m_paths.appState).isDir()
         && !m_stateWatcher.directories().contains(m_paths.appState))
         m_stateWatcher.addPath(m_paths.appState);
+}
+
+void Backend::watchConfig() {
+    // The folder appears with a takeover or a first setup.
+    const QString folder = m_paths.config.isEmpty() ? QString() : QFileInfo(m_paths.config).absolutePath();
+    if (!folder.isEmpty() && QFileInfo(folder).isDir() && !m_configWatcher.directories().contains(folder))
+        m_configWatcher.addPath(folder);
 }
 
 void Backend::readLog() {
@@ -300,6 +319,7 @@ void Backend::recompute() {
     src.driveFound = m_conflictError != "noDrive";
     src.conflicts = int(m_conflicts.size());
     src.managed = m_paths.managed;
+    src.intervalSeconds = m_paths.intervalSeconds;
     if (!m_paths.appState.isEmpty()) {
         src.pause = readPause(pauseFilePath(m_paths.appState));
         src.fixPresent = fixPresent(m_paths.appState);
@@ -343,7 +363,7 @@ SyncSummary Backend::summarize(const SyncInputs &in) {
                             && in.lastStart > in.serviceStart.addSecs(60);
     const bool systemdFailed = !in.serviceResult.isEmpty() && in.serviceResult != "success"
                                && in.serviceResult != "exec-condition" && !logIsNewer;
-    const bool stale = in.lastSuccess.isValid() && in.lastSuccess.secsTo(in.now) > kStaleSeconds;
+    const bool stale = in.lastSuccess.isValid() && in.lastSuccess.secsTo(in.now) > qint64(kStaleIntervals) * in.intervalSeconds;
 
     if (!in.systemctlWorks) {
         s.status = "unavailable";
@@ -476,6 +496,8 @@ void Backend::reloadConfig() {
     const auto config = loadSyncConfig(m_paths.config, nullptr);
     const QString log = config ? config->logFile : m_paths.log;
     m_paths.managed = config.has_value();
+    // Without a config the packaged timer's interval is the one that runs.
+    m_paths.intervalSeconds = (config ? config->intervalMinutes : kDefaultIntervalMinutes) * 60;
     if (config)
         m_paths.drive = config->localPath;
     if (log != m_paths.log) {

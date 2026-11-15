@@ -27,7 +27,12 @@ step 4a it sets up a drive-sync where none exists (`T`, `drive-sync signin`
 then `drive-sync setup --folder`): rclone's own browser sign-in with the
 DriveSync OAuth client, the default filters, the config, and a fix whose dry
 run the user confirms; and a token Google no longer accepts is the cause
-`signIn`, with `I` to sign in again. The plan for growing it into the
+`signIn`, with `I` to sign in again. Since step 4b it has Settings (`,`,
+`drive-sync settings`, `drive-sync folders`): the interval (a drop-in for
+the packaged timer) and the max-delete guard at once; the folder, the
+filters and selective sync (a marked block at the top of the filters)
+through the fix, undone byte for byte when that fix is cancelled before its
+base; "late" is three intervals. The plan for growing it into the
 owner of drive-sync is `docs/superpowers/specs/2026-11-07-drive-sync-manager-design.md`; `docs/` is git-ignored,
 so that file exists only in the maintainer's working copy. The `drive-sync` scripts themselves live
 in the DIY repository (`assets/omarchy/home/.local/bin/drive-sync.sh` and
@@ -61,7 +66,7 @@ bin/build               qmake6 + make into build/drive-sync
 bin/test                builds and runs build/tests/drivesync_tests offscreen
 bin/install             bin/build, then makepkg -fsi with BUILDDIR/PKGDEST under build/
 bin/harness             builds tools/harness into build/harness and runs it with the given options
-src/main.cpp            commands run headless (status, sync, pause, resume, takeover, fix, deletes, signin, setup, and run-condition, run, notify, watchdog, fix-run for the units); otherwise the window
+src/main.cpp            commands run headless (status, sync, pause, resume, takeover, fix, deletes, signin, setup, settings, folders, and run-condition, run, notify, watchdog, fix-run for the units); otherwise the window
 src/synclog.{h,cpp}     pure parser of the rclone bisync log into SyncRun records
 src/snapshot.{h,cpp}    buildSnapshot(): the one place the state is decided; tone; the JSON contract
 src/backend.{h,cpp}     the window's state: log watch, systemctl calls, conflict scan, headline rules (summarize)
@@ -82,6 +87,10 @@ src/oauthclient.{h,cpp}  shippedOAuthClient(): the Google client, compiled in on
 src/signin.{h,cpp}      `drive-sync signin [--abandon]`: rclone's browser flow creates the drive-sync remote, or refreshes the config's remote
 src/firstsetup.{h,cpp}  `drive-sync setup --folder`: refusals, default filters, the new user's config, startFix, then the timers
 src/setupcontroller.{h,cpp}  the window's side of signin and setup; Cancel sends SIGTERM to the signin child alone
+src/settingscommand.{h,cpp}  `drive-sync settings`: show; interval (config + timer drop-in) and guard at once; folder, filters and --skip through startFix with the settings-change mark
+src/selectivesync.{h,cpp}  the block of cloud folders left out (escape, parse, rewrite), the tick rules, `drive-sync folders` (rclone lsjson --dirs-only)
+src/settingscontroller.{h,cpp}  the window's side of Settings: a queue of `drive-sync settings ... --json` children
+src/foldertree.{h,cpp}  the cloud folder tree for Settings and first setup, a level at a time through `drive-sync folders`
 src/takeoversetup.{h,cpp}  the window's side of a takeover, through a child process
 src/pluginsetup.{h,cpp} links the shipped bar widget and enables it through `omarchy plugin`
 src/theme.{h,cpp}       Omarchy accent and Hyprland rounding (from the skill template)
@@ -96,7 +105,9 @@ src/ControlsRow.qml     sync now (S), pause (P), resume (U), open ~/Drive (O)
 src/PauseMenu.qml       the three pause lengths (1, 2, 3)
 src/TakeoverBanner.qml  offer to take over (T), or what blocks it; TakeoverDialog.qml confirms
 src/SetupBanner.qml     offer first setup (T) when there is no drive-sync at all
-src/SetupDialog.qml     sign in, the folder, start; with "again", only the sign-in (I)
+src/SetupDialog.qml     sign in, the folder, the cloud folders, start; with "again", only the sign-in (I)
+src/SettingsDialog.qml  Settings (,): General, Cloud folders and Filters pages (Ctrl+1/2/3), Ctrl+S saves the page shown
+src/FolderTreeView.qml  the tree with ticks; takes its own keys (arrows, J K, Space, Left, Right) while it has the focus
 src/FixBanner.qml       offer to fix (F) after lost listings, out of sync or changed filters
 src/FixDialog.qml       the fix's start, the dry run to confirm (Enter) and a stopped step (retry; X cancels)
 src/FixQuestions.qml    the files that changed in the cloud during the base run: C cloud, L notebook, Enter sends
@@ -119,14 +130,15 @@ assets/images/          README pictures: window-*.png from bin/harness over a ma
 
 ```sh
 bin/build            # about 30 s from clean
-bin/test             # 248 cases, about 19 s (seven run real rclone on temp folders)
+bin/test             # 289 cases, about 24 s (ten run real rclone on temp folders)
 bin/install          # needs sudo (pacman -U); run it in a real terminal
 bin/harness --scenario running --clock "h:mm AP" --out build/shot.png   # the window offscreen, made-up data; options atop tools/harness/harness.cpp
 makepkg -f           # from pkgbuild/, with BUILDDIR and PKGDEST set as in bin/install, to check packaging without sudo
 build/drive-sync status --json   # the state as the bar sees it (0.13 s with a fresh conflict cache)
-(cd plugin && node --test tests/*.test.mjs)   # bar widget, 25 cases; the glob is required on Node 22
+(cd plugin && node --test tests/*.test.mjs)   # bar widget, 26 cases; the glob is required on Node 22
 build/drive-sync takeover --check              # read-only: what a takeover would move, or what blocks it
 bin/harness --scenario setup-offer --keys o --out build/shot.png   # first setup; also setup-signing-in, setup-folder, signin-needed
+bin/harness --managed --keys ",w^2w>w" --out build/shot.png   # Settings, Cloud folders page; ^3 Filters, ~X types an X
 omarchy plugin validate plugin                # needs the folder path, not the plugin id
 ```
 
@@ -141,7 +153,8 @@ headline, most urgent first:
 `unavailable` (systemctl failed), `notLoaded`, `fixing`, `fixWaiting`, `fixFailed`,
 `running`, `resync`, `paused`, `noLog`,
 `failed`, `interrupted`, `skipped` (ExecCondition: emergency home), `timerOff`,
-`stale` (no success for 45 min), `noDrive`, `noRuns` (a log with no run:
+`stale` (no success for three intervals, 45 min at the default 15; the
+interval comes from the config through `BackendPaths::intervalSeconds`), `noDrive`, `noRuns` (a log with no run:
 new or rotated), `conflicts`, `ok`. What the
 headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
 `conflicts`.
@@ -413,6 +426,57 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   source file the window uses needs `tools/harness/harness.pro`.
 - The Material `Button` background (an elevation effect) does not render in
   the offscreen harness; `BarBanner.qml` draws its button's background itself.
+
+- **Settings changes that need a resync (step 4b).** `drive-sync settings`
+  writes nothing of the user's: `startFix(paths, apply, undo)` writes
+  `fix.json` (every tick held from here), then `apply` writes
+  `<appState>/settings-change.json` with the old and the new bytes
+  (previousConfig/newConfig, previousFilters/newFilters, base64, only what
+  changes), "fix" (fix.json's start; a mark serves that fix only, and
+  `fix --start` clears one left behind) and "applied". The fix's preparing
+  step writes the new bytes (`applySettingsChange`) only after its loop that
+  waits for drive-sync.service to be idle: a run that passed run-condition
+  before the mark would otherwise read new filters against the old `.md5`,
+  abort and take the base with it. `fix --cancel` at `preparing`, `confirm`,
+  or `failed` from `preparing` writes the old bytes back when "applied",
+  which keeps the base: tried with rclone 1.75.2 on 2026-11-15,
+  `bisync --resync --dry-run` leaves the listings and the filters `.md5`
+  alone (it writes `-dry` listings). From the base on the new bytes stay, and
+  the unit drops the mark. New filters are checked with
+  `rclone lsf <empty dir> --filter-from <file>` first ("malformed rule ..."),
+  and bytes equal to the file's start nothing. The window sends the editor's
+  bytes on stdin (`--filters -`). After a folder change, `takeover --undo` is
+  refused until the folder is set back (the manifest records "localPath").
+- **Option values are taken as they are** in `settings`, `setup` and
+  `folders` (a cloud folder may be called `--json`); `folders` takes its path
+  after `--`, and the window always passes it so.
+- **The interval drop-in.** `~/.config/systemd/user/drive-sync.timer.d/drive-sync-interval.conf`
+  resets the timer list with an empty `OnUnitActiveSec=` (systemd.timer(5):
+  that resets every timer, so it repeats `OnBootSec=5min`), then sets the new
+  value. At 15 minutes there is no drop-in at all, because the takeover
+  refuses any drop-in on the units (`dropIn` blocker, `checkPackagedUnits`),
+  and `undoTakeover` removes ours before anything moves (a removal that
+  fails stops the undo; a later refusal writes it back). The config
+  keeps `intervalMinutes` (optional in config version 1, 15 when absent);
+  "late" reads it from there, never from systemd. Not verified on a live
+  timer: whether daemon-reload alone re-arms it (the command also runs
+  `try-restart drive-sync.timer`).
+- **Selective sync rules** (tried with rclone 1.75.2): the block sits at the
+  top because filter rules are first-match; each line is
+  `- /<folder>/**` with `\ * ? [ ] { }` escaped by a backslash; a name with a
+  line break cannot be left out. A folder left out after it was synced keeps
+  its local copy (bisync ignores it on both sides from then on); ticking it
+  again is a union, so its local copy goes back up, files deleted in the cloud
+  meanwhile included. A block line the code never writes (a `+` rule) makes
+  the block "edited by hand", and the tree refuses to change it. A block keeps
+  its line ends (CRLF too) and its blank line, or lack of one, after `# END`.
+  The tree keeps only listing entries right below the folder listed: one
+  named after the folder itself would nest the tree in itself (a crash seen
+  with a wrong fake). `drive-sync folders` passes SIGTERM to its rclone and
+  sets PR_SET_PDEATHSIG on it; the window stops a listing with SIGTERM.
+- moc also breaks on JSON in raw string literals inside a test macro ("missing
+  ')' in macro usage" at the end of the file): build test JSON with
+  `QJsonObject`.
 
 ### Bar plugin (`plugin/`)
 

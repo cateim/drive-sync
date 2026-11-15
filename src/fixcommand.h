@@ -54,7 +54,15 @@ int runFixCommand(const QStringList &arguments, const BackendPaths &paths, QText
 // and removes the mark again when systemd says no. Refused unless DriveSync
 // runs drive-sync (paths.managed), during a fix or a takeover, and for the
 // config refusals. Call it holding the FixLock. The error, or empty.
-QString startFix(const BackendPaths &paths);
+// A change made in Settings passes apply, which writes it after the mark
+// (no tick runs on it) and before the unit (which reads it): an error from
+// apply removes the mark and is returned; when the unit does not start,
+// undo runs before the mark goes.
+QString startFix(const BackendPaths &paths, const std::function<QString()> &apply = {},
+                 const std::function<void()> &undo = {});
+// The config's flags that say how to reach the remote (--config and the
+// --drive-* ones, with their values), for rclone calls on single paths.
+QStringList remoteFlags(const QStringList &flags);
 // --retry: from a failed step, or one the unit left halfway; starts the
 // unit. Call it holding the FixLock. The error, or empty.
 QString retryFix(const BackendPaths &paths, const FixState &state);

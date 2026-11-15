@@ -2,6 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
+import "format.js" as Format
 
 // The fix, one moment at a time: what it does before it starts, the dry run
 // to confirm, and a step that stopped. The questions about single files have
@@ -96,6 +97,7 @@ Popup {
             color: "#f4f4f5"
         }
         Label {
+            objectName: "fixStartText"
             Layout.fillWidth: true
             // The error comes from rclone's log: never markup.
             textFormat: Text.PlainText
@@ -104,7 +106,8 @@ Popup {
             text: {
                 translator.language
                 if (dialog.mode === "start")
-                    return qsTr("DriveSync rebuilds the base of both sides, the way a resync does, while ~/Drive stays in use. First a dry run lists what the base run would copy, and nothing changes until you confirm it. The base run takes about 40 min; a file that changes in the cloud meanwhile is asked about. Runs wait until the fix ends.")
+                    return qsTr("DriveSync rebuilds the base of both sides, the way a resync does, while %1 stays in use. First a dry run lists what the base run would copy, and nothing changes until you confirm it. The base run takes about 40 min; a file that changes in the cloud meanwhile is asked about. Runs wait until the fix ends.")
+                               .arg(Format.home(backend.drivePath))
                 if (dialog.mode === "confirm")
                     return backend.fixCopies === 0
                         ? qsTr("The dry run found nothing to copy: the base run only writes new listings.")

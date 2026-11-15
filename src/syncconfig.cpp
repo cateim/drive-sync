@@ -21,6 +21,15 @@ bool fail(QString *error, const QString &message) {
 
 }  // namespace
 
+QStringList newUserFlags() {
+    // The maintainer's sync proved these over months; --fast-list is added
+    // by rcloneRunArguments, and the fix leaves the routine ones out of the
+    // base run.
+    return {"--drive-skip-gdocs", "--drive-skip-shortcuts", "--resilient", "--recover", "--max-lock", "2m",
+            "--max-delete",       "5",                      "--conflict-resolve", "newer", "--log-level", "INFO",
+            "--fast-list"};
+}
+
 QString defaultSyncConfigPath() {
     return QDir::homePath() + "/.config/drive-sync/config.json";
 }
@@ -73,12 +82,15 @@ std::optional<SyncConfig> loadSyncConfig(const QString &path, QString *error) {
         config.rcloneFlags << flag.toString();
     }
     config.runOnlyWhen = object.value("runOnlyWhen").toString();
+    // Optional, so a config written before it existed keeps loading.
+    const QJsonValue interval = object.value("intervalMinutes");
+    config.intervalMinutes = interval.isDouble() && interval.toDouble() == interval.toInt() && interval.toInt() > 0
+                                 ? interval.toInt()
+                                 : kDefaultIntervalMinutes;
     return config;
 }
 
-bool saveSyncConfig(const QString &path, const SyncConfig &config, QString *error) {
-    if (!QDir().mkpath(QFileInfo(path).absolutePath()))
-        return fail(error, QString("cannot create the folder of %1").arg(path));
+QByteArray syncConfigBytes(const SyncConfig &config) {
     const QJsonObject object{{"version", kConfigVersion},
                              {"remote", config.remote},
                              {"localPath", config.localPath},
@@ -86,11 +98,18 @@ bool saveSyncConfig(const QString &path, const SyncConfig &config, QString *erro
                              {"filtersFile", config.filtersFile},
                              {"logFile", config.logFile},
                              {"rcloneFlags", QJsonArray::fromStringList(config.rcloneFlags)},
-                             {"runOnlyWhen", config.runOnlyWhen}};
+                             {"runOnlyWhen", config.runOnlyWhen},
+                             {"intervalMinutes", config.intervalMinutes}};
+    return QJsonDocument(object).toJson(QJsonDocument::Indented);
+}
+
+bool saveSyncConfig(const QString &path, const SyncConfig &config, QString *error) {
+    if (!QDir().mkpath(QFileInfo(path).absolutePath()))
+        return fail(error, QString("cannot create the folder of %1").arg(path));
     QSaveFile file(path);
     if (!file.open(QIODevice::WriteOnly))
         return fail(error, QString("cannot write %1").arg(path));
-    file.write(QJsonDocument(object).toJson(QJsonDocument::Indented));
+    file.write(syncConfigBytes(config));
     if (!file.commit())
         return fail(error, QString("cannot write %1").arg(path));
     return true;

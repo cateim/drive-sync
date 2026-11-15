@@ -1,3 +1,4 @@
+#include <QBuffer>
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
@@ -14,6 +15,7 @@
 #include <QQmlPropertyMap>
 #include <QRegularExpression>
 #include <QScopeGuard>
+#include <QSignalSpy>
 #include <QStandardPaths>
 #include <QTemporaryDir>
 #include <QTimeZone>
@@ -41,6 +43,10 @@
 #include "oauthclient.h"
 #include "pausestate.h"
 #include "pluginsetup.h"
+#include "settingscommand.h"
+#include "selectivesync.h"
+#include "settingscontroller.h"
+#include "foldertree.h"
 #include "setupcontroller.h"
 #include "signin.h"
 #include "snapshot.h"
@@ -882,6 +888,123 @@ bool processGone(qint64 pid) {
         return true;
     const QByteArray text = stat.readAll();
     return text.mid(text.lastIndexOf(')') + 2, 1) == "Z";
+}
+
+// Step 4b: what "drive-sync settings" reads and writes, inside dir. A
+// drive-sync DriveSync runs (makeFixSetup), its unit folder, and the fix's
+// fake rclone and systemctl.
+struct SettingsFixture {
+    FixSetup fix;
+    TakeoverPaths takeover;
+};
+
+SettingsFixture makeSettingsFixture(const QString &dir) {
+    SettingsFixture s;
+    s.fix = makeFixSetup(dir);
+    // The config and the log in folders of their own, as ~/.config/drive-sync
+    // and ~/.local/state are: a new local folder may not sit inside them.
+    QDir().mkpath(dir + "/conf");
+    QDir().mkpath(dir + "/logs");
+    QFile::remove(dir + "/config.json");
+    s.fix.config.logFile = dir + "/logs/drive-sync.log";
+    s.fix.paths.log = s.fix.config.logFile;
+    s.fix.paths.config = dir + "/conf/config.json";
+    QString error;
+    saveSyncConfig(s.fix.paths.config, s.fix.config, &error);
+    s.takeover.userUnits = dir + "/units";
+    s.takeover.binDir = dir + "/bin";
+    s.takeover.oldStateDir = dir + "/state";
+    s.takeover.appConfigDir = dir + "/conf";
+    s.takeover.backupRoot = dir + "/backup";
+    s.takeover.systemctl = s.fix.paths.systemctl;
+    s.takeover.rclone = s.fix.tools.rclone;
+    s.takeover.packagedUnits = dir + "/packaged";
+    s.takeover.appState = s.fix.paths.appState;
+    s.takeover.systemUserUnits = dir + "/etc";
+    return s;
+}
+
+// Runs "drive-sync settings <arguments> --json": its exit code and answer.
+QPair<int, QJsonObject> settingsCommand(const SettingsFixture &s, const QStringList &arguments,
+                                        QIODevice *input = nullptr) {
+    QString output;
+    QString errors;
+    QTextStream out(&output);
+    QTextStream err(&errors);
+    const int code = runSettingsCommand(arguments + QStringList{"--json"}, s.fix.paths, s.takeover, out, err, input);
+    out.flush();
+    return {code, QJsonDocument::fromJson(output.toUtf8()).object()};
+}
+
+// An rclone for "drive-sync folders": records each call in rclone-calls.log
+// (arguments separated by tabs), prints lsjson.json and exits with
+// lsjson-exit, or 0.
+QString fakeFoldersRclone(const QString &dir) {
+    const QString path = dir + "/rclone";
+    write(path, QString(R"sh(#!/bin/sh
+for a in "$@"; do printf '%s\t' "$a"; done >> '%1/rclone-calls.log'
+echo >> '%1/rclone-calls.log'
+cat '%1/lsjson.json' 2>/dev/null
+exit "$(cat '%1/lsjson-exit' 2>/dev/null || echo 0)"
+)sh").arg(dir).toUtf8());
+    QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    return path;
+}
+
+// Runs "drive-sync folders <arguments> --json": its exit code and answer.
+QPair<int, QJsonObject> foldersCommand(const BackendPaths &paths, const QString &rclone, const QStringList &arguments) {
+    QString output;
+    QString errors;
+    QTextStream out(&output);
+    QTextStream err(&errors);
+    const int code = runFoldersCommand(QStringList{"--json"} + arguments, paths, rclone, out, err);
+    out.flush();
+    return {code, QJsonDocument::fromJson(output.toUtf8()).object()};
+}
+
+// A drive-sync for the Settings view: records each call in calls.log.
+// "settings --json" prints settings.json; a change copies the filters file
+// it was given to filters-sent.txt and prints change-answer.json; "folders"
+// prints folders-root.json, or folders-<PATH>.json for a level below.
+QString fakeSettingsDrivesync(const QString &dir) {
+    const QString path = dir + "/drive-sync";
+    write(path, QString(R"sh(#!/bin/sh
+echo "$*" >> '%1/calls.log'
+case "$1" in
+  settings)
+    if [ "$2" = --json ]; then cat '%1/settings.json'; exit 0; fi
+    if [ "$2" = --filters ]; then
+      if [ "$3" = - ]; then cat > '%1/filters-sent.txt'; else cp "$3" '%1/filters-sent.txt'; fi
+    fi
+    cat '%1/change-answer.json' ;;
+  folders)
+    case " $* " in
+      *" -- "*) for last in "$@"; do :; done; cat "%1/folders-$last.json" ;;
+      *) cat '%1/folders-root.json' ;;
+    esac ;;
+esac
+exit 0
+)sh").arg(dir).toUtf8());
+    QFile::setPermissions(path, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+    return path;
+}
+
+// Moves the fix to a step and keeps its start, as the unit does: a
+// settings-change mark serves the fix with that start only.
+bool moveFix(const QString &appState, const QString &step, const QString &failedStep = {}) {
+    FixState state = readFix(appState);
+    state.step = step;
+    state.failedStep = failedStep;
+    return writeFix(appState, state);
+}
+
+// Runs the fix unit from "preparing" to the dry run's "confirm", with the
+// config on disk, as drive-sync-fix.service does.
+bool runToConfirm(const SettingsFixture &s) {
+    QString error;
+    const auto config = loadSyncConfig(s.fix.paths.config, &error);
+    return config && runFixUnit(s.fix.paths, *config, s.fix.tools, s.fix.notify) == 0
+           && readFix(s.fix.paths.appState).step == "confirm";
 }
 
 }  // namespace
@@ -6546,6 +6669,12 @@ private slots:
         controller.start("~/Drive");
         QTRY_COMPARE(started.size(), 2);
         QVERIFY(calls(dir.path()).contains("setup --folder " + QDir::homePath() + "/Drive --json"));
+        // The cloud folders left out in the dialog's tree go along.
+        controller.signIn();
+        QTRY_COMPARE(controller.state(), QString("signedIn"));
+        controller.start("~/Drive", {"Photos", "Old Stuff"});
+        QTRY_COMPARE(started.size(), 3);
+        QVERIFY(calls(dir.path()).contains("setup --folder " + QDir::homePath() + "/Drive --skip Photos --skip Old Stuff --json"));
         // Nothing to cancel once setup started: no abandon.
         controller.cancel();
         QVERIFY(!calls(dir.path()).contains("signin --abandon"));
@@ -6603,6 +6732,17 @@ private slots:
         engine.rootContext()->setContextProperty("setupController", &controller);
         engine.rootContext()->setContextProperty("theme", &theme);
         engine.rootContext()->setContextProperty("translator", &translator);
+        // The dialog's tree of cloud folders, over a made-up drive-sync.
+        QTemporaryDir dir;
+        fakeSettingsDrivesync(dir.path());
+        QVERIFY(write(dir.filePath("folders-root.json"),
+                      QJsonDocument(QJsonObject{{"ok", true}, {"error", ""},
+                                                {"folders", QJsonArray{QJsonObject{{"name", "Photos"}, {"path", "Photos"},
+                                                                                   {"local", false}, {"unsupported", false}}}}})
+                          .toJson(QJsonDocument::Compact)));
+        FolderTree tree(dir.filePath("drive-sync"));
+        engine.rootContext()->setContextProperty("folderTree", &tree);
+        QTest::failOnWarning(QRegularExpression("ReferenceError"));
         QQmlComponent component(&engine);
         component.setData(QString("import QtQuick\nimport QtQuick.Controls\nimport \"%1\"\n"
                                   "ApplicationWindow { width: 800; height: 600; visible: true\n"
@@ -6620,6 +6760,11 @@ private slots:
         QTRY_COMPARE(dialog->property("closePolicy").toInt(), noAutoClose);
         controller.insert("state", "signedIn");
         QTRY_VERIFY(dialog->property("closePolicy").toInt() != noAutoClose);
+        // Signed in, the dialog lists DriveSync's own remote for the tree.
+        QVERIFY(QMetaObject::invokeMethod(dialog, "close"));
+        QVERIFY(QMetaObject::invokeMethod(dialog, "openSetup"));
+        QTRY_COMPARE(tree.rows().size(), 1);
+        QVERIFY(calls(dir.path()).contains("folders --remote drive-sync: --json"));
     }
 
     void cancellingAFirstSetupFixUndoesTheSetup()
@@ -6732,6 +6877,1008 @@ private slots:
         const QStringList sent = notifications(dir.path());
         QVERIFY(!sent.isEmpty());
         QVERIFY2(sent.last().contains("sign in again") && !sent.last().contains("reconnect"), qPrintable(sent.last()));
+    }
+
+    // Step 4b. A config written before the interval existed keeps loading,
+    // with the 15 minutes the packaged timer has.
+    void configWithoutIntervalReadsFifteen()
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("config.json");
+        QVERIFY(write(path, R"({"version":1,"remote":"gdrive:","localPath":"/h/Drive","workDir":"/h/w",)"
+                            R"("filtersFile":"/h/f.txt","logFile":"/h/l.log","rcloneFlags":[],"runOnlyWhen":""})"));
+        QString error;
+        auto config = loadSyncConfig(path, &error);
+        QVERIFY2(config, qPrintable(error));
+        QCOMPARE(config->intervalMinutes, 15);
+        for (const QByteArray &bad : {QByteArray("0"), QByteArray("\"x\""), QByteArray("-5")}) {
+            QVERIFY(write(path, R"({"version":1,"remote":"gdrive:","localPath":"/h/Drive","workDir":"/h/w",)"
+                                R"("filtersFile":"/h/f.txt","logFile":"/h/l.log","rcloneFlags":[],"intervalMinutes":)"
+                                    + bad + "}"));
+            config = loadSyncConfig(path, &error);
+            QVERIFY2(config, qPrintable(error));
+            QCOMPARE(config->intervalMinutes, 15);
+        }
+        config->intervalMinutes = 30;
+        QVERIFY(saveSyncConfig(path, *config, &error));
+        QCOMPARE(loadSyncConfig(path, &error)->intervalMinutes, 30);
+    }
+
+    // Spec 4: "late" is three missed runs, 45 minutes at the default 15.
+    void staleIsThreeIntervals()
+    {
+        SyncInputs in = healthy();
+        in.intervalSeconds = 1800;
+        in.lastSuccess = in.now.addSecs(-89 * 60);
+        QCOMPARE(Backend::summarize(in).status, QString("ok"));
+        in.lastSuccess = in.now.addSecs(-91 * 60);
+        QCOMPARE(Backend::summarize(in).status, QString("stale"));
+        SyncInputs standard = healthy();
+        standard.lastSuccess = standard.now.addSecs(-44 * 60);
+        QCOMPARE(Backend::summarize(standard).status, QString("ok"));
+        standard.lastSuccess = standard.now.addSecs(-46 * 60);
+        QCOMPARE(Backend::summarize(standard).status, QString("stale"));
+    }
+
+    void snapshotCarriesTheInterval()
+    {
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        SnapshotSources src = idleSources(successfulRun(now.toLocalTime().addSecs(-2 * 3600), 60), now);
+        QCOMPARE(buildSnapshot(src).summary.status, QString("stale"));
+        src.intervalSeconds = 3600;
+        QCOMPARE(buildSnapshot(src).summary.status, QString("ok"));
+        // BackendPaths carries it from the config, for the window and the status command.
+        SyncConfig config;
+        config.intervalMinutes = 60;
+        BackendPaths paths;
+        applySyncConfig(&paths, config);
+        QCOMPARE(paths.intervalSeconds, 3600);
+    }
+
+    void settingsShowsTheConfig()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        const auto [code, answer] = settingsCommand(s, {});
+        QCOMPARE(code, 0);
+        QVERIFY2(answer.value("ok").toBool(), qPrintable(answer.value("error").toString()));
+        QCOMPARE(answer.value("folder").toString(), s.fix.config.localPath);
+        QCOMPARE(answer.value("remote").toString(), QString("gdrive:"));
+        QCOMPARE(answer.value("intervalMinutes").toInt(), 15);
+        QCOMPARE(answer.value("maxDelete").toInt(), 5);
+        QCOMPARE(answer.value("filtersFile").toString(), s.fix.config.filtersFile);
+        QCOMPARE(answer.value("filters").toString(), QString("- .git/**\n"));
+        // Nothing to show before DriveSync runs drive-sync.
+        SettingsFixture unmanaged = s;
+        unmanaged.fix.paths.managed = false;
+        const auto refused = settingsCommand(unmanaged, {});
+        QCOMPARE(refused.first, 1);
+        QVERIFY(refused.second.value("error").toString().contains("take it over"));
+    }
+
+    void settingsSetsMaxDelete()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        const auto [code, answer] = settingsCommand(s, {"--max-delete", "10"});
+        QVERIFY2(code == 0, qPrintable(answer.value("error").toString()));
+        QCOMPARE(answer.value("fixStarted").toBool(), false);
+        QString error;
+        QCOMPARE(loadSyncConfig(s.fix.paths.config, &error)->rcloneFlags,
+                 (QStringList{"--drive-skip-gdocs", "--resilient", "--max-delete", "10"}));
+        for (const QString &bad : {QString("0"), QString("51"), QString("x")})
+            QCOMPARE(settingsCommand(s, {"--max-delete", bad}).first, 1);
+        QCOMPARE(configuredMaxDelete(loadSyncConfig(s.fix.paths.config, &error)->rcloneFlags), 10);
+
+        // After a guard stop only D lets deletions through: a raise is
+        // refused, a lower guard is fine.
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-300);
+        QVERIFY(write(s.fix.config.logFile, abortedRun(start, {}, numberedFiles("p%1.jpg", 11), 20).toUtf8()));
+        const auto raised = settingsCommand(s, {"--max-delete", "20"});
+        QCOMPARE(raised.first, 1);
+        QVERIFY2(raised.second.value("error").toString().contains("D"), qPrintable(raised.second.value("error").toString()));
+        QCOMPARE(configuredMaxDelete(loadSyncConfig(s.fix.paths.config, &error)->rcloneFlags), 10);
+        QCOMPARE(settingsCommand(s, {"--max-delete", "3"}).first, 0);
+        QCOMPARE(configuredMaxDelete(loadSyncConfig(s.fix.paths.config, &error)->rcloneFlags), 3);
+    }
+
+    void settingsSetsTheIntervalThroughADropIn()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        const auto [code, answer] = settingsCommand(s, {"--interval", "30"});
+        QVERIFY2(code == 0, qPrintable(answer.value("error").toString()));
+        QString error;
+        QCOMPARE(loadSyncConfig(s.fix.paths.config, &error)->intervalMinutes, 30);
+        const QString dropIn = dir.filePath("units/drive-sync.timer.d/drive-sync-interval.conf");
+        QCOMPARE(dropIn, intervalDropInPath(s.takeover.userUnits));
+        QCOMPARE(readBytes(dropIn), intervalDropIn(30));
+        QVERIFY(intervalDropIn(30).contains("[Timer]\nOnUnitActiveSec=\nOnBootSec=5min\nOnUnitActiveSec=30min\n"));
+        const QStringList sent = calls(dir.path());
+        QVERIFY2(sent.indexOf("systemctl --user daemon-reload") >= 0
+                     && sent.indexOf("systemctl --user daemon-reload") < sent.indexOf("systemctl --user try-restart drive-sync.timer"),
+                 qPrintable(sent.join('\n')));
+        // Back to the packaged 15 minutes: no drop-in at all.
+        QCOMPARE(settingsCommand(s, {"--interval", "15"}).first, 0);
+        QVERIFY(!QFile::exists(dropIn));
+        QVERIFY(!QFile::exists(dir.filePath("units/drive-sync.timer.d")));
+        QCOMPARE(loadSyncConfig(s.fix.paths.config, &error)->intervalMinutes, 15);
+        for (const QString &bad : {QString("4"), QString("1441"), QString("ten")})
+            QCOMPARE(settingsCommand(s, {"--interval", bad}).first, 1);
+        // A fix holds every change.
+        QVERIFY(writeFix(s.fix.paths.appState, fixAt("confirm")));
+        QCOMPARE(settingsCommand(s, {"--interval", "60"}).first, 1);
+        QVERIFY(!QFile::exists(dropIn));
+    }
+
+    void undoTakeoverRemovesTheIntervalDropIn()
+    {
+        QTemporaryDir dir;
+        OldSetup old = makeOldSetup(dir.path());
+        old.paths.systemctl = takeoverSystemctl(dir.path(), 0);
+        QString error;
+        QVERIFY(applyTakeover(old.paths, detectTakeover(old.paths, settledSnapshot()), QDateTime::currentDateTimeUtc(),
+                              &error));
+        // What "drive-sync settings --interval 30" leaves.
+        QVERIFY(QDir().mkpath(old.paths.userUnits + "/drive-sync.timer.d"));
+        QVERIFY(write(intervalDropInPath(old.paths.userUnits), intervalDropIn(30)));
+        QVERIFY2(undoTakeover(old.paths, &error), qPrintable(error));
+        QVERIFY(!QFile::exists(old.paths.userUnits + "/drive-sync.timer.d"));
+        QVERIFY(!detectTakeover(old.paths, settledSnapshot()).blockers.contains("dropIn"));
+    }
+
+    // New filters are written after the fix's mark (no tick runs on them) and
+    // before its unit starts (the unit reads them for the dry run).
+    void settingsFiltersStartAFixAfterTheMark()
+    {
+        QTemporaryDir dir;
+        SettingsFixture s = makeSettingsFixture(dir.path());
+        // At the unit's start fix.json exists and the filters are still the
+        // old ones: the new bytes wait in the mark for the preparing step.
+        const QString systemctl = dir.filePath("systemctl");
+        QVERIFY(write(systemctl, QString("#!/bin/sh\necho \"systemctl $*\" >> '%1/calls.log'\n"
+                                         "case \"$*\" in *\" start \"*) [ -f '%2/fix.json' ] && cp '%3' '%1/at-start.txt' ;; esac\n"
+                                         "exit 0\n")
+                                     .arg(dir.path(), s.fix.paths.appState, s.fix.config.filtersFile)
+                                     .toUtf8()));
+        const QByteArray edited = "- .git/**\n- *.iso\n";
+        QVERIFY(write(dir.filePath("new-filters.txt"), edited));
+        const auto [code, answer] = settingsCommand(s, {"--filters", dir.filePath("new-filters.txt")});
+        QVERIFY2(code == 0, qPrintable(answer.value("error").toString()));
+        QVERIFY(answer.value("fixStarted").toBool());
+        QCOMPARE(readBytes(dir.filePath("at-start.txt")), QByteArray("- .git/**\n"));
+        QCOMPARE(readBytes(s.fix.config.filtersFile), QByteArray("- .git/**\n"));
+        QCOMPARE(readFix(s.fix.paths.appState).step, QString("preparing"));
+        const QJsonObject mark = QJsonDocument::fromJson(readBytes(settingsChangeMarkPath(s.fix.paths.appState))).object();
+        QCOMPARE(QByteArray::fromBase64(mark.value("previousFilters").toString().toLatin1()), QByteArray("- .git/**\n"));
+        QCOMPARE(QByteArray::fromBase64(mark.value("newFilters").toString().toLatin1()), edited);
+        QCOMPARE(mark.value("config").toString(), s.fix.paths.config);
+        QCOMPARE(mark.value("fix").toInteger(), readFix(s.fix.paths.appState).started.toSecsSinceEpoch());
+        QVERIFY(!mark.value("applied").toBool());
+    }
+
+    // Review: a run that passed run-condition just before the fix's mark
+    // reads the filters with the old .md5; new filters under it would abort
+    // it and take the base along. The preparing step writes them only once
+    // drive-sync.service is idle.
+    void settingsBytesWaitForTheRunningRun()
+    {
+        QTemporaryDir dir;
+        SettingsFixture s = makeSettingsFixture(dir.path());
+        QVERIFY(write(dir.filePath("new.txt"), "- *.iso\n"));
+        QCOMPARE(settingsCommand(s, {"--filters", dir.filePath("new.txt")}).first, 0);
+        // drive-sync.service says active twice, then inactive; each time it
+        // is active, what the run would read is kept.
+        QVERIFY(write(dir.filePath("systemctl"),
+                      QString(R"sh(#!/bin/sh
+echo "systemctl $*" >> '%1/calls.log'
+case "$*" in
+  *drive-sync-fix.service*) echo inactive ;;
+  *drive-sync.service*)
+    if [ -s '%1/service-active' ]; then head -n 1 '%1/service-active'; sed -i 1d '%1/service-active'; cat '%2' >> '%1/read-by-run.txt'; else echo inactive; fi ;;
+esac
+)sh").arg(dir.path(), s.fix.config.filtersFile).toUtf8()));
+        QVERIFY(write(dir.filePath("service-active"), "active\nactive\n"));
+        QVERIFY(runToConfirm(s));
+        QCOMPARE(readBytes(dir.filePath("read-by-run.txt")), QByteArray("- .git/**\n- .git/**\n"));
+        QCOMPARE(*s.fix.waits, (QList<int>{5, 5}));
+        QCOMPARE(readBytes(s.fix.config.filtersFile), QByteArray("- *.iso\n"));
+        QVERIFY(QJsonDocument::fromJson(readBytes(settingsChangeMarkPath(s.fix.paths.appState))).object().value("applied").toBool());
+        // The dry run read the new filters.
+        QVERIFY(calls(dir.path()).filter("--dry-run").join('\n').contains("--filters-file " + s.fix.config.filtersFile));
+    }
+
+    void settingsFiltersWithTheSameBytesStartNothing()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        QVERIFY(write(dir.filePath("same.txt"), "- .git/**\n"));
+        const auto [code, answer] = settingsCommand(s, {"--filters", dir.filePath("same.txt")});
+        QCOMPARE(code, 0);
+        QCOMPARE(answer.value("fixStarted").toBool(), false);
+        QVERIFY(!fixPresent(s.fix.paths.appState));
+        QVERIFY(!QFile::exists(settingsChangeMarkPath(s.fix.paths.appState)));
+    }
+
+    void settingsRefusesFiltersRcloneCannotRead()
+    {
+        const QString rclone = QStandardPaths::findExecutable("rclone");
+        if (rclone.isEmpty())
+            QSKIP("rclone is not installed");
+        QTemporaryDir dir;
+        SettingsFixture s = makeSettingsFixture(dir.path());
+        s.takeover.rclone = rclone;
+        QVERIFY(write(dir.filePath("bad.txt"), "Photos/**\n"));
+        const auto [code, answer] = settingsCommand(s, {"--filters", dir.filePath("bad.txt")});
+        QCOMPARE(code, 1);
+        QVERIFY2(answer.value("error").toString().contains("malformed rule"), qPrintable(answer.value("error").toString()));
+        QCOMPARE(readBytes(s.fix.config.filtersFile), QByteArray("- .git/**\n"));
+        QVERIFY(!fixPresent(s.fix.paths.appState));
+        // A good file passes the same check.
+        QVERIFY(write(dir.filePath("good.txt"), "- /Photos/**\n- .git/**\n"));
+        QCOMPARE(settingsCommand(s, {"--filters", dir.filePath("good.txt")}).first, 0);
+    }
+
+    void settingsRollsBackWhenTheFixCannotStart()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        QVERIFY(write(dir.filePath("start-exit"), "1\n"));
+        QVERIFY(write(dir.filePath("new.txt"), "- *.iso\n"));
+        const auto [code, answer] = settingsCommand(s, {"--filters", dir.filePath("new.txt")});
+        QCOMPARE(code, 1);
+        QVERIFY(answer.value("error").toString().contains("drive-sync-fix.service"));
+        QCOMPARE(readBytes(s.fix.config.filtersFile), QByteArray("- .git/**\n"));
+        QVERIFY(!fixPresent(s.fix.paths.appState));
+        QVERIFY(!QFile::exists(settingsChangeMarkPath(s.fix.paths.appState)));
+    }
+
+    // Review Focus 1: X at the dry run gives back the base the sync had.
+    void cancellingASettingsFixPutsTheOldFiltersBack()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        const QString filters = s.fix.config.filtersFile;
+        QVERIFY(write(filters + ".md5", QCryptographicHash::hash(readBytes(filters), QCryptographicHash::Md5).toHex()));
+        QVERIFY(filtersUsable(filters, nullptr));
+        QVERIFY(write(dir.filePath("new.txt"), "- *.iso\n"));
+        QCOMPARE(settingsCommand(s, {"--filters", dir.filePath("new.txt")}).first, 0);
+        QVERIFY(runToConfirm(s));
+        QVERIFY(!filtersUsable(filters, nullptr));
+        QCOMPARE(fixCommand(s.fix, {"--cancel"}), QString());
+        QCOMPARE(readBytes(filters), QByteArray("- .git/**\n"));
+        QVERIFY(filtersUsable(filters, nullptr));
+        QVERIFY(!QFile::exists(settingsChangeMarkPath(s.fix.paths.appState)));
+        QVERIFY(!fixPresent(s.fix.paths.appState));
+
+        // Cancelled before the preparing step wrote anything: nothing to undo.
+        QCOMPARE(settingsCommand(s, {"--filters", dir.filePath("new.txt")}).first, 0);
+        QCOMPARE(fixCommand(s.fix, {"--cancel"}), QString());
+        QCOMPARE(readBytes(filters), QByteArray("- .git/**\n"));
+        QVERIFY(!QFile::exists(settingsChangeMarkPath(s.fix.paths.appState)));
+
+        // The dry run failed after the bytes were written: they go back too.
+        QCOMPARE(settingsCommand(s, {"--filters", dir.filePath("new.txt")}).first, 0);
+        QVERIFY(runToConfirm(s));
+        QVERIFY(moveFix(s.fix.paths.appState, "failed", "preparing"));
+        QCOMPARE(fixCommand(s.fix, {"--cancel"}), QString());
+        QCOMPARE(readBytes(filters), QByteArray("- .git/**\n"));
+        QVERIFY(filtersUsable(filters, nullptr));
+
+        // Once a base run started, the new filters are the base's: kept.
+        QCOMPARE(settingsCommand(s, {"--filters", dir.filePath("new.txt")}).first, 0);
+        QVERIFY(runToConfirm(s));
+        QVERIFY(moveFix(s.fix.paths.appState, "failed", "base"));
+        QCOMPARE(fixCommand(s.fix, {"--cancel"}), QString());
+        QCOMPARE(readBytes(filters), QByteArray("- *.iso\n"));
+        QVERIFY(!QFile::exists(settingsChangeMarkPath(s.fix.paths.appState)));
+    }
+
+    // A mark serves the fix that wrote it: one left behind never acts on a
+    // later fix, and a fix started without a change clears it.
+    void aSettingsMarkServesItsOwnFixOnly()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        QVERIFY(write(dir.filePath("new.txt"), "- *.iso\n"));
+        QCOMPARE(settingsCommand(s, {"--filters", dir.filePath("new.txt")}).first, 0);
+        QVERIFY(runToConfirm(s));
+        const QByteArray mark = readBytes(settingsChangeMarkPath(s.fix.paths.appState));
+        // fix.json removed by hand, the mark left behind; a later fix.
+        QVERIFY(clearFix(s.fix.paths.appState));
+        QVERIFY(write(settingsChangeMarkPath(s.fix.paths.appState), mark));
+        FixState later = fixAt("confirm");
+        later.started = later.started.addSecs(-7200);
+        QVERIFY(writeFix(s.fix.paths.appState, later));
+        QCOMPARE(fixCommand(s.fix, {"--cancel"}), QString());
+        QCOMPARE(readBytes(s.fix.config.filtersFile), QByteArray("- *.iso\n"));
+        QVERIFY(!QFile::exists(settingsChangeMarkPath(s.fix.paths.appState)));
+        // "fix --start" clears a mark left behind before anything reads it.
+        QVERIFY(write(settingsChangeMarkPath(s.fix.paths.appState), mark));
+        QCOMPARE(fixCommand(s.fix, {"--start"}), QString());
+        QVERIFY(!QFile::exists(settingsChangeMarkPath(s.fix.paths.appState)));
+    }
+
+    void fixUnitDropsTheSettingsMarkAfterTheBase()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        QVERIFY(write(dir.filePath("new.txt"), "- *.iso\n"));
+        QCOMPARE(settingsCommand(s, {"--filters", dir.filePath("new.txt")}).first, 0);
+        QVERIFY(QFile::exists(settingsChangeMarkPath(s.fix.paths.appState)));
+        const QDateTime when = QDateTime::currentDateTimeUtc().addSecs(-3600);
+        QVERIFY(cannedListings(dir.path(), listingLine("same.txt", 3, when), listingLine("same.txt", 3, when)));
+        QVERIFY(writeFix(s.fix.paths.appState, fixAt("base")));
+        QCOMPARE(runFixUnit(s.fix.paths, s.fix.config, s.fix.tools, s.fix.notify), 0);
+        QVERIFY(!QFile::exists(settingsChangeMarkPath(s.fix.paths.appState)));
+    }
+
+    void settingsMovesTheFolderThroughAFix()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        QVERIFY(write(s.fix.config.localPath + "/mine.txt", "mine\n"));
+        const QByteArray configBefore = readBytes(s.fix.paths.config);
+        const QString other = dir.filePath("Other/Drive");
+        const auto [code, answer] = settingsCommand(s, {"--folder", other});
+        QVERIFY2(code == 0, qPrintable(answer.value("error").toString()));
+        QVERIFY(answer.value("fixStarted").toBool());
+        QString error;
+        // The config changes in the preparing step, not before.
+        QCOMPARE(readBytes(s.fix.paths.config), configBefore);
+        QVERIFY(QFileInfo(other).isDir());
+        const QJsonObject mark = QJsonDocument::fromJson(readBytes(settingsChangeMarkPath(s.fix.paths.appState))).object();
+        QCOMPARE(QByteArray::fromBase64(mark.value("previousConfig").toString().toLatin1()), configBefore);
+        QVERIFY(!mark.contains("previousFilters"));
+        QCOMPARE(mark.value("createdFolders").toArray().size(), 2);  // Other and Other/Drive
+        QVERIFY(runToConfirm(s));
+        QCOMPARE(loadSyncConfig(s.fix.paths.config, &error)->localPath, other);
+        // The dry run already compared the new folder.
+        QVERIFY(calls(dir.path()).filter("--dry-run").join('\n').contains(" " + other + " "));
+        QCOMPARE(readBytes(s.fix.config.localPath + "/mine.txt"), QByteArray("mine\n"));
+        QCOMPARE(readBytes(s.fix.config.filtersFile), QByteArray("- .git/**\n"));
+    }
+
+    void settingsRefusesNestedFolders()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        const QByteArray before = readBytes(s.fix.paths.config);
+        for (const QString &folder : {s.fix.config.localPath + "/Sub", dir.path(), QDir::homePath(),
+                                      s.fix.paths.appState + "/Drive", QString("relative/Drive")}) {
+            const auto refused = settingsCommand(s, {"--folder", folder});
+            QVERIFY2(refused.first == 1, qPrintable(folder));
+        }
+        QCOMPARE(readBytes(s.fix.paths.config), before);
+        QVERIFY(!fixPresent(s.fix.paths.appState));
+    }
+
+    void settingsSameFolderStartsNothing()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        const auto [code, answer] = settingsCommand(s, {"--folder", s.fix.config.localPath + "/"});
+        QCOMPARE(code, 0);
+        QCOMPARE(answer.value("fixStarted").toBool(), false);
+        QVERIFY(!fixPresent(s.fix.paths.appState));
+    }
+
+    void cancellingAFolderChangePutsTheOldConfigBack()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        const QByteArray before = readBytes(s.fix.paths.config);
+        const QString other = dir.filePath("Other");
+        QCOMPARE(settingsCommand(s, {"--folder", other}).first, 0);
+        QVERIFY(runToConfirm(s));
+        QVERIFY(readBytes(s.fix.paths.config) != before);
+        QCOMPARE(fixCommand(s.fix, {"--cancel"}), QString());
+        QCOMPARE(readBytes(s.fix.paths.config), before);
+        QVERIFY(!QFile::exists(other));
+        // A file put in the new folder meanwhile keeps it there.
+        QCOMPARE(settingsCommand(s, {"--folder", other}).first, 0);
+        QVERIFY(write(other + "/new.txt", "new\n"));
+        QCOMPARE(fixCommand(s.fix, {"--cancel"}), QString());
+        QCOMPARE(readBytes(s.fix.paths.config), before);
+        QCOMPARE(readBytes(other + "/new.txt"), QByteArray("new\n"));
+    }
+
+    void folderChangeBaseLeavesTheOldFolderAlone()
+    {
+        const QString rclone = QStandardPaths::findExecutable("rclone");
+        if (rclone.isEmpty())
+            QSKIP("rclone is not installed");
+        QTemporaryDir dir;
+        SettingsFixture s = makeSettingsFixture(dir.path());
+        // Local folders as both sides, with real rclone.
+        QVERIFY(QDir().mkpath(dir.filePath("cloud/Docs")));
+        QVERIFY(write(dir.filePath("cloud/one.txt"), "one\n"));
+        QVERIFY(write(dir.filePath("cloud/Docs/two.txt"), "two\n"));
+        SyncConfig config = s.fix.config;
+        config.remote = dir.filePath("cloud");
+        QString error;
+        QVERIFY(saveSyncConfig(s.fix.paths.config, config, &error));
+        s.fix.tools.rclone = rclone;
+        s.takeover.rclone = rclone;
+        auto runFix = [&](const QString &what) {
+            const SyncConfig now = *loadSyncConfig(s.fix.paths.config, &error);
+            QCOMPARE(runFixUnit(s.fix.paths, now, s.fix.tools, s.fix.notify), 0);
+            QVERIFY2(readFix(s.fix.paths.appState).step == "confirm", qPrintable(what + ": " + readFix(s.fix.paths.appState).error));
+            QCOMPARE(fixCommand(s.fix, {"--confirm"}), QString());
+            // A new start of the unit reads the config again, as systemd's does.
+            const int unit = runFixUnit(s.fix.paths, *loadSyncConfig(s.fix.paths.config, &error), s.fix.tools, s.fix.notify);
+            QVERIFY2(unit == 0 && !fixPresent(s.fix.paths.appState), qPrintable(what + ": " + readFix(s.fix.paths.appState).error));
+        };
+        QCOMPARE(fixCommand(s.fix, {"--start"}), QString());
+        runFix("first base");
+        QVERIFY(write(config.localPath + "/local-only.txt", "kept\n"));
+        const auto oldFolder = filesUnder(config.localPath);
+        const QString other = dir.filePath("Other");
+        const auto [code, answer] = settingsCommand(s, {"--folder", other});
+        QVERIFY2(code == 0, qPrintable(answer.value("error").toString()));
+        runFix("base of the new folder");
+        QCOMPARE(readBytes(other + "/one.txt"), QByteArray("one\n"));
+        QCOMPARE(readBytes(other + "/Docs/two.txt"), QByteArray("two\n"));
+        QVERIFY(!QFile::exists(other + "/local-only.txt"));
+        QCOMPARE(filesUnder(config.localPath), oldFolder);
+        QVERIFY(!QFile::exists(settingsChangeMarkPath(s.fix.paths.appState)));
+    }
+    // Step 4b, selective sync. Ticking back what was left out gives the
+    // filters their old bytes: the .md5 matches and no fix is needed.
+    void skipBlockRoundTripKeepsTheFileByteForByte()
+    {
+        const QByteArray original = defaultFilters();
+        QString error;
+        const auto with = withSkippedFolders(original, {"Work/Old", "Photos"}, &error);
+        QVERIFY2(with, qPrintable(error));
+        QVERIFY(with->startsWith("# BEGIN DriveSync: cloud folders left out of this computer\n- /Photos/**\n"
+                                 "- /Work/Old/**\n# END DriveSync: cloud folders left out of this computer\n\n"));
+        QVERIFY(with->endsWith(original));
+        QCOMPARE(*skippedFolders(*with, &error), (QStringList{"Photos", "Work/Old"}));
+        QCOMPARE(*withSkippedFolders(*with, {}, &error), original);
+        // Replaced in place: no duplicates, nothing inside a folder already left out.
+        const auto again = withSkippedFolders(*with, {"Work/Old", "Archive", "Work", "Archive"}, &error);
+        QVERIFY2(again, qPrintable(error));
+        QCOMPARE(*skippedFolders(*again, &error), (QStringList{"Archive", "Work"}));
+        QVERIFY(again->endsWith(original));
+        QCOMPARE(*skippedFolders(original, &error), QStringList());
+    }
+
+    void skipBlockEscapesGlobCharacters()
+    {
+        QCOMPARE(escapeFilterPath("a[1]"), QString("a\\[1\\]"));
+        QCOMPARE(escapeFilterPath("b*c"), QString("b\\*c"));
+        QCOMPARE(escapeFilterPath("{x}"), QString("\\{x\\}"));
+        QCOMPARE(escapeFilterPath("back\\slash"), QString("back\\\\slash"));
+        QCOMPARE(escapeFilterPath("q?mark"), QString("q\\?mark"));
+        QCOMPARE(escapeFilterPath("sp ace/ lead"), QString("sp ace/ lead"));
+        const QStringList names{" lead", "a[1]", "b*c", "back\\slash", "q?mark", "sp ace", "{x}", "Ünï/sub"};
+        QString error;
+        const auto filters = withSkippedFolders("- .git/**\n", names, &error);
+        QVERIFY2(filters, qPrintable(error));
+        QVERIFY(filters->contains("- /a\\[1\\]/**\n"));
+        QCOMPARE(*skippedFolders(*filters, &error), names);
+    }
+
+    void skipBlockRefusesNewlines()
+    {
+        QString error;
+        for (const QString &bad : {QString("a\nb"), QString("a\rb"), QString(), QString("/Photos"), QString("a//b"),
+                                   QString("Photos/")}) {
+            QVERIFY2(!withSkippedFolders("- .git/**\n", {bad}, &error), qPrintable(bad));
+            QVERIFY(!error.isEmpty());
+        }
+    }
+
+    void skipBlockEditedByHandIsReported()
+    {
+        QString error;
+        QVERIFY(!skippedFolders("# BEGIN DriveSync: cloud folders left out of this computer\n- /A/**\n", &error));
+        QVERIFY(error.contains("END"));
+        QVERIFY(!skippedFolders("# BEGIN DriveSync: cloud folders left out of this computer\n+ /A/**\n"
+                                "# END DriveSync: cloud folders left out of this computer\n\n",
+                                &error));
+        QVERIFY2(error.contains("+ /A/**"), qPrintable(error));
+        // withSkippedFolders refuses to rewrite a block it cannot read.
+        QVERIFY(!withSkippedFolders("# BEGIN DriveSync: cloud folders left out of this computer\n- /A/**\n", {"B"}, &error));
+    }
+
+    void togglingFoldersFollowsTheTree()
+    {
+        QStringList skipped;
+        skipped = toggledFolder(skipped, "Work/Old");
+        QCOMPARE(skipped, QStringList{"Work/Old"});
+        QVERIFY(folderSkipped(skipped, "Work/Old/2019"));
+        QVERIFY(!folderTickable(skipped, "Work/Old/2019"));
+        QVERIFY(folderTickable(skipped, "Work/Old"));
+        // Leaving the parent out takes in the child it already left out.
+        skipped = toggledFolder(skipped, "Work");
+        QCOMPARE(skipped, QStringList{"Work"});
+        QVERIFY(!folderTickable(skipped, "Work/Old"));
+        QCOMPARE(toggledFolder(skipped, "Work/Old"), skipped);  // not tickable: no change
+        QVERIFY(!folderSkipped(skipped, "Workshop"));
+        skipped = toggledFolder(skipped, "Work");
+        QCOMPARE(skipped, QStringList());
+    }
+
+    void foldersCommandListsOneLevel()
+    {
+        QTemporaryDir dir;
+        SettingsFixture s = makeSettingsFixture(dir.path());
+        s.fix.config.rcloneFlags = {"--config", "/x/rclone.conf", "--drive-skip-shortcuts", "--resilient"};
+        QString error;
+        QVERIFY(saveSyncConfig(s.fix.paths.config, s.fix.config, &error));
+        QVERIFY(QDir().mkpath(s.fix.config.localPath + "/Work/Old"));
+        QVERIFY(write(dir.filePath("lsjson.json"),
+                      R"([{"Path":"Old","Name":"Old","Size":-1,"MimeType":"inode/directory","IsDir":true},)"
+                      R"({"Path":"archive","Name":"archive","IsDir":true},{"Path":"a\nb","Name":"a\nb","IsDir":true}])"));
+        const QString rclone = fakeFoldersRclone(dir.path());
+        const auto [code, answer] = foldersCommand(s.fix.paths, rclone, {"Work"});
+        QVERIFY2(code == 0, qPrintable(answer.value("error").toString()));
+        const QJsonArray folders = answer.value("folders").toArray();
+        QCOMPARE(folders.size(), 3);
+        QCOMPARE(folders.at(0).toObject().value("name").toString(), QString("a\nb"));
+        QCOMPARE(folders.at(0).toObject().value("unsupported").toBool(), true);
+        QCOMPARE(folders.at(1).toObject().value("path").toString(), QString("Work/archive"));
+        QCOMPARE(folders.at(2).toObject().value("path").toString(), QString("Work/Old"));
+        QCOMPARE(folders.at(2).toObject().value("local").toBool(), true);
+        QCOMPARE(folders.at(1).toObject().value("local").toBool(), false);
+        QCOMPARE(rcloneCalls(dir.path()).last(),
+                 (QStringList{"lsjson", "gdrive:Work", "--dirs-only", "--config", "/x/rclone.conf", "--drive-skip-shortcuts"}));
+        // First setup has no config yet: the remote it names, at the root.
+        BackendPaths fresh = s.fix.paths;
+        fresh.config = dir.filePath("none.json");
+        fresh.managed = false;
+        QCOMPARE(foldersCommand(fresh, rclone, {"--remote", "drive-sync:"}).first, 0);
+        // With the flags a new sync gets, so the tree shows what will sync.
+        QCOMPARE(rcloneCalls(dir.path()).last(),
+                 (QStringList{"lsjson", "drive-sync:", "--dirs-only", "--drive-skip-gdocs", "--drive-skip-shortcuts"}));
+    }
+
+    void foldersCommandSaysAGoneFolder()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        QVERIFY(write(dir.filePath("lsjson-exit"), "3\n"));
+        const auto [code, answer] = foldersCommand(s.fix.paths, fakeFoldersRclone(dir.path()), {"Gone"});
+        QCOMPARE(code, 1);
+        QVERIFY2(answer.value("error").toString().contains("no longer"), qPrintable(answer.value("error").toString()));
+    }
+
+    void realRcloneHonoursTheSkipBlock()
+    {
+        const QString rclone = QStandardPaths::findExecutable("rclone");
+        if (rclone.isEmpty())
+            QSKIP("rclone is not installed");
+        QTemporaryDir dir;
+        const QStringList names{" lead", "a[1]", "b*c", "back\\slash", "q?mark", "sp ace", "{x}", "Work/Old"};
+        for (const QString &name : names + QStringList{"qXmark", "Work"}) {
+            QVERIFY(QDir().mkpath(dir.filePath("cloud/" + name)));
+            QVERIFY(write(dir.filePath("cloud/" + name + "/f.txt"), "x\n"));
+        }
+        QVERIFY(write(dir.filePath("cloud/top.txt"), "t\n"));
+        QString error;
+        const auto filters = withSkippedFolders(defaultFilters(), names, &error);
+        QVERIFY2(filters, qPrintable(error));
+        QVERIFY(write(dir.filePath("filters.txt"), *filters));
+        // A real base run between the "cloud" and an empty folder: only what
+        // the block lets through comes down.
+        QVERIFY(QDir().mkpath(dir.filePath("local")));
+        const QStringList bisync{"bisync", dir.filePath("cloud"), dir.filePath("local"), "--workdir", dir.filePath("work"),
+                                 "--filters-file", dir.filePath("filters.txt")};
+        QVERIFY2(runProcess(rclone, bisync + QStringList{"--resync", "--resync-mode", "newer"}, 60000, nullptr, &error),
+                 qPrintable(error));
+        QStringList listed = filesUnder(dir.filePath("local")).keys();
+        listed.sort();
+        QCOMPARE(listed, (QStringList{"Work/f.txt", "qXmark/f.txt", "top.txt"}));
+        // A normal run leaves a folder left out alone on both sides.
+        QVERIFY(QDir().mkpath(dir.filePath("local/Work/Old")));
+        QVERIFY(write(dir.filePath("local/Work/Old/mine.txt"), "mine\n"));
+        QVERIFY2(runProcess(rclone, bisync, 60000, nullptr, &error), qPrintable(error));
+        QVERIFY(!QFile::exists(dir.filePath("cloud/Work/Old/mine.txt")));
+        QVERIFY(QFile::exists(dir.filePath("cloud/Work/Old/f.txt")));
+    }
+
+    void settingsSkipStartsAFixAndCancelRestores()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        const auto [code, answer] = settingsCommand(s, {"--skip", "Photos", "--skip", "Work/Old"});
+        QVERIFY2(code == 0, qPrintable(answer.value("error").toString()));
+        QVERIFY(answer.value("fixStarted").toBool());
+        QString error;
+        QVERIFY(runToConfirm(s));
+        QCOMPARE(*skippedFolders(readBytes(s.fix.config.filtersFile), &error), (QStringList{"Photos", "Work/Old"}));
+        QCOMPARE(settingsCommand(s, {}).second.value("skipped").toArray().size(), 2);
+        QCOMPARE(fixCommand(s.fix, {"--cancel"}), QString());
+        QCOMPARE(readBytes(s.fix.config.filtersFile), QByteArray("- .git/**\n"));
+        // Nothing left out already: no change, no fix.
+        const auto none = settingsCommand(s, {"--skip-none"});
+        QCOMPARE(none.first, 0);
+        QCOMPARE(none.second.value("fixStarted").toBool(), false);
+        QCOMPARE(settingsCommand(s, {"--skip", "a\nb"}).first, 1);
+    }
+
+    void setupWritesTheSkippedFolders()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        CommandResult r;
+        QTextStream out(&r.out);
+        QTextStream err(&r.err);
+        r.code = runSetupCommand({"--folder", s.folder, "--skip", "Photos", "--skip", "Old Stuff", "--json"}, s.paths,
+                                 s.takeover, out, err);
+        out.flush();
+        QVERIFY2(r.code == 0, qPrintable(r.out + r.err));
+        QString error;
+        const QByteArray filters = readBytes(s.takeover.appConfigDir + "/filters.txt");
+        QCOMPARE(*skippedFolders(filters, &error), (QStringList{"Old Stuff", "Photos"}));
+        QVERIFY(filters.endsWith(defaultFilters()));
+    }
+    void settingsControllerFollowsTheCommands()
+    {
+        QTemporaryDir dir;
+        const QJsonObject settings{{"ok", true}, {"error", ""}, {"folder", "/h/Drive"}, {"remote", "gdrive:"},
+                                   {"intervalMinutes", 30}, {"maxDelete", 5}, {"filtersFile", "/h/f.txt"},
+                                   {"filters", "- .git/**\n"}, {"skipped", QJsonArray{"Photos"}}, {"skipError", ""}};
+        QVERIFY(write(dir.filePath("settings.json"), QJsonDocument(settings).toJson(QJsonDocument::Compact)));
+        auto answerWith = [&](bool ok, const QString &error, bool fixStarted) {
+            return write(dir.filePath("change-answer.json"),
+                         QJsonDocument(QJsonObject{{"ok", ok}, {"error", error}, {"fixStarted", fixStarted}})
+                             .toJson(QJsonDocument::Compact));
+        };
+        QVERIFY(answerWith(true, "", false));
+        SettingsController controller(fakeSettingsDrivesync(dir.path()));
+        QSignalSpy fixes(&controller, &SettingsController::fixStarted);
+        controller.load();
+        QTRY_VERIFY(controller.loaded());
+        QCOMPARE(controller.folder(), QString("/h/Drive"));
+        QCOMPARE(controller.intervalMinutes(), 30);
+        QCOMPARE(controller.maxDelete(), 5);
+        QCOMPARE(controller.filters(), QString("- .git/**\n"));
+        QCOMPARE(controller.skipped(), QStringList{"Photos"});
+
+        // Two changes in a row run in order, then the settings are read back.
+        controller.setInterval(60);
+        controller.setMaxDelete(10);
+        QTRY_VERIFY(controller.saved());
+        QTRY_COMPARE(controller.state(), QString("idle"));
+        QTRY_COMPARE(calls(dir.path()).size(), 4);
+        QCOMPARE(calls(dir.path()).mid(1), (QStringList{"settings --interval 60 --json", "settings --max-delete 10 --json",
+                                                         "settings --json"}));
+        QCOMPARE(fixes.size(), 0);
+
+        // The editor's text, byte for byte, through a file.
+        QVERIFY(answerWith(true, "", true));
+        controller.setFilters("- .git/**\n- *.iso\n");
+        QTRY_COMPARE(fixes.size(), 1);
+        QCOMPARE(readBytes(dir.filePath("filters-sent.txt")), QByteArray("- .git/**\n- *.iso\n"));
+        // On stdin, so the child needs no file of the window's.
+        QVERIFY(calls(dir.path()).contains("settings --filters - --json"));
+        QVERIFY(!controller.saved());
+        controller.setSkipped({});
+        QTRY_COMPARE(fixes.size(), 2);
+        QVERIFY(calls(dir.path()).contains("settings --skip-none --json"));
+        controller.setSkipped({"A b", "C"});
+        QTRY_VERIFY(calls(dir.path()).contains("settings --skip A b --skip C --json"));
+
+        // A refusal shows the command's reason and drops what was queued after it.
+        QTRY_COMPARE(controller.state(), QString("idle"));
+        QVERIFY(answerWith(false, "a fix is under way", false));
+        const int before = int(calls(dir.path()).size());
+        controller.setFolder("~/Other");
+        controller.setInterval(15);
+        QTRY_COMPARE(controller.error(), QString("a fix is under way"));
+        QTRY_COMPARE(controller.state(), QString("idle"));
+        QCOMPARE(calls(dir.path()).mid(before), QStringList{"settings --folder " + QDir::homePath() + "/Other --json"});
+    }
+
+    void folderTreeLoadsLevelsAndTicks()
+    {
+        QTemporaryDir dir;
+        fakeSettingsDrivesync(dir.path());
+        auto level = [](const QList<QPair<QString, bool>> &folders) {
+            QJsonArray list;
+            for (const auto &[path, local] : folders)
+                list.append(QJsonObject{{"name", path.section('/', -1)}, {"path", path}, {"local", local},
+                                        {"unsupported", false}});
+            return QJsonDocument(QJsonObject{{"ok", true}, {"error", ""}, {"folders", list}}).toJson(QJsonDocument::Compact);
+        };
+        QVERIFY(write(dir.filePath("folders-root.json"), level({{"Photos", true}, {"Work", true}})));
+        QVERIFY(write(dir.filePath("folders-Work.json"), level({{"Work/Old", false}})));
+        FolderTree tree(dir.filePath("drive-sync"));
+        tree.reset({"Work"}, "drive-sync:");
+        QTRY_COMPARE(tree.rows().size(), 2);
+        QVERIFY(calls(dir.path()).contains("folders --remote drive-sync: --json"));
+        QVERIFY(tree.rows().at(0).toMap().value("ticked").toBool());
+        QVERIFY(!tree.rows().at(1).toMap().value("ticked").toBool());
+        tree.expand(1);
+        QTRY_COMPARE(tree.rows().size(), 3);
+        QVERIFY(calls(dir.path()).contains("folders --remote drive-sync: --json -- Work"));
+        const QVariantMap old = tree.rows().at(2).toMap();
+        QCOMPARE(old.value("depth").toInt(), 1);
+        QCOMPARE(old.value("path").toString(), QString("Work/Old"));
+        QVERIFY(!old.value("tickable").toBool());  // its parent is left out
+        QVERIFY(!tree.dirty());
+
+        // Work ticked again: its local copy goes back up (Review Focus 2).
+        tree.toggle(1);
+        QCOMPARE(tree.skipped(), QStringList());
+        QCOMPARE(tree.reticked(), QStringList{"Work"});
+        QVERIFY(tree.rows().at(2).toMap().value("tickable").toBool());
+        // Photos left out after it was synced: its copy stays here (Review Focus 3).
+        tree.toggle(0);
+        QCOMPARE(tree.newlySkippedLocal(), QStringList{"Photos"});
+        QVERIFY(tree.dirty());
+        tree.collapse(1);
+        QCOMPARE(tree.rows().size(), 2);
+
+        // A listing that names a folder outside the one listed (the folder
+        // itself, say) adds nothing: the tree must not nest it in itself.
+        QVERIFY(write(dir.filePath("folders-Photos.json"), level({{"Photos", false}, {"Elsewhere/x", false}})));
+        tree.expand(0);
+        QTRY_VERIFY(calls(dir.path()).contains("folders --remote drive-sync: --json -- Photos"));
+        QTRY_VERIFY(!tree.loading());
+        QCOMPARE(tree.rows().size(), 2);
+
+        // A level that cannot be listed says why.
+        QVERIFY(write(dir.filePath("folders-root.json"),
+                      QJsonDocument(QJsonObject{{"ok", false}, {"error", "rclone could not list the cloud: boom"}})
+                          .toJson(QJsonDocument::Compact)));
+        tree.reset({}, QString());
+        QTRY_COMPARE(tree.error(), QString("rclone could not list the cloud: boom"));
+        QVERIFY(calls(dir.path()).contains("folders --json"));
+    }
+    // "drive-sync settings --interval" from the window or a terminal: the
+    // window follows the config on disk, as the status command (and so the
+    // bar) does on every call, so the two never disagree on "late".
+    void backendFollowsAnIntervalChangeOnDisk()
+    {
+        QTemporaryDir dir;
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-51 * 60);
+        QVERIFY(write(dir.filePath("drive-sync.log"), successfulRun(start, 60).toUtf8()));
+        QVERIFY(QDir().mkpath(dir.filePath("Drive")));
+        BackendPaths paths{dir.filePath("drive-sync.log"), dir.filePath("Drive"), dir.filePath("state"),
+                           dir.filePath("proc"), fakeSystemctl(dir.path(), start),
+                           QStandardPaths::findExecutable("find"), dir.filePath("app")};
+        paths.config = dir.filePath("conf/config.json");
+        SyncConfig config = newUserConfig(dir.filePath("Drive"), dir.path());
+        config.logFile = paths.log;
+        QVERIFY(QDir().mkpath(dir.filePath("conf")));
+        QString error;
+        QVERIFY(saveSyncConfig(paths.config, config, &error));
+        applySyncConfig(&paths, config);
+        Backend backend(paths);
+        QTRY_COMPARE(backend.status(), QString("stale"));
+        config.intervalMinutes = 30;
+        QVERIFY(saveSyncConfig(paths.config, config, &error));
+        QTRY_COMPARE(backend.status(), QString("ok"));
+        config.intervalMinutes = 15;
+        QVERIFY(saveSyncConfig(paths.config, config, &error));
+        QTRY_COMPARE(backend.status(), QString("stale"));
+        // A config that goes away (an undo) takes its interval with it.
+        config.intervalMinutes = 30;
+        QVERIFY(saveSyncConfig(paths.config, config, &error));
+        QTRY_COMPARE(backend.status(), QString("ok"));
+        QVERIFY(QFile::remove(paths.config));
+        QTRY_VERIFY(!backend.managed());
+        QTRY_COMPARE(backend.status(), QString("stale"));
+    }
+    // Review: a link leads where it points, and the work dir is DriveSync's.
+    void settingsRefusesLinksAndTheWorkDir()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        QVERIFY(QFile::link(QDir::homePath(), dir.filePath("to-home")));
+        QVERIFY(QFile::link(s.fix.config.localPath, dir.filePath("to-drive")));
+        QVERIFY(QDir().mkpath(dir.filePath("real/Inside")));
+        QVERIFY(QFile::link(s.fix.config.localPath, dir.filePath("real/Inside/drive-link")));
+        const QByteArray before = readBytes(s.fix.paths.config);
+        for (const QString &folder : {dir.filePath("to-home"), dir.filePath("to-drive"), dir.filePath("to-drive/Sub"),
+                                      s.fix.config.workDir, s.fix.config.workDir + "/Drive"}) {
+            const auto refused = settingsCommand(s, {"--folder", folder});
+            QVERIFY2(refused.first == 1, qPrintable(folder));
+        }
+        QCOMPARE(readBytes(s.fix.paths.config), before);
+        QVERIFY(!fixPresent(s.fix.paths.appState));
+        // First setup takes no link to the home either.
+        QVERIFY(QDir().mkpath(dir.filePath("setup")));
+        const SetupFixture setup = makeSetupFixture(dir.filePath("setup"));
+        QVERIFY(!setupRefusal(setup.paths, setup.takeover, dir.filePath("to-home"), setup.takeover.rclone).isEmpty());
+    }
+    void settingsReadsFiltersFromStdin()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        QByteArray bytes = "- .git/**\n- *.iso\n";
+        QBuffer input(&bytes);
+        QVERIFY(input.open(QIODevice::ReadOnly));
+        const auto [code, answer] = settingsCommand(s, {"--filters", "-"}, &input);
+        QVERIFY2(code == 0, qPrintable(answer.value("error").toString()));
+        QVERIFY(answer.value("fixStarted").toBool());
+        const QJsonObject mark = QJsonDocument::fromJson(readBytes(settingsChangeMarkPath(s.fix.paths.appState))).object();
+        QCOMPARE(QByteArray::fromBase64(mark.value("newFilters").toString().toLatin1()), bytes);
+    }
+
+    // Values are taken as they are: names that look like options are names.
+    void settingsTakesNamesThatLookLikeOptions()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        const auto [code, answer] = settingsCommand(s, {"--skip", "--json", "--skip", "--skip-none"});
+        QVERIFY2(code == 0, qPrintable(answer.value("error").toString()));
+        const QJsonObject mark = QJsonDocument::fromJson(readBytes(settingsChangeMarkPath(s.fix.paths.appState))).object();
+        QString error;
+        QCOMPARE(*skippedFolders(QByteArray::fromBase64(mark.value("newFilters").toString().toLatin1()), &error),
+                 (QStringList{"--json", "--skip-none"}));
+        // Two changes at once, or a lone value, are refused.
+        QCOMPARE(settingsCommand(s, {"--interval", "30", "--max-delete", "10"}).first, 1);
+        QCOMPARE(settingsCommand(s, {"--folder"}).first, 1);
+
+        // First setup and the folder listing take them too.
+        QVERIFY(QDir().mkpath(dir.filePath("setup")));
+        const SetupFixture setup = makeSetupFixture(dir.filePath("setup"));
+        CommandResult r;
+        QTextStream out(&r.out);
+        QTextStream err(&r.err);
+        r.code = runSetupCommand({"--folder", setup.folder, "--skip", "--json", "--json"}, setup.paths, setup.takeover, out,
+                                 err);
+        out.flush();
+        QVERIFY2(r.code == 0, qPrintable(r.out + r.err));
+        QCOMPARE(*skippedFolders(readBytes(setup.takeover.appConfigDir + "/filters.txt"), &error), QStringList{"--json"});
+        QVERIFY(write(dir.filePath("lsjson.json"), "[]"));
+        const QString rclone = fakeFoldersRclone(dir.path());
+        QCOMPARE(foldersCommand(s.fix.paths, rclone, {"--", "--json"}).first, 0);
+        QCOMPARE(rcloneCalls(dir.path()).last().value(1), QString("gdrive:--json"));
+        QCOMPARE(foldersCommand(s.fix.paths, rclone, {"--odd"}).first, 1);
+    }
+    // The window's tree stops a listing with SIGTERM: "drive-sync folders"
+    // passes it to its rclone, so no lsjson is left behind.
+    void foldersCommandStopsItsRcloneOnSigterm()
+    {
+        QTemporaryDir dir;
+        const SettingsFixture s = makeSettingsFixture(dir.path());
+        const QString rclone = dir.filePath("slow-rclone");
+        QVERIFY(write(rclone, QString("#!/bin/sh\necho $$ > '%1/rclone.pid'\nexec sleep 10\n").arg(dir.path()).toUtf8()));
+        QFile::setPermissions(rclone, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        static std::atomic<bool> caught{false};
+        caught = false;
+        struct sigaction mine {}, previous {};
+        mine.sa_handler = [](int) { caught = true; };
+        sigemptyset(&mine.sa_mask);
+        QCOMPARE(sigaction(SIGTERM, &mine, &previous), 0);
+        const auto restore = qScopeGuard([&previous] { sigaction(SIGTERM, &previous, nullptr); });
+        std::thread window([] {
+            std::this_thread::sleep_for(std::chrono::milliseconds(700));
+            ::kill(::getpid(), SIGTERM);
+        });
+        QElapsedTimer clock;
+        clock.start();
+        const auto [code, answer] = foldersCommand(s.fix.paths, rclone, {});
+        window.join();
+        QCOMPARE(code, 1);
+        QVERIFY2(clock.elapsed() < 4000, qPrintable(QString::number(clock.elapsed())));
+        const qint64 pid = readBytes(dir.filePath("rclone.pid")).trimmed().toLongLong();
+        QVERIFY(pid > 0);
+        QTRY_VERIFY(processGone(pid));
+        // The test's own handler is back.
+        struct sigaction now {};
+        sigaction(SIGTERM, nullptr, &now);
+        QVERIFY(now.sa_handler == mine.sa_handler);
+    }
+    // Review: the old units sync the folder they always did; after a folder
+    // change in Settings, going back to them would need a resync.
+    void undoTakeoverRefusesAfterAFolderChange()
+    {
+        QTemporaryDir dir;
+        OldSetup old = makeOldSetup(dir.path());
+        old.paths.systemctl = takeoverSystemctl(dir.path(), 0);
+        QString error;
+        QVERIFY(applyTakeover(old.paths, detectTakeover(old.paths, settledSnapshot()), QDateTime::currentDateTimeUtc(),
+                              &error));
+        const QString configPath = old.paths.appConfigDir + "/config.json";
+        SyncConfig config = *loadSyncConfig(configPath, &error);
+        const QString original = config.localPath;
+        config.localPath = dir.filePath("Elsewhere");
+        QVERIFY(saveSyncConfig(configPath, config, &error));
+        QVERIFY(!undoTakeover(old.paths, &error));
+        QVERIFY2(error.contains("folder"), qPrintable(error));
+        QVERIFY(QFile::exists(configPath));
+        // A takeover made before the manifest named the folder: read from the old unit.
+        QDir backups(old.paths.backupRoot);
+        const QString manifestPath = backups.filePath(backups.entryList(QDir::Dirs | QDir::NoDotAndDotDot).last() + "/manifest.json");
+        QJsonObject manifest = QJsonDocument::fromJson(readBytes(manifestPath)).object();
+        QCOMPARE(manifest.value("localPath").toString(), original);
+        manifest.remove("localPath");
+        QVERIFY(write(manifestPath, QJsonDocument(manifest).toJson()));
+        QVERIFY(!undoTakeover(old.paths, &error));
+        QVERIFY2(error.contains("folder"), qPrintable(error));
+        // Back to the old folder, the undo goes through.
+        config.localPath = original;
+        QVERIFY(saveSyncConfig(configPath, config, &error));
+        QVERIFY2(undoTakeover(old.paths, &error), qPrintable(error));
+    }
+    // Review: the interval drop-in goes before the old units come back, and
+    // one that cannot go stops the undo with nothing moved.
+    void undoTakeoverStopsWhenTheDropInCannotGo()
+    {
+        QTemporaryDir dir;
+        OldSetup old = makeOldSetup(dir.path());
+        old.paths.systemctl = takeoverSystemctl(dir.path(), 0);
+        QString error;
+        QVERIFY(applyTakeover(old.paths, detectTakeover(old.paths, settledSnapshot()), QDateTime::currentDateTimeUtc(),
+                              &error));
+        const QString folder = old.paths.userUnits + "/drive-sync.timer.d";
+        QVERIFY(QDir().mkpath(folder));
+        QVERIFY(write(intervalDropInPath(old.paths.userUnits), intervalDropIn(30)));
+        QVERIFY(QFile::setPermissions(folder, QFile::ReadOwner | QFile::ExeOwner));
+        const auto writable = qScopeGuard([&] {
+            QFile::setPermissions(folder, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        });
+        QVERIFY(!undoTakeover(old.paths, &error));
+        QVERIFY2(error.contains("drive-sync-interval.conf"), qPrintable(error));
+        QVERIFY(!QFile::exists(old.paths.userUnits + "/drive-sync.service"));
+        QVERIFY(QFile::exists(intervalDropInPath(old.paths.userUnits)));
+        QVERIFY(QFile::exists(old.paths.appConfigDir + "/config.json"));
+    }
+    // Review: a block written by hand without the blank line after it, and a
+    // file with Windows line ends, keep their layout through the tree.
+    void skipBlockKeepsAHandWrittenLayout()
+    {
+        const QByteArray begin = kSkipBlockBegin;
+        const QByteArray end = kSkipBlockEnd;
+        QString error;
+        const QByteArray hand = begin + "\n- /A/**\n" + end + "\n- .git/**\n";
+        const auto two = withSkippedFolders(hand, {"A", "B"}, &error);
+        QVERIFY2(two, qPrintable(error));
+        QCOMPARE(*withSkippedFolders(*two, {"A"}, &error), hand);
+
+        const QByteArray crlf = begin + "\r\n- /A/**\r\n" + end + "\r\n\r\n- .git/**\r\n";
+        QCOMPARE(*skippedFolders(crlf, &error), QStringList{"A"});
+        const auto crlfTwo = withSkippedFolders(crlf, {"A", "B"}, &error);
+        QVERIFY2(crlfTwo, qPrintable(error));
+        QCOMPARE(crlfTwo->count(begin), 1);
+        QVERIFY(crlfTwo->contains("- /B/**\r\n"));
+        QCOMPARE(*withSkippedFolders(*crlfTwo, {"A"}, &error), crlf);
+        const QByteArray plain = "- .git/**\r\n";
+        const auto added = withSkippedFolders(plain, {"C"}, &error);
+        QVERIFY(added->startsWith(begin + "\r\n- /C/**\r\n"));
+        QCOMPARE(*withSkippedFolders(*added, {}, &error), plain);
+    }
+    // Review: the fix dialog names the folder the config syncs, not ~/Drive.
+    void fixDialogNamesTheConfiguredFolder()
+    {
+        QQmlEngine engine;
+        QQmlPropertyMap backend, theme, translator;
+        for (const char *key : {"status", "fixStep", "causeKind", "causeDetail", "fixError"})
+            backend.insert(key, QString());
+        backend.insert("fixCopies", 0);
+        backend.insert("fixCopiesToNotebook", 0);
+        backend.insert("fixCopyList", QVariantList());
+        backend.insert("fixBaseDone", false);
+        backend.insert("drivePath", QDir::homePath() + "/Sync/Google");
+        theme.insert("radius", 8);
+        theme.insert("accent", QColor("#7aa2f7"));
+        translator.insert("language", "en");
+        engine.rootContext()->setContextProperty("backend", &backend);
+        engine.rootContext()->setContextProperty("theme", &theme);
+        engine.rootContext()->setContextProperty("translator", &translator);
+        QTest::failOnWarning(QRegularExpression("ReferenceError|TypeError"));
+        QQmlComponent component(&engine);
+        component.setData(QString("import QtQuick\nimport QtQuick.Controls\nimport \"%1\"\n"
+                                  "ApplicationWindow { width: 800; height: 600; visible: true\n"
+                                  "  property alias dialog: d\n  FixDialog { id: d } }\n")
+                              .arg(QUrl::fromLocalFile(QString(SRCDIR) + "/../src").toString())
+                              .toUtf8(),
+                          QUrl());
+        std::unique_ptr<QObject> window(component.create());
+        QVERIFY2(window, qPrintable(component.errorString()));
+        QObject *dialog = window->property("dialog").value<QObject *>();
+        QVERIFY(QMetaObject::invokeMethod(dialog, "open"));
+        QObject *text = window->findChild<QObject *>("fixStartText");
+        QVERIFY(text);
+        QTRY_VERIFY(text->property("text").toString().contains("~/Sync/Google stays in use"));
+        QVERIFY(!text->property("text").toString().contains("~/Drive"));
     }
 };
 

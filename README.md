@@ -12,8 +12,9 @@ and a bar widget, driven from the keyboard.
 
 - **Status**: in sync, syncing now (with the phase and a progress bar against
   the usual run time), resync in progress, failed (with the same cause the
-  desktop notification names and how to recover), cut off, timer off, no
-  sync for a while, or a fix at work or waiting for you.
+  desktop notification names and how to recover), cut off, timer off, late
+  (no success in three sync intervals: 45 minutes at the usual 15), or a fix
+  at work or waiting for you.
 - **Runs**: the last 40 runs from the log, each with what changed in the
   cloud and on the notebook, file by file, and its errors.
 - **Conflict copies**: the `*.conflictN` files bisync left in `~/Drive` when a
@@ -35,13 +36,19 @@ and a bar widget, driven from the keyboard.
 - **Fix**: rebuilds the base of both sides after lost listings, listings out
   of sync or edited filters, with `~/Drive` still in use, asking you about
   every file that changed in the cloud meanwhile.
+- **Settings** (`,`): the sync interval and the max-delete guard, at once;
+  the local folder, the filters and which cloud folders come down to this
+  computer (selective sync), through a fix whose dry run you confirm.
 
 It starts a resync only as a fix you confirmed, and touches no synced file
 otherwise. It writes its own state in `~/.local/state/drive-sync-app/`, the link
 to its bar widget and, when you accept, the bar layout through
 `omarchy plugin`. After a takeover or a first setup it also owns
 `~/.config/drive-sync/` and the `drive-sync` user timers, and a first setup
-adds the `drive-sync` remote to `rclone.conf` through rclone itself.
+adds the `drive-sync` remote to `rclone.conf` through rclone itself. A sync
+interval other than 15 minutes, set in Settings, is written as
+`~/.config/systemd/user/drive-sync.timer.d/drive-sync-interval.conf`, which
+an interval of 15 minutes or undoing the takeover removes.
 
 ## Screens
 
@@ -72,6 +79,7 @@ adds the `drive-sync` remote to `rclone.conf` through rclone itself.
 | `F`, `X`         | Fix a broken sync, or cancel the fix in its dialog              |
 | `C`, `L`         | Keep the cloud's or the notebook's file, in the fix's questions |
 | `D`              | Review what a max-delete stop would delete                      |
+| `,`              | Settings: folder, interval, guard, cloud folders, filters       |
 | `B`              | Put DriveSync on the Omarchy bar, when offered                  |
 | `N`              | Say no to that offer, or hide its notice for good               |
 | `?`              | Show or hide the shortcuts                                      |
@@ -94,6 +102,7 @@ adds the `drive-sync` remote to `rclone.conf` through rclone itself.
 | `~/.local/state/drive-sync-app/fix.json`                         | A fix: its step, the dry run's count and its questions       |
 | `find ~/Drive -name '*.conflict[0-9]*'`                     | Conflict copies (`.git`, `node_modules` and `.venv` skipped) |
 | `rclone listremotes`, `rclone config dump`                  | Sign-in only: whether the `drive-sync` remote exists and holds a token, read in memory and never shown |
+| `rclone lsjson <remote>:<folder> --dirs-only`               | Settings and first setup only: one level of the cloud's folders, nothing copied |
 
 The log is watched, systemd is polled every 30 seconds (5 while a run is
 going), and conflict copies are looked for again every 2 minutes and after
@@ -122,7 +131,7 @@ widget. In its panel, `S` syncs now, `P` pauses for an hour or resumes, and
 ## First setup
 
 With no drive-sync at all, the window offers to set one up (`T`). The
-dialog goes through three steps, and nothing is copied before the last one:
+dialog goes through four steps, and nothing is copied before the last one:
 
 1. **Sign in to Google.** Your browser opens Google's sign-in page for
    DriveSync, through rclone's own flow (`rclone config create`): the token
@@ -136,7 +145,10 @@ dialog goes through three steps, and nothing is copied before the last one:
 2. **Choose the folder,** `~/Drive` by default. Files already in it stay and
    go to the cloud; where both sides have a file at the same path, the newer
    copy wins on both, and the dry run lists every copy.
-3. **Start.** DriveSync writes its default filters
+3. **Choose the cloud folders.** A tree of the cloud's folders, read a level
+   at a time; untick what should stay only in the cloud (`Tab` reaches the
+   list, `Space` ticks, `→` opens a folder). Settings change it later.
+4. **Start.** DriveSync writes its default filters
    (`~/.config/drive-sync/filters.txt`: `.git`, `node_modules`, `.venv`,
    Python caches, Google Docs shortcuts and system junk) and its config, and
    starts a fix (see below): a dry run lists every copy in both directions,
@@ -168,6 +180,46 @@ it was made with), and then starts a run. A fix that stopped on the token
 says the same: sign in again (`I`), then retry it (`F`). A network failure
 while fetching the token is an ordinary error, not a sign-in.
 
+## Settings
+
+`,` opens Settings once DriveSync runs drive-sync. `Ctrl+1`, `Ctrl+2` and
+`Ctrl+3` pick a page, `Ctrl+S` saves the page shown, `Esc` closes. Every
+change goes through `drive-sync settings`, so the window writes nothing itself.
+
+- **Sync interval**, from 5 minutes to 4 hours in the window (5 to 1440 on
+  the command line), applies at once: DriveSync keeps it in its config and
+  writes it into a drop-in for the packaged timer,
+  `~/.config/systemd/user/drive-sync.timer.d/drive-sync-interval.conf`
+  (none at the usual 15 minutes). "Late" follows it: three intervals with no
+  successful run.
+- **Max-delete guard**, 1% to 50%, applies at once. After a run stopped at
+  the guard it can only go down: those deletions go through `D`.
+- **Local folder.** A new folder means a new base: the fix makes a dry run
+  from the cloud and whatever the new folder holds, and nothing is copied
+  before you confirm it. The old folder stays as it is, outside the sync. A
+  folder inside the current one, or holding it, is refused.
+- **Cloud folders** (selective sync): the tree of the cloud's folders, read
+  with `rclone lsjson --dirs-only` a level at a time (`↑` `↓` `J` `K` move,
+  `Space` ticks, `→` `←` open and close). An unticked folder stays whole in
+  the cloud; one that was synced keeps its copy on this computer, outside the
+  sync, and the window names it, since deleting it is your call. A folder
+  ticked again sends its local copy back up, files deleted in the cloud
+  meanwhile included, and the window says so before saving. The ticks become
+  a block of rules at the top of the filters file, between
+  `# BEGIN DriveSync: cloud folders left out of this computer` and its
+  `# END` line.
+- **Filters**: the whole filters file. Saving checks the rules with rclone
+  first.
+
+The folder, the cloud folders and the filters change what bisync compares,
+so saving them starts a fix: its dry run waits for your confirmation, and
+runs wait until it ends. Cancelling that fix (`X`) before its base run puts
+the old config and filters back byte for byte, and the sync goes on with its
+old base. Saving bytes that did not change starts nothing. The new config
+and filters are written by the fix itself, once no run is under way, never
+under a run that already started. After a folder change, undoing the takeover
+is refused until the folder is set back.
+
 ## Taking over drive-sync
 
 When the window finds a drive-sync made by `drive-sync.sh`, it offers to run
@@ -196,7 +248,8 @@ itself, and `T` cancels the wait.
 `drive-sync run` refuses to start rclone when the filters' `.md5` is missing or
 stale: a single bisync run in that state throws away its base, and only a
 resync brings it back. So filters change in two steps: edit
-`~/.config/drive-sync/filters.txt`, then press `F`.
+`~/.config/drive-sync/filters.txt`, then press `F`; or edit them in Settings,
+which does both.
 
 ## Fixing a broken sync
 
@@ -280,14 +333,21 @@ drive-sync pause [--minutes N | --until-tomorrow]   # no flag: until resumed
 drive-sync resume           # end the pause and start a run
 drive-sync signin           # sign in to Google in the browser (first setup, or again)
 drive-sync signin --abandon # remove a drive-sync remote whose sign-in never finished
-drive-sync setup --folder <path>   # first setup, after signin: filters, config, the fix
+drive-sync setup --folder <path> [--skip <cloud folder>]...   # first setup, after signin
+drive-sync settings         # the settings; with one change: --interval N | --max-delete N |
+                            # --folder <path> | --filters <file> (- reads stdin) | --skip <cloud folder>... | --skip-none
+drive-sync folders [--remote <remote:>] [[--] <cloud folder>]   # one level of the cloud's folders
 drive-sync takeover --check | --apply | --undo
 drive-sync fix --start | --confirm | --answers <file.json> | --cancel | --retry
 drive-sync deletes --list | --allow <count>   # after a max-delete stop
 ```
 
-`sync`, `pause`, `resume`, `signin`, `setup`, `takeover`, `fix` and `deletes`
-take `--json` and answer `{"ok": ..., "error": ...}`. `signin --json` first
+`sync`, `pause`, `resume`, `signin`, `setup`, `takeover`, `fix`, `deletes`,
+`settings` and `folders` take `--json` and answer `{"ok": ..., "error": ...}`.
+`settings --json` adds `folder`, `remote`, `intervalMinutes`, `maxDelete`,
+`filtersFile`, `filters`, `skipped` and `skipError`; a change adds
+`fixStarted`. `folders --json` adds `folders`, each `{name, path, local,
+unsupported}`. `signin --json` first
 prints `{"link": ...}` once rclone has its local sign-in address, and refuses a
 `drive-sync` remote it did not make with `reason` `remoteExists`. `fix --answers` reads `{"<path>": "cloud" |
 "notebook"}` with an answer for every file the fix asked about. `deletes

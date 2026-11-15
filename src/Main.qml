@@ -103,7 +103,11 @@ ApplicationWindow {
         && takeoverSetup.blockers.length === 1 && takeoverSetup.blockers[0] === "running"
 
     function move(step) {
-        if (deleteDialog.visible)
+        if (win.helpVisible)
+            help.scroll(step)
+        else if (settingsDialog.visible)
+            settingsDialog.move(step)
+        else if (deleteDialog.visible)
             deleteDialog.scroll(step)
         else if (fixQuestions.visible)
             fixQuestions.move(step)
@@ -127,6 +131,19 @@ ApplicationWindow {
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: fixQuestions.visible; onActivated: fixQuestions.close() }
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: deleteDialog.visible; onActivated: deleteDialog.close() }
     Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: setupDialog.visible; onActivated: setupDialog.close() }
+    Shortcut { sequence: "Esc"; context: Qt.ApplicationShortcut; enabled: settingsDialog.visible; onActivated: settingsDialog.close() }
+    // Settings: "," like most apps' settings key, with Ctrl too. Its fields
+    // take every other key for themselves (SettingsDialog.keepTyping).
+    Shortcut {
+        sequences: [",", "Ctrl+,"]
+        context: Qt.ApplicationShortcut
+        enabled: !win.dialogOpen && backend.managed
+        onActivated: settingsDialog.open()
+    }
+    Shortcut { sequence: "Ctrl+1"; context: Qt.ApplicationShortcut; enabled: settingsDialog.visible; onActivated: settingsDialog.showPage(0) }
+    Shortcut { sequence: "Ctrl+2"; context: Qt.ApplicationShortcut; enabled: settingsDialog.visible; onActivated: settingsDialog.showPage(1) }
+    Shortcut { sequence: "Ctrl+3"; context: Qt.ApplicationShortcut; enabled: settingsDialog.visible; onActivated: settingsDialog.showPage(2) }
+    Shortcut { sequence: "Ctrl+S"; context: Qt.ApplicationShortcut; enabled: settingsDialog.visible; onActivated: settingsDialog.save() }
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; onActivated: Qt.quit() }
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; onActivated: backend.refresh() }
     Shortcut { sequence: "O"; context: Qt.ApplicationShortcut; enabled: !win.dialogOpen; onActivated: backend.openDriveFolder() }
@@ -146,6 +163,7 @@ ApplicationWindow {
     // same key cancel each other out.
     readonly property bool dialogOpen: pauseMenu.visible || takeoverDialog.visible || fixDialog.visible
                                        || fixQuestions.visible || deleteDialog.visible || setupDialog.visible
+                                       || settingsDialog.visible
     // The newest run stopped at the max-delete guard and DriveSync runs
     // drive-sync: D reviews what it would delete (spec 5b). Also after a
     // fix whose final run stopped there. Never while a run is under way.
@@ -369,6 +387,7 @@ ApplicationWindow {
         }
 
         HelpOverlay {
+            id: help
             anchors.fill: parent
             visible: win.helpVisible
             onCloseRequested: win.helpVisible = false
@@ -380,5 +399,6 @@ ApplicationWindow {
         FixQuestions { id: fixQuestions; now: win.now }
         DeleteDialog { id: deleteDialog }
         SetupDialog { id: setupDialog }
+        SettingsDialog { id: settingsDialog }
     }
 }

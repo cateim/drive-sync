@@ -37,6 +37,15 @@ bool fixPresent(const QString &appState);
 // filters, the folders it made), so cancelling its fix before any base undoes
 // exactly that. The base run removes it.
 QString firstSetupMarkPath(const QString &appState);
+// <appState>/settings-change.json: a change made in Settings (folder,
+// filters, cloud folders) that goes through a fix. It holds the old and the
+// new bytes (previousConfig/newConfig, previousFilters/newFilters, base64,
+// only for what changes), "config" (the config file it applies to), "fix"
+// (the fix's start, Unix seconds: it serves that fix only) and "applied".
+// The fix's preparing step writes the new bytes once no run is under way;
+// cancelling before the base puts the old ones back, so the old base still
+// matches; the base run removes it.
+QString settingsChangeMarkPath(const QString &appState);
 // No file: an empty step. A file that cannot be read is a failed fix with
 // that error: holding the timer is the safer mistake, and
 // "drive-sync fix --cancel" clears it.

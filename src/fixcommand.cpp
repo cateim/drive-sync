@@ -8,9 +8,11 @@
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QSaveFile>
 #include <QRegularExpression>
 #include <QStandardPaths>
 #include <QThread>
+#include <optional>
 #include <fcntl.h>
 #include <sys/stat.h>
 
@@ -140,6 +142,72 @@ bool unitBusy(const QString &state) {
     return state == "active" || state == "activating" || state == "deactivating" || state == "reloading";
 }
 
+// The settings-change mark (fixstate.h), when there is one.
+std::optional<QJsonObject> readSettingsMark(const QString &appState) {
+    QFile file(settingsChangeMarkPath(appState));
+    if (!file.open(QIODevice::ReadOnly))
+        return std::nullopt;
+    return QJsonDocument::fromJson(file.readAll()).object();
+}
+
+// The mark was written for this config and for this fix: a mark left by a
+// fix that ended some other way must never act on a later one.
+bool settingsMarkBelongsTo(const QJsonObject &mark, const BackendPaths &paths, const FixState &state) {
+    return mark.value("config").toString() == paths.config && state.started.isValid()
+           && mark.value("fix").toInteger(-1) == state.started.toSecsSinceEpoch();
+}
+
+// Writes the mark's "<prefix>Config" and "<prefix>Filters" bytes, only those
+// it has: a folder change keeps the filters, a filters change the config.
+QString writeMarkBytes(const BackendPaths &paths, const QJsonObject &mark, const QString &prefix) {
+    const QList<QPair<QString, QString>> files{{paths.config, prefix + "Config"},
+                                              {mark.value("filtersFile").toString(), prefix + "Filters"}};
+    for (const auto &[path, key] : files) {
+        if (path.isEmpty() || !mark.contains(key))
+            continue;
+        const QByteArray data = QByteArray::fromBase64(mark.value(key).toString().toLatin1());
+        QSaveFile out(path);
+        if (!out.open(QIODevice::WriteOnly) || out.write(data) != data.size() || !out.commit())
+            return QString("cannot write %1").arg(path);
+    }
+    return QString();
+}
+
+// The preparing step of a fix that a change in Settings started: its new
+// filters and config are written now, with no run under way, and the step
+// goes on with the new config. Once, even when the step is retried.
+QString applySettingsChange(const BackendPaths &paths, const FixState &state, SyncConfig *config) {
+    std::optional<QJsonObject> mark = readSettingsMark(paths.appState);
+    if (!mark)
+        return QString();
+    if (!settingsMarkBelongsTo(*mark, paths, state)) {
+        QFile::remove(settingsChangeMarkPath(paths.appState));
+        return QString();
+    }
+    if (mark->value("applied").toBool())
+        return QString();
+    if (const QString error = writeMarkBytes(paths, *mark, "new"); !error.isEmpty()) {
+        writeMarkBytes(paths, *mark, "previous");
+        return QString("%1, so the change from Settings was not made").arg(error);
+    }
+    mark->insert("applied", true);
+    QSaveFile out(settingsChangeMarkPath(paths.appState));
+    const QByteArray data = QJsonDocument(*mark).toJson();
+    if (!out.open(QIODevice::WriteOnly) || out.write(data) != data.size() || !out.commit()) {
+        // Without "applied" a cancel would leave the new bytes over the old base.
+        writeMarkBytes(paths, *mark, "previous");
+        return QString("cannot write %1").arg(settingsChangeMarkPath(paths.appState));
+    }
+    QString error;
+    if (mark->contains("newConfig")) {
+        const auto reloaded = loadSyncConfig(paths.config, &error);
+        if (!reloaded)
+            return error;
+        *config = *reloaded;
+    }
+    return QString();
+}
+
 QString startFixUnit(const BackendPaths &paths) {
     QString error;
     // --no-block: the step takes minutes; the state file says where it is.
@@ -198,7 +266,24 @@ QString maxDeleteRefusal(const SyncConfig &config) {
 
 }  // namespace
 
-QString startFix(const BackendPaths &paths) {
+// Without them a touch, a delete or a listing could act on another root, or
+// report "not found".
+QStringList remoteFlags(const QStringList &flags) {
+    QStringList kept;
+    for (qsizetype i = 0; i < flags.size(); ++i) {
+        const QString &flag = flags.at(i);
+        const QString name = flag.section('=', 0, 0);
+        if (name != "--config" && !name.startsWith("--drive-"))
+            continue;
+        kept << flag;
+        // A value in the next argument (not a flag itself) goes along.
+        if (!flag.contains('=') && i + 1 < flags.size() && !flags.at(i + 1).startsWith('-'))
+            kept << flags.at(++i);
+    }
+    return kept;
+}
+
+QString startFix(const BackendPaths &paths, const std::function<QString()> &apply, const std::function<void()> &undo) {
     if (!paths.managed)
         return "a fix needs DriveSync to run drive-sync; take it over first";
     if (fixPresent(paths.appState))
@@ -218,9 +303,22 @@ QString startFix(const BackendPaths &paths) {
     // The mark goes first: from here on run-condition skips every tick.
     if (!writeFix(paths.appState, state))
         return QString("cannot write %1").arg(fixStatePath(paths.appState));
+    // A mark is the change of the fix that wrote it: one left behind (a fix
+    // whose fix.json was removed by hand) must not ride on this one.
+    if (!apply)
+        QFile::remove(settingsChangeMarkPath(paths.appState));
+    if (apply) {
+        error = apply();
+        if (!error.isEmpty()) {
+            clearFix(paths.appState);
+            return error;
+        }
+    }
     error = startFixUnit(paths);
     if (error.isEmpty())
         return QString();
+    if (undo)
+        undo();
     clearFix(paths.appState);
     return QString("could not start %1: %2").arg(kFixUnit, error);
 }
@@ -281,7 +379,33 @@ QString undoFirstSetup(const BackendPaths &paths) {
     return QString();
 }
 
-QString cancelFix(const BackendPaths &paths) {
+// A change made in Settings whose fix is cancelled before its base run.
+// Not applied yet: nothing was written, the mark just goes. Applied: the
+// config and filters go back to their old bytes, the .md5 and the listings
+// still match them (a dry run leaves both alone, tried with rclone 1.75.2),
+// and the next tick syncs as before. From the base on, the new ones are the
+// base's and stay. A mark another fix wrote is never restored. The mark
+// goes in every case.
+QString undoSettingsChange(const BackendPaths &paths, const FixState &state) {
+    const QString markPath = settingsChangeMarkPath(paths.appState);
+    const std::optional<QJsonObject> mark = readSettingsMark(paths.appState);
+    if (!mark)
+        return QString();
+    const bool beforeBase = state.step == "preparing" || state.step == "confirm"
+                            || (state.step == "failed" && state.failedStep == "preparing");
+    if (beforeBase && settingsMarkBelongsTo(*mark, paths, state)) {
+        if (mark->value("applied").toBool())
+            if (const QString error = writeMarkBytes(paths, *mark, "previous"); !error.isEmpty())
+                return error + QString("; its old bytes are in %1").arg(markPath);
+        const QJsonArray folders = mark->value("createdFolders").toArray();
+        for (qsizetype i = folders.size() - 1; i >= 0; --i)
+            QDir().rmdir(folders.at(i).toString());  // never recursive: a folder that holds anything stays
+    }
+    QFile::remove(markPath);
+    return QString();
+}
+
+QString cancelFix(const BackendPaths &paths, const FixState &state) {
     QString error;
     const QString unit = unitState(paths, kFixUnit, &error);
     if (unit.isEmpty())
@@ -289,6 +413,8 @@ QString cancelFix(const BackendPaths &paths) {
     if (unitBusy(unit))
         return "a step of the fix is running; wait for it to end, then cancel";
     if (const QString undo = undoFirstSetup(paths); !undo.isEmpty())
+        return undo;
+    if (const QString undo = undoSettingsChange(paths, state); !undo.isEmpty())
         return undo;
     return clearFix(paths.appState) ? QString() : QString("cannot remove %1").arg(fixStatePath(paths.appState));
 }
@@ -362,23 +488,6 @@ QString runBisync(const FixTools &tools, const QStringList &arguments, const QSt
     }
 }
 
-// The config's flags that say how to reach the remote (--config and the
-// --drive-* ones, with their values), for the one-file calls. Without them a
-// touch or a delete could act on another root, or report "not found".
-QStringList remoteFlags(const QStringList &flags) {
-    QStringList kept;
-    for (qsizetype i = 0; i < flags.size(); ++i) {
-        const QString &flag = flags.at(i);
-        const QString name = flag.section('=', 0, 0);
-        if (name != "--config" && !name.startsWith("--drive-"))
-            continue;
-        kept << flag;
-        // A value in the next argument (not a flag itself) goes along.
-        if (!flag.contains('=') && i + 1 < flags.size() && !flags.at(i + 1).startsWith('-'))
-            kept << flags.at(++i);
-    }
-    return kept;
-}
 
 // rclone on one file, and its exit code; -1 when it did not run or crashed.
 int runRcloneFile(const FixTools &tools, const QStringList &arguments, QString *error) {
@@ -396,7 +505,7 @@ int runRcloneFile(const FixTools &tools, const QStringList &arguments, QString *
 
 // Spec section 5, step 1: nothing starts rclone while a normal run holds the
 // listings. Then the dry run, into its own log.
-QString prepareStep(const BackendPaths &paths, const SyncConfig &config, const FixTools &tools, FixState *state) {
+QString prepareStep(const BackendPaths &paths, SyncConfig *config, const FixTools &tools, FixState *state) {
     for (;;) {
         QString error;
         const QString service = unitState(paths, "drive-sync.service", &error);
@@ -406,9 +515,14 @@ QString prepareStep(const BackendPaths &paths, const SyncConfig &config, const F
             break;
         tools.wait(kServicePollSeconds);
     }
+    // Only now, with no run under way and every tick held by fix.json: a run
+    // that started before the fix would read new filters against the old
+    // .md5, abort and take the base with it.
+    if (const QString error = applySettingsChange(paths, *state, config); !error.isEmpty())
+        return error;
     const QString dryLog = fixDryRunLogPath(paths.appState);
     QFile::remove(dryLog);
-    const QString error = runBisync(tools, fixResyncArguments(config, true, dryLog), dryLog);
+    const QString error = runBisync(tools, fixResyncArguments(*config, true, dryLog), dryLog);
     if (!error.isEmpty())
         return error;
     QFile log(dryLog);
@@ -536,7 +650,7 @@ int runFixCommand(const QStringList &arguments, const BackendPaths &paths, QText
     FixState state = readFix(paths.appState);
     QString error;
     if (action == "--cancel") {
-        error = cancelFix(paths);
+        error = cancelFix(paths, state);
     } else if (action == "--retry") {
         error = retryFix(paths, state);
     } else if (action == "--confirm") {
@@ -557,6 +671,8 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
     // A fix unit killed during a final run let through (TimeoutStartSec, a
     // power cut) left that run unchecked, and this unit has no ExecStopPost.
     notifyUnconfirmedDeletes(notify, checkConfirmedRun(paths.appState, config.logFile));
+    // A change made in Settings becomes the config in the preparing step.
+    SyncConfig current = config;
     // Read again after every step: the unit works until the fix waits for
     // the user, fails or ends, and a step never repeats on its own.
     for (;;) {
@@ -574,12 +690,12 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
             error = runOnlyWhenRefusal(config);
         if (error.isEmpty()) {
             if (step == "preparing")
-                error = prepareStep(paths, config, tools, &state);
+                error = prepareStep(paths, &current, tools, &state);
             else if (step == "base")
-                error = baseStep(config, tools, &state);
+                error = baseStep(current, tools, &state);
             else {
                 UnconfirmedDeletes extra;
-                error = finishStep(paths.appState, config, tools, &state, &extra);
+                error = finishStep(paths.appState, current, tools, &state, &extra);
                 notifyUnconfirmedDeletes(notify, extra);
             }
         }
@@ -588,7 +704,7 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
             // A final run that failed can take the new listings with it
             // (moved to -err): retrying it would fail forever.
             if (step == "finishing"
-                && currentListings(config.workDir, bisyncSessionName(config.remote, config.localPath)).first.isEmpty())
+                && currentListings(current.workDir, bisyncSessionName(current.remote, current.localPath)).first.isEmpty())
                 state.failedStep = "base";
             state.step = "failed";
             state.error = error;
@@ -601,8 +717,10 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
             return 1;
         }
         // From the first base on, the config is no longer one to undo.
-        if (step == "base")
+        if (step == "base") {
             QFile::remove(firstSetupMarkPath(paths.appState));
+            QFile::remove(settingsChangeMarkPath(paths.appState));
+        }
         if (state.step.isEmpty()) {
             {
                 const FixLock lock(paths.appState);

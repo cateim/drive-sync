@@ -25,11 +25,18 @@ Rectangle {
         { keys: "F   X", what: qsTr("Fix a broken sync, or cancel the fix from its dialog") },
         { keys: "C   L", what: qsTr("Keep the cloud's or the notebook's file, in the fix") },
         { keys: "D", what: qsTr("Review what a max-delete stop would delete") },
+        { keys: ",", what: qsTr("Settings: folder, interval, guard, cloud folders, filters") },
         { keys: "B", what: qsTr("Put DriveSync on the Omarchy bar, when offered") },
         { keys: "N", what: qsTr("Say no to the bar offer or notice, for good") },
         { keys: "?", what: qsTr("Show or hide these shortcuts") },
         { keys: "Q", what: qsTr("Quit") }
     ]
+
+    // The list outgrows a short window (and pt-BR's longer lines): the card
+    // stops at the window's height and scrolls, with ↑ ↓ J K too.
+    function scroll(step) {
+        flick.contentY = Math.max(0, Math.min(flick.contentHeight - flick.height, flick.contentY + step * 40))
+    }
 
     MouseArea {
         anchors.fill: parent
@@ -39,7 +46,7 @@ Rectangle {
     Rectangle {
         anchors.centerIn: parent
         width: Math.min(parent.width - 64, 560)
-        height: list.implicitHeight + 48
+        height: Math.min(list.implicitHeight + 48, parent.height - 32)
         color: "#1c1c21"
         radius: theme.radius
         border.color: "#2e2e36"
@@ -47,45 +54,55 @@ Rectangle {
         // Clicks on the card don't close it.
         MouseArea { anchors.fill: parent }
 
-        ColumnLayout {
-            id: list
-            anchors { left: parent.left; right: parent.right; top: parent.top; margins: 24 }
-            spacing: 12
+        Flickable {
+            id: flick
+            anchors.fill: parent
+            anchors.margins: 24
+            clip: true
+            contentHeight: list.implicitHeight
+            boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar {}
 
-            Label {
-                text: qsTr("Keyboard shortcuts")
-                font.pixelSize: 18
-                font.weight: Font.DemiBold
-                color: "#f4f4f5"
-            }
+            ColumnLayout {
+                id: list
+                width: flick.width
+                spacing: 12
 
-            Repeater {
-                model: overlay.shortcuts
-                delegate: RowLayout {
-                    id: entry
-                    required property var modelData
-                    Layout.fillWidth: true
-                    spacing: 16
+                Label {
+                    text: qsTr("Keyboard shortcuts")
+                    font.pixelSize: 18
+                    font.weight: Font.DemiBold
+                    color: "#f4f4f5"
+                }
 
-                    Rectangle {
-                        Layout.preferredWidth: 120
-                        implicitHeight: keys.implicitHeight + 8
-                        radius: Math.min(4, theme.radius)
-                        color: "#2a2a31"
-                        Label {
-                            id: keys
-                            anchors.centerIn: parent
-                            text: entry.modelData.keys
-                            color: theme.accent
-                            font.family: "monospace"
-                            font.pixelSize: 13
-                        }
-                    }
-                    Label {
+                Repeater {
+                    model: overlay.shortcuts
+                    delegate: RowLayout {
+                        id: entry
+                        required property var modelData
                         Layout.fillWidth: true
-                        text: entry.modelData.what
-                        wrapMode: Text.Wrap
-                        color: "#d4d4dc"
+                        spacing: 16
+
+                        Rectangle {
+                            Layout.preferredWidth: 120
+                            implicitHeight: keys.implicitHeight + 8
+                            radius: Math.min(4, theme.radius)
+                            color: "#2a2a31"
+                            Label {
+                                id: keys
+                                anchors.centerIn: parent
+                                text: entry.modelData.keys
+                                color: theme.accent
+                                font.family: "monospace"
+                                font.pixelSize: 13
+                            }
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: entry.modelData.what
+                            wrapMode: Text.Wrap
+                            color: "#d4d4dc"
+                        }
                     }
                 }
             }

@@ -59,6 +59,7 @@ struct SyncInputs {
     bool fixInterrupted = false;  // a working step with drive-sync-fix.service gone
     QString fixError;         // why the fix stopped
     QString fixUnitResult;    // drive-sync-fix.service's Result, for an interrupted step
+    int intervalSeconds = 15 * 60;  // the timer's interval: "late" is three of them
 };
 
 struct SyncSummary {
@@ -86,6 +87,7 @@ struct SnapshotSources {
     bool fixUnitActive = false;       // drive-sync-fix.service is starting or running a step
     QString fixUnitResult;            // its Result: "success", "signal", "exit-code"...
     QDateTime now;                    // UTC
+    int intervalSeconds = 15 * 60;    // the config's interval
 };
 
 struct Snapshot {

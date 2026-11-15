@@ -86,6 +86,7 @@ SnapshotSources gatherSources(const BackendPaths &paths, const QDateTime &now, i
     src.driveFound = QFileInfo(paths.drive).isDir();
     src.conflicts = src.driveFound ? countConflicts(paths, now) : 0;
     src.managed = paths.managed;
+    src.intervalSeconds = paths.intervalSeconds;
     if (!paths.appState.isEmpty()) {
         src.pause = readPause(pauseFilePath(paths.appState));
         src.fixPresent = fixPresent(paths.appState);
@@ -131,7 +132,10 @@ QString usageText() {
            "       drive-sync pause [--minutes N | --until-tomorrow] [--json]\n"
            "       drive-sync resume [--json]\n"
            "       drive-sync signin [--abandon] [--json]\n"
-           "       drive-sync setup --folder <path> [--json]\n"
+           "       drive-sync setup --folder <path> [--skip <cloud folder>]... [--json]\n"
+           "       drive-sync folders [--remote <remote:>] [--json] [[--] <cloud folder>]\n"
+           "       drive-sync settings [--interval N | --max-delete N | --folder <path> | --filters <file> |\n"
+           "                           --skip <cloud folder>... | --skip-none] [--json]\n"
            "       drive-sync takeover --check | --apply | --undo [--json]\n"
            "       drive-sync fix --start | --confirm | --answers <file.json> | --cancel | --retry [--json]\n"
            "       drive-sync deletes --list | --allow <count> [--json]\n"

@@ -27,7 +27,11 @@
 //   --keys <letters>                     t Tab, digits (1 and 2 the tabs), h ?, d Down, e Esc,
 //                                        s Space, p P, o T, f F, D D, c C, l L, x X, r Enter,
 //                                        b Backspace, w waits a second, I I, Q Q (typed into a field
-//                                        it must not quit)
+//                                        it must not quit), "," the settings, ^ Ctrl with the next
+//                                        key (^2 Ctrl+2, ^s Ctrl+S), > Right, < Left, ~ the next
+//                                        character typed as it is (~J types a J)
+//   --settings-interval N --settings-max-delete N   what the fake "settings --json" says (15 and 5)
+//   --slow-settings                      that answer takes a second, as a slow disk or a busy CPU can
 //   --width N --height N                 1000x700 by default
 //   --real                               this machine's drive-sync: never for the README
 
@@ -50,6 +54,8 @@
 #include "fixstate.h"
 #include "pausestate.h"
 #include "pluginsetup.h"
+#include "settingscontroller.h"
+#include "foldertree.h"
 #include "setupcontroller.h"
 #include "takeoversetup.h"
 #include "theme.h"
@@ -256,14 +262,45 @@ int main(int argc, char **argv) {
     const QString signinAnswer = scenario == "setup-folder"
         ? "echo '{\"ok\":true,\"error\":\"\"}'; exit 0"
         : "echo '{\"link\":\"http://127.0.0.1:53682/auth?state=k3Jv9QxT2mWb7LpA\"}'; exec sleep 30";
-    put(dir.filePath("drive-sync"), QString("#!/bin/sh\necho \"$*\" >> '%2'\n[ \"$*\" = 'signin --json' ] && { %3; }\ncat '%1' 2>/dev/null\n")
-                                        .arg(dir.filePath("answer.json"), dir.filePath("calls.log"), signinAnswer).toUtf8());
+    // Settings and the cloud's folders: made up, never this machine's.
+    const QJsonObject settings{{"ok", true}, {"error", ""}, {"folder", "/home/someone/Drive"}, {"remote", "gdrive:"},
+                               {"intervalMinutes", opt("--settings-interval", "15").toInt()},
+                               {"maxDelete", opt("--settings-max-delete", "5").toInt()},
+                               {"filtersFile", "/home/someone/.config/drive-sync/filters.txt"},
+                               {"filters", "# BEGIN DriveSync: cloud folders left out of this computer\n- /Archive/2019/**\n"
+                                           "# END DriveSync: cloud folders left out of this computer\n\n"
+                                           "# What DriveSync does not sync between your folder and Google Drive.\n"
+                                           "- .git/**\n- node_modules/**\n- .venv/**\n- *.gdoc\n- desktop.ini\n"},
+                               {"skipped", QJsonArray{"Archive/2019"}}, {"skipError", ""}};
+    put(dir.filePath("settings.json"), QJsonDocument(settings).toJson(QJsonDocument::Compact));
+    auto level = [](const QStringList &paths, const QStringList &local) {
+        QJsonArray list;
+        for (const QString &path : paths)
+            list.append(QJsonObject{{"name", path.section('/', -1)}, {"path", path}, {"local", local.contains(path)},
+                                    {"unsupported", false}});
+        return QJsonDocument(QJsonObject{{"ok", true}, {"error", ""}, {"folders", list}}).toJson(QJsonDocument::Compact);
+    };
+    put(dir.filePath("folders-root.json"), level({"Archive", "Documents", "Notes", "Photos", "Spreadsheets"},
+                                                 {"Archive", "Documents", "Notes", "Photos", "Spreadsheets"}));
+    put(dir.filePath("folders-Archive.json"), level({"Archive/2019", "Archive/2020"}, {"Archive/2019", "Archive/2020"}));
+    put(dir.filePath("drive-sync"),
+        QString("#!/bin/sh\necho \"$*\" >> '%2'\n[ \"$*\" = 'signin --json' ] && { %3; }\n"
+                "case \"$1\" in\n"
+                "  settings) if [ \"$2\" = --json ]; then %5cat '%4/settings.json'; else echo '{\"ok\":true,\"error\":\"\",\"fixStarted\":false}'; fi; exit 0 ;;\n"
+                "  folders) case \" $* \" in *\" -- \"*) for last in \"$@\"; do :; done; cat \"%4/folders-$last.json\" 2>/dev/null || echo '{\"ok\":true,\"error\":\"\",\"folders\":[]}' ;; *) cat '%4/folders-root.json' ;; esac; exit 0 ;;\n"
+                "esac\n"
+                "cat '%1' 2>/dev/null\n")
+            .arg(dir.filePath("answer.json"), dir.filePath("calls.log"), signinAnswer, dir.path(),
+                 args.contains("--slow-settings") ? QString("sleep 1; ") : QString())
+            .toUtf8());
     QFile::setPermissions(dir.filePath("drive-sync"), QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     fake.self = dir.filePath("drive-sync");
     Backend backend(real ? BackendPaths::defaults() : fake);
     TakeoverSetup takeoverSetup(dir.filePath("drive-sync"));
     takeoverSetup.check();
     SetupController setupController(dir.filePath("drive-sync"), "/home/someone/Drive");
+    SettingsController settingsController(dir.filePath("drive-sync"));
+    FolderTree folderTree(dir.filePath("drive-sync"));
 
     // none: the widget is already on the bar, so no banner shows.
     const QString bar = opt("--bar", "none");
@@ -298,6 +335,10 @@ int main(int argc, char **argv) {
     engine.rootContext()->setContextProperty("pluginSetup", &pluginSetup);
     engine.rootContext()->setContextProperty("takeoverSetup", &takeoverSetup);
     engine.rootContext()->setContextProperty("setupController", &setupController);
+    engine.rootContext()->setContextProperty("settingsController", &settingsController);
+    engine.rootContext()->setContextProperty("folderTree", &folderTree);
+    // Qt.quit() from a shortcut: said, so a key that must not quit is caught.
+    QObject::connect(&engine, &QQmlEngine::quit, [] { printf("quit asked\n"); });
     engine.load(QUrl("qrc:/Main.qml"));
     if (engine.rootObjects().isEmpty())
         return 1;
@@ -309,8 +350,22 @@ int main(int argc, char **argv) {
         QTest::qWait(400);
     }
 
+    bool ctrl = false, literal = false;
     for (const QChar k : keys) {
-        if (k == 't') QTest::keyClick(window, Qt::Key_Tab);
+        if (literal) {
+            QTest::keyClick(window, k.toLatin1());
+            literal = false;
+        } else if (k == '~') { literal = true; continue; }
+        else if (k == '^') { ctrl = true; continue; }
+        else if (ctrl) {
+            QTest::keyClick(window, k.isDigit() ? Qt::Key(Qt::Key_0 + k.digitValue()) : Qt::Key(Qt::Key_A + (k.toLower().toLatin1() - 'a')),
+                            Qt::ControlModifier);
+            ctrl = false;
+        }
+        else if (k == ',') QTest::keyClick(window, Qt::Key_Comma);
+        else if (k == '>') QTest::keyClick(window, Qt::Key_Right);
+        else if (k == '<') QTest::keyClick(window, Qt::Key_Left);
+        else if (k == 't') QTest::keyClick(window, Qt::Key_Tab);
         else if (k == 'h') QTest::keyClick(window, Qt::Key_Question, Qt::ShiftModifier);
         else if (k == 'd') QTest::keyClick(window, Qt::Key_Down);
         else if (k == 'e') QTest::keyClick(window, Qt::Key_Escape);
@@ -334,6 +389,14 @@ int main(int argc, char **argv) {
     window->grabWindow().save(out);
     printf("status=%s runs=%lld conflicts=%lld -> %s\n", qPrintable(backend.status()), (long long)backend.runs().size(),
            (long long)backend.conflicts().size(), qPrintable(out));
+    // What the filters editor holds, when it is on screen: typing into it
+    // must reach it and nothing else.
+    if (QObject *editor = window->findChild<QObject *>("filtersEditor"); editor && keys.contains('~'))
+        printf("filters editor: %s\nwindow page=%d help=%d\n",
+               qPrintable(QString::fromUtf8(QJsonDocument(QJsonArray{editor->property("text").toString()}).toJson(QJsonDocument::Compact))),
+               window->property("page").toInt(), window->property("helpVisible").toBool());
+    if (!folderTree.rows().isEmpty())
+        printf("tree left out: %s\n", qPrintable(folderTree.skipped().join(", ")));
     QFile calls(dir.filePath("calls.log"));
     if (calls.open(QIODevice::ReadOnly))
         printf("drive-sync calls:\n%s", calls.readAll().constData());

@@ -36,6 +36,7 @@ FixState unreadable(const QString &why) {
 QString fixStatePath(const QString &appState) { return appState + "/fix.json"; }
 
 QString firstSetupMarkPath(const QString &appState) { return appState + "/first-setup.json"; }
+QString settingsChangeMarkPath(const QString &appState) { return appState + "/settings-change.json"; }
 
 QString fixDryRunLogPath(const QString &appState) { return appState + "/fix-dry-run.log"; }
 

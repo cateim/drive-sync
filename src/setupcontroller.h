@@ -39,7 +39,8 @@ public:
     // Only a sign-in waiting for the browser can be cancelled; a setup takes
     // seconds and stopping it halfway would leave a config with no fix.
     Q_INVOKABLE void cancel();
-    Q_INVOKABLE void start(const QString &folder);
+    // skipped: the cloud folders left out from the start (selective sync).
+    Q_INVOKABLE void start(const QString &folder, const QStringList &skipped = {});
 
 signals:
     void changed();

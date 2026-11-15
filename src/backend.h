@@ -15,6 +15,7 @@
 #include "blockeddeletes.h"
 #include "snapshot.h"
 #include "synclog.h"
+#include "syncconfig.h"
 
 // Where the Backend looks. Tests point every path at a temp directory and
 // systemctl at a fake script.
@@ -29,11 +30,18 @@ struct BackendPaths {
     QString config;    // DriveSync's config; empty when there is none
     QString self;      // this program, for the commands the window runs
     bool managed = false;  // DriveSync runs drive-sync through its own units
+    // The config's interval: "late" is three of them. Last, so the paths
+    // listed in order above keep their places.
+    int intervalSeconds = kDefaultIntervalMinutes * 60;
 
     // Today's paths, or the config's log and folder once DriveSync owns drive-sync.
 
     static BackendPaths defaults();
 };
+
+// What a loaded config changes in the paths: its log, its folder, its
+// interval, and managed.
+void applySyncConfig(BackendPaths *paths, const SyncConfig &config);
 
 class Backend : public QObject {
     Q_OBJECT
@@ -94,7 +102,8 @@ class Backend : public QObject {
     // rule (fixWaitsForDeletes).
     Q_PROPERTY(bool deletesHeld READ deletesHeld NOTIFY deletesHeldChanged)
     Q_PROPERTY(QString logPath READ logPath CONSTANT)
-    Q_PROPERTY(QString drivePath READ drivePath CONSTANT)
+    // The config's folder: it changes with a folder change in Settings.
+    Q_PROPERTY(QString drivePath READ drivePath NOTIFY changed)
 
 public:
     explicit Backend(const BackendPaths &paths = BackendPaths::defaults(), QObject *parent = nullptr);
@@ -195,6 +204,7 @@ private:
     void recompute();
     void watchLog();
     void watchAppState();
+    void watchConfig();
     void updateFix(const FixState &fix);
     void updateBlocked(const QString &logText);
     void setMessage(const QString &message);
@@ -208,6 +218,11 @@ private:
     // apart from the log, so a step change does not parse the log again.
     QFileSystemWatcher m_stateWatcher;
     QTimer m_stateDebounce;
+    // The config's folder (~/.config/drive-sync, quiet): a settings change
+    // made anywhere, the window or a terminal, reaches the window as it
+    // reaches "drive-sync status", which reads the config on every call.
+    QFileSystemWatcher m_configWatcher;
+    QTimer m_configDebounce;
     QTimer m_logDebounce;
     QTimer m_poll;
     QTimer m_conflictPoll;

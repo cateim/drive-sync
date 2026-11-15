@@ -4,7 +4,8 @@ import QtQuick.Controls.Material
 import QtQuick.Layouts
 import "format.js" as Format
 
-// First setup (spec section 6): sign in to Google, pick the folder, start.
+// First setup (spec section 6): sign in to Google, pick the folder and the
+// cloud folders that come down (selective sync, spec 8), start.
 // Start writes the filters and the config and begins the fix, whose dry run
 // opens in the fix dialog: nothing is copied before the user confirms it.
 // With "again", only the sign-in, for a token Google no longer accepts.
@@ -45,8 +46,10 @@ Popup {
 
     onOpened: {
         field.text = Format.home(setupController.folder)
-        if (signedIn && !again)
+        if (signedIn && !again) {
             field.forceActiveFocus()
+            folderTree.reset([], "drive-sync:")
+        }
     }
     // A sign-in that still waits for the browser goes with the dialog.
     onClosed: setupController.cancel()
@@ -54,8 +57,11 @@ Popup {
     Connections {
         target: setupController
         function onSignedIn() {
-            if (dialog.visible && !dialog.again)
+            if (dialog.visible && !dialog.again) {
                 field.forceActiveFocus()
+                // DriveSync's own remote, before any config names it.
+                folderTree.reset([], "drive-sync:")
+            }
         }
     }
 
@@ -65,7 +71,7 @@ Popup {
         if (again || !signedIn)
             setupController.signIn()
         else
-            setupController.start(field.text.trim())
+            setupController.start(field.text.trim(), folderTree.skipped)
     }
 
     ColumnLayout {
@@ -160,10 +166,34 @@ Popup {
             text: qsTr("Files already in it stay and go to the cloud. Where both sides have a file at the same path, the newer copy wins on both; the dry run lists every copy, and nothing changes before you confirm it.")
         }
 
-        // 3. Start.
+        // 3. The cloud folders that come down.
         Label {
             visible: !dialog.again
-            text: qsTr("3. Start")
+            text: qsTr("3. Choose the cloud folders")
+            textFormat: Text.PlainText
+            font.weight: Font.DemiBold
+            color: dialog.signedIn ? "#e4e4e8" : "#6f6f7a"
+        }
+        FolderTreeView {
+            visible: !dialog.again && dialog.signedIn
+            Layout.fillWidth: true
+            Layout.preferredHeight: 150
+        }
+        Label {
+            Layout.fillWidth: true
+            visible: !dialog.again
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: dialog.signedIn ? "#c4c4cc" : "#6f6f7a"
+            text: folderTree.error !== "" && dialog.signedIn
+                  ? folderTree.error
+                  : qsTr("Untick what should stay only in the cloud; Tab reaches the list, Space ticks, → opens a folder. Settings change this later.")
+        }
+
+        // 4. Start.
+        Label {
+            visible: !dialog.again
+            text: qsTr("4. Start")
             textFormat: Text.PlainText
             font.weight: Font.DemiBold
             color: dialog.signedIn ? "#e4e4e8" : "#6f6f7a"

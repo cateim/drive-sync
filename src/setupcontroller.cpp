@@ -44,7 +44,7 @@ void SetupController::cancel() {
     emit changed();
 }
 
-void SetupController::start(const QString &folder) {
+void SetupController::start(const QString &folder, const QStringList &skipped) {
     if (m_state != "signedIn")
         return;
     // The dialog shows the home as "~", as the rest of the window does.
@@ -55,7 +55,10 @@ void SetupController::start(const QString &folder) {
     m_state = "settingUp";
     m_detail.clear();
     emit changed();
-    run({"setup", "--folder", path, "--json"});
+    QStringList arguments{"setup", "--folder", path};
+    for (const QString &cloudFolder : skipped)
+        arguments << "--skip" << cloudFolder;
+    run(arguments << "--json");
 }
 
 void SetupController::stopSignIn(bool thenAbandon) {

@@ -136,6 +136,16 @@ test("the widget leaves the late rule to the app", () => {
   assert.doesNotMatch(qml, /staleAfter/)
 })
 
+// "Late" is three sync intervals, which only the app knows: an ok status
+// whose last success is old (a 60 minute interval) stays ok on the bar.
+test("late is the app's call: an ok snapshot an hour old stays ok", () => {
+  const now = 1794076098
+  const s = model.parseSnapshot(JSON.stringify({ version: 2, now: now, status: "ok", tone: "ok",
+                                                 lastSuccess: now - 3600 }))
+  assert.equal(s.status, "ok")
+  assert.equal(model.barState(s), "ok")
+})
+
 test("helper scripts parse in bash", () => {
   execFileSync("bash", ["-n", new URL("../open-history.sh", import.meta.url).pathname])
 })

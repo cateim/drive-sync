@@ -69,6 +69,7 @@ Snapshot buildSnapshot(const SnapshotSources &src) {
     }
     in.lastSuccess = s.lastSuccess;
     in.now = now;
+    in.intervalSeconds = src.intervalSeconds;
     in.conflicts = src.conflicts;
     if (src.fixPresent) {
         in.fixStep = src.fix.step;

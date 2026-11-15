@@ -1,4 +1,5 @@
 #include "takeover.h"
+#include "settingscommand.h"
 
 #include <QCoreApplication>
 #include <QDir>
@@ -592,6 +593,9 @@ bool applyTakeover(const TakeoverPaths &paths, const TakeoverPlan &plan, const Q
     if (const QString problem = writeJson(backup + "/manifest.json",
                                           {{"version", 1},
                                            {"takenOverAt", now.toSecsSinceEpoch()},
+                                           // The folder the old units sync: an undo after a
+                                           // folder change in Settings is refused.
+                                           {"localPath", plan.config.localPath},
                                            {"moved", moved},
                                            {"oldTimersEnabled", QJsonArray::fromStringList(wasEnabled)},
                                            {"oldTimersActive", QJsonArray::fromStringList(wasActive)},
@@ -696,6 +700,27 @@ bool undoTakeover(const TakeoverPaths &paths, QString *error) {
         *error = "the filters changed since the takeover, so the old setup would need a resync";
         return false;
     }
+    // The old units sync the folder of their ExecStart: after a folder change
+    // in Settings their listings no longer match the folder DriveSync syncs.
+    QString oldFolder = manifest.value("localPath").toString();
+    for (const auto &[from, to] : moves)
+        if (oldFolder.isEmpty() && QFileInfo(from).fileName() == "drive-sync.service") {
+            bool ok = false;
+            const UnitFile unit = readUnit(to, &ok);
+            for (const auto &[key, value] : unit.value("Service")) {
+                SyncConfig old;
+                QString ignored;
+                if (ok && key == "ExecStart" && readExecStart(value, &old, &ignored))
+                    oldFolder = old.localPath;
+            }
+        }
+    const auto config = loadSyncConfig(paths.appConfigDir + "/config.json", nullptr);
+    if (config && !oldFolder.isEmpty() && QDir::cleanPath(config->localPath) != QDir::cleanPath(oldFolder)) {
+        *error = QString("the folder changed since the takeover (%1 now, %2 before), so the old setup would need a "
+                         "resync; set the folder back to %2 in Settings first")
+                     .arg(config->localPath, oldFolder);
+        return false;
+    }
     // Nothing may sit where an old file goes back, and every saved file must be there.
     for (const auto &[from, to] : moves) {
         if (QFileInfo::exists(from)) {
@@ -723,7 +748,25 @@ bool undoTakeover(const TakeoverPaths &paths, QString *error) {
         if (unitAnswer(paths, "is-active", timer) == "active")
             newActive << timer;
     }
+    // DriveSync's interval drop-in would retime the old timer, which comes
+    // back to the same folder, and a later takeover would find it in the way:
+    // it goes before anything moves, and one that cannot go stops the undo.
+    const QString dropIn = intervalDropInPath(paths.userUnits);
+    QFile dropInFile(dropIn);
+    const QByteArray dropInBytes = dropInFile.open(QIODevice::ReadOnly) ? dropInFile.readAll() : QByteArray();
+    dropInFile.close();
+    if (QFile::exists(dropIn) && !QFile::remove(dropIn)) {
+        *error = QString("could not remove %1, so nothing was undone; remove it and undo again").arg(dropIn);
+        return false;
+    }
+    QDir().rmdir(QFileInfo(dropIn).absolutePath());  // only when empty
     auto restoreNew = [&] {
+        // A refused undo leaves DriveSync's own interval as it was.
+        if (!dropInBytes.isEmpty() && QDir().mkpath(QFileInfo(dropIn).absolutePath())) {
+            QFile back(dropIn);
+            if (back.open(QIODevice::WriteOnly))
+                back.write(dropInBytes);
+        }
         const QString problem = restoreOldTimers(paths, newEnabled, newActive);
         return problem.isEmpty() ? QString() : "; and DriveSync's timers did not come back: " + problem;
     };

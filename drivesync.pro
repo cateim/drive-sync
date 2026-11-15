@@ -19,6 +19,10 @@ HEADERS += \
     src/oauthclient.h \
     src/pausestate.h \
     src/pluginsetup.h \
+    src/selectivesync.h \
+    src/settingscommand.h \
+    src/settingscontroller.h \
+    src/foldertree.h \
     src/setupcontroller.h \
     src/signin.h \
     src/snapshot.h \
@@ -46,6 +50,10 @@ SOURCES += \
     src/oauthclient.cpp \
     src/pausestate.cpp \
     src/pluginsetup.cpp \
+    src/selectivesync.cpp \
+    src/settingscommand.cpp \
+    src/settingscontroller.cpp \
+    src/foldertree.cpp \
     src/setupcontroller.cpp \
     src/signin.cpp \
     src/snapshot.cpp \

@@ -1,8 +1,14 @@
 #pragma once
 
+#include <QByteArray>
 #include <QString>
 #include <QStringList>
 #include <optional>
+
+// The packaged timer's interval, and the range the settings accept.
+inline constexpr int kDefaultIntervalMinutes = 15;
+inline constexpr int kMinIntervalMinutes = 5;
+inline constexpr int kMaxIntervalMinutes = 1440;
 
 // What DriveSync runs when it owns drive-sync. A takeover copies every value
 // byte for byte from the old unit: the bisync listings are named after the
@@ -15,13 +21,23 @@ struct SyncConfig {
     QString logFile;
     QStringList rcloneFlags;  // every other rclone argument, in the old unit's order
     QString runOnlyWhen;      // a shell command; the run is skipped when it fails; empty runs always
+    // Minutes between runs, written into a drop-in for the packaged timer
+    // (drive-sync settings --interval). "Late" is three of them.
+    int intervalMinutes = kDefaultIntervalMinutes;
 };
+
+// The rclone flags a new user's sync runs with (first setup); the cloud
+// folder tree lists with their --drive-* ones before any config exists.
+QStringList newUserFlags();
 
 // ~/.config/drive-sync/config.json
 QString defaultSyncConfigPath();
 // Missing, unreadable, another version or a missing field: no config, and
-// error says which.
+// error says which. intervalMinutes came later and is optional: absent or
+// not a positive whole number, it reads kDefaultIntervalMinutes.
 std::optional<SyncConfig> loadSyncConfig(const QString &path, QString *error);
+// The bytes saveSyncConfig writes.
+QByteArray syncConfigBytes(const SyncConfig &config);
 // Writes through QSaveFile, so a crash never leaves half a config behind.
 bool saveSyncConfig(const QString &path, const SyncConfig &config, QString *error);
 // The arguments after "rclone" for one normal run.

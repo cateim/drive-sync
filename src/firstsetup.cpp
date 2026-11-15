@@ -12,6 +12,7 @@
 #include "controlcommands.h"
 #include "fixcommand.h"
 #include "fixstate.h"
+#include "selectivesync.h"
 #include "signin.h"
 #include "snapshot.h"
 
@@ -114,9 +115,16 @@ bool writeSetupMark(const QString &appState, const QString &config, const QStrin
     return file.open(QIODevice::WriteOnly) && file.write(data) == data.size() && file.commit();
 }
 
-QString setUp(const BackendPaths &paths, const TakeoverPaths &takeover, const QString &folder) {
+QString setUp(const BackendPaths &paths, const TakeoverPaths &takeover, const QString &folder,
+              const QStringList &skipped) {
     if (const QString refusal = setupRefusal(paths, takeover, folder, takeover.rclone); !refusal.isEmpty())
         return refusal;
+    // The cloud folders the user left out in the setup dialog: the first
+    // dry run already leaves them in the cloud.
+    QString skipError;
+    const std::optional<QByteArray> filters = withSkippedFolders(defaultFilters(), skipped, &skipError);
+    if (!filters)
+        return skipError;
     // newUserConfig's paths, taken from the ones given: in production they
     // are the same, and tests keep every file inside their temp dir.
     SyncConfig config = newUserConfig(cleanFolder(folder), QString());
@@ -132,7 +140,7 @@ QString setUp(const BackendPaths &paths, const TakeoverPaths &takeover, const QS
         error = QString("cannot create %1").arg(config.workDir);
     else if (!makeFolder(takeover.appConfigDir, &written) || !makeFolder(QFileInfo(paths.config).path(), &written))
         error = QString("cannot create %1").arg(takeover.appConfigDir);
-    else if (writeNewFile(config.filtersFile, defaultFilters(), &error)) {
+    else if (writeNewFile(config.filtersFile, *filters, &error)) {
         written.files << config.filtersFile;
         if (saveSyncConfig(paths.config, config, &error)) {
             written.files << paths.config;
@@ -209,45 +217,77 @@ SyncConfig newUserConfig(const QString &folder, const QString &home) {
     config.workDir = home + "/.local/state/drive-sync-app/bisync";
     config.filtersFile = home + "/.config/drive-sync/filters.txt";
     config.logFile = home + "/.local/state/drive-sync.log";
-    // The maintainer's sync proved these over months; --fast-list is added
-    // by rcloneRunArguments, and the fix leaves the routine ones out of the
-    // base run.
-    config.rcloneFlags = {"--drive-skip-gdocs", "--drive-skip-shortcuts", "--resilient", "--recover",
-                          "--max-lock",         "2m",                     "--max-delete", "5",
-                          "--conflict-resolve", "newer",                  "--log-level",  "INFO",
-                          "--fast-list"};
+    config.rcloneFlags = newUserFlags();
     return config;
 }
 
-QString setupRefusal(const BackendPaths &paths, const TakeoverPaths &takeover, const QString &folder,
-                     const QString &rclone) {
+QString resolvedFolder(const QString &path) {
+    QString existing = QDir::cleanPath(path);
+    QString rest;
+    while (!QFileInfo::exists(existing)) {
+        rest = rest.isEmpty() ? QFileInfo(existing).fileName() : QFileInfo(existing).fileName() + "/" + rest;
+        const QString up = QFileInfo(existing).path();
+        if (up == existing)
+            break;
+        existing = up;
+    }
+    QString real = QFileInfo(existing).canonicalFilePath();
+    if (real.isEmpty())
+        real = existing;
+    return rest.isEmpty() ? real : QDir::cleanPath(real + "/" + rest);
+}
+
+QString folderRefusal(const BackendPaths &paths, const TakeoverPaths &takeover, const QString &folder,
+                      const QStringList &alsoOwn) {
     if (folder.isEmpty() || QDir::isRelativePath(folder))
         return QString("the folder must be an absolute path, not \"%1\"").arg(folder);
     const QString clean = cleanFolder(folder);
+    // The path as written and the one it leads to: a link to the home or to
+    // DriveSync's own folders must not pass for another folder.
+    const QStringList names{clean, resolvedFolder(clean)};
     const QString home = QDir::cleanPath(QDir::homePath());
+    const QStringList homes{home, resolvedFolder(home)};
+    auto inside = [](const QString &path, const QString &folder) {
+        return path.startsWith(folder.endsWith('/') ? folder : folder + "/");
+    };
     // The home itself, or a folder that holds it, would sync every config
     // and cache of the session to the cloud.
-    if (clean == home || home.startsWith(clean.endsWith('/') ? clean : clean + "/"))
-        return QString("%1 holds the whole home folder; pick a folder inside it, such as ~/Drive").arg(clean);
+    for (const QString &name : names)
+        for (const QString &h : homes)
+            if (name == h || inside(h, name))
+                return QString("%1 holds the whole home folder; pick a folder inside it, such as ~/Drive").arg(clean);
     // A folder that holds DriveSync's or rclone's own files, or sits inside
     // them, would sync its own state, the token and the log it writes while
     // syncing; ~/.config and ~/.local/state hold every program's.
     const QString rcloneConfig = qEnvironmentVariable("RCLONE_CONFIG");
-    const QStringList own = {paths.appState,
-                             paths.appState + "/bisync",
-                             QFileInfo(paths.log).absolutePath(),
-                             QFileInfo(paths.config).absolutePath(),
-                             takeover.appConfigDir,
-                             rcloneConfig.isEmpty() ? home + "/.config/rclone" : QFileInfo(rcloneConfig).absolutePath(),
-                             home + "/.config",
-                             home + "/.local/state"};
+    const QStringList own = QStringList{paths.appState,
+                                        paths.appState + "/bisync",
+                                        QFileInfo(paths.log).absolutePath(),
+                                        QFileInfo(paths.config).absolutePath(),
+                                        takeover.appConfigDir,
+                                        rcloneConfig.isEmpty() ? home + "/.config/rclone"
+                                                               : QFileInfo(rcloneConfig).absolutePath(),
+                                        home + "/.config",
+                                        home + "/.local/state"}
+                            + alsoOwn;
     for (const QString &path : own) {
-        const QString other = QDir::cleanPath(path);
-        if (clean == other || clean.startsWith(other + "/") || other.startsWith(clean + "/"))
-            return QString("%1 holds or sits inside %2, where DriveSync, rclone or other programs keep their own "
-                           "files; pick a folder of its own, such as ~/Drive")
-                .arg(clean, other);
+        for (const QString &other : {QDir::cleanPath(path), resolvedFolder(path)})
+            for (const QString &name : names)
+                if (name == other || inside(name, other) || inside(other, name))
+                    return QString("%1 holds or sits inside %2, where DriveSync, rclone or other programs keep their "
+                                   "own files; pick a folder of its own, such as ~/Drive")
+                        .arg(clean, QDir::cleanPath(path));
     }
+    const QFileInfo info(clean);
+    if (info.exists() && !info.isDir())
+        return QString("%1 is not a folder").arg(clean);
+    return QString();
+}
+
+QString setupRefusal(const BackendPaths &paths, const TakeoverPaths &takeover, const QString &folder,
+                     const QString &rclone) {
+    if (const QString refusal = folderRefusal(paths, takeover, folder); !refusal.isEmpty())
+        return refusal;
     if (QFile::exists(paths.config))
         return QString("DriveSync already runs drive-sync (%1 exists)").arg(paths.config);
     if (fixPresent(paths.appState))
@@ -263,9 +303,6 @@ QString setupRefusal(const BackendPaths &paths, const TakeoverPaths &takeover, c
     const QString filters = takeover.appConfigDir + "/filters.txt";
     if (QFile::exists(filters))
         return QString("%1 exists already, and setup never overwrites a filters file").arg(filters);
-    const QFileInfo info(clean);
-    if (info.exists() && !info.isDir())
-        return QString("%1 is not a folder").arg(clean);
     if (const QString refusal = rcloneVersionRefusal(rclone); !refusal.isEmpty())
         return refusal;
     return remoteRefusal(rclone);
@@ -273,13 +310,33 @@ QString setupRefusal(const BackendPaths &paths, const TakeoverPaths &takeover, c
 
 int runSetupCommand(const QStringList &arguments, const BackendPaths &paths, const TakeoverPaths &takeover,
                     QTextStream &out, QTextStream &err) {
-    QStringList rest = arguments;
-    const bool json = rest.removeAll("--json") > 0;
-    if (rest.size() != 2 || rest.first() != "--folder") {
-        err << "usage: drive-sync setup --folder <path> [--json]\n";
+    // Option by option, values as they are: a cloud folder named "--json"
+    // is a folder.
+    bool json = false;
+    bool valid = true;
+    QString folder;
+    QStringList skipped;
+    for (qsizetype i = 0; i < arguments.size() && valid; ++i) {
+        const QString &argument = arguments.at(i);
+        if (argument == "--json") {
+            json = true;
+        } else if ((argument == "--folder" && folder.isNull()) || argument == "--skip") {
+            valid = i + 1 < arguments.size();
+            if (!valid)
+                break;
+            if (argument == "--folder")
+                folder = arguments.at(++i);
+            else
+                skipped << arguments.at(++i);
+        } else {
+            valid = false;
+        }
+    }
+    if (!valid || folder.isNull()) {
+        err << "usage: drive-sync setup --folder <path> [--skip <cloud folder>]... [--json]\n";
         return 1;
     }
     // One setup, fix command or unit step at a time: they all write fix.json.
     const FixLock lock(paths.appState);
-    return commandAnswer(json, setUp(paths, takeover, rest.at(1)), out, err);
+    return commandAnswer(json, setUp(paths, takeover, folder, skipped), out, err);
 }
