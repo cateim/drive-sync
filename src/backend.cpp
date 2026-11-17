@@ -45,9 +45,9 @@ BackendPaths BackendPaths::defaults() {
                        "/proc",
                        QStandardPaths::findExecutable("systemctl"),
                        QStandardPaths::findExecutable("find"),
-                       home + "/.local/state/drive-sync-app"};
-    paths.config = defaultSyncConfigPath();
-    paths.self = QCoreApplication::applicationFilePath();
+                       home + "/.local/state/drive-sync-app",
+                       defaultSyncConfigPath(),
+                       QCoreApplication::applicationFilePath()};
     if (const auto config = loadSyncConfig(paths.config, nullptr))
         applySyncConfig(&paths, *config);
     return paths;
@@ -417,7 +417,10 @@ SyncSummary Backend::summarize(const SyncInputs &in) {
         s.causeDetail = in.lastCauseDetail;
     } else if (in.lastOutcome == "interrupted") {
         s.status = "interrupted";
-    } else if (in.serviceResult == "exec-condition") {
+    } else if (in.serviceResult == "exec-condition"
+               && !(in.serviceSkip.isValid() && in.lastStart.isValid() && in.lastStart > in.serviceSkip)) {
+        // A run in the log after the skip (the fix's final run, which runs
+        // outside the unit) is newer news than the skip.
         s.status = "skipped";
     } else if (timerOff) {
         s.status = "timerOff";

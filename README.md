@@ -131,7 +131,7 @@ widget. In its panel, `S` syncs now, `P` pauses for an hour or resumes, and
 ## First setup
 
 With no drive-sync at all, the window offers to set one up (`T`). The
-dialog goes through four steps, and nothing is copied before the last one:
+dialog goes through five steps, and nothing is copied before the last one:
 
 1. **Sign in to Google.** Your browser opens Google's sign-in page for
    DriveSync, through rclone's own flow (`rclone config create`): the token
@@ -148,8 +148,13 @@ dialog goes through four steps, and nothing is copied before the last one:
 3. **Choose the cloud folders.** A tree of the cloud's folders, read a level
    at a time; untick what should stay only in the cloud (`Tab` reaches the
    list, `Space` ticks, `→` opens a folder). Settings change it later.
-4. **Start.** DriveSync writes its default filters
-   (`~/.config/drive-sync/filters.txt`: `.git`, `node_modules`, `.venv`,
+4. **Choose what does not sync** (`Ctrl+E` opens and closes the editor): the
+   same screen as the Filters page of Settings, below. A folder that already
+   holds builds, virtual environments or links needs its rules before the
+   first base run. rclone checks every rule when you start, before anything
+   is written.
+5. **Start.** DriveSync writes the filters (the defaults or the imported ones)
+   to `~/.config/drive-sync/filters.txt` (the defaults: `.git`, `node_modules`, `.venv`,
    Python caches, Google Docs shortcuts and system junk) and its config, and
    starts a fix (see below): a dry run lists every copy in both directions,
    and the base run waits for your confirmation. The timers come on at the
@@ -208,8 +213,24 @@ change goes through `drive-sync settings`, so the window writes nothing itself.
   a block of rules at the top of the filters file, between
   `# BEGIN DriveSync: cloud folders left out of this computer` and its
   `# END` line.
-- **Filters**: the whole filters file. Saving checks the rules with rclone
-  first.
+- **Filters**: what does not sync, built on screen, in four parts:
+  - **Ready-made groups** to tick: Git folders, `node_modules`, Python
+    environments and caches, build output, Google Docs shortcuts, Windows
+    and macOS junk, locks and temporary files.
+  - **On this computer**: the synced folder as a tree; untick a folder or a
+    file to leave it out. A link shows a warning: rclone never syncs a link,
+    so a cloud file with its name would come down over it unless it is
+    unticked.
+  - **By name**: a name, a folder, an extension or a path, each shown as a
+    sentence ("No folder named build, in any folder").
+  - **Advanced**: every other rclone rule, kept as written and read before
+    the parts above, so a `+` rule there wins. A filters file from an
+    earlier sync can be imported here; what the screen can show lights up.
+
+  Each of the first three parts is a marked block at the end of the filters
+  file (`# BEGIN DriveSync: ready-made groups`, `paths on this computer`,
+  `rules by name`); everything else stays as written. Saving checks the
+  rules with rclone first.
 
 The folder, the cloud folders and the filters change what bisync compares,
 so saving them starts a fix: its dry run waits for your confirmation, and
@@ -333,7 +354,7 @@ drive-sync pause [--minutes N | --until-tomorrow]   # no flag: until resumed
 drive-sync resume           # end the pause and start a run
 drive-sync signin           # sign in to Google in the browser (first setup, or again)
 drive-sync signin --abandon # remove a drive-sync remote whose sign-in never finished
-drive-sync setup --folder <path> [--skip <cloud folder>]...   # first setup, after signin
+drive-sync setup --folder <path> [--skip <cloud folder>]... [--filters <file>|-]   # first setup, after signin; --filters imports an earlier sync's rules
 drive-sync settings         # the settings; with one change: --interval N | --max-delete N |
                             # --folder <path> | --filters <file> (- reads stdin) | --skip <cloud folder>... | --skip-none
 drive-sync folders [--remote <remote:>] [[--] <cloud folder>]   # one level of the cloud's folders

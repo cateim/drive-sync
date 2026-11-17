@@ -73,15 +73,6 @@ std::optional<BlockSpan> findBlock(const QByteArray &filters, QList<QByteArray> 
     return span;
 }
 
-QString unescapeFilterPath(const QString &escaped) {
-    QString plain;
-    for (qsizetype i = 0; i < escaped.size(); ++i) {
-        if (escaped.at(i) == '\\' && i + 1 < escaped.size())
-            ++i;
-        plain += escaped.at(i);
-    }
-    return plain;
-}
 
 QString folderProblem(const QString &folder) {
     if (folder.isEmpty())
@@ -133,6 +124,16 @@ private:
 };
 
 }  // namespace
+
+QString unescapeFilterPath(const QString &escaped) {
+    QString plain;
+    for (qsizetype i = 0; i < escaped.size(); ++i) {
+        if (escaped.at(i) == '\\' && i + 1 < escaped.size())
+            ++i;
+        plain += escaped.at(i);
+    }
+    return plain;
+}
 
 QString escapeFilterPath(const QString &path) {
     QString escaped;

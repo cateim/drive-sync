@@ -55,7 +55,9 @@
 #include "pausestate.h"
 #include "pluginsetup.h"
 #include "settingscontroller.h"
+#include "filtereditor.h"
 #include "foldertree.h"
+#include "localtree.h"
 #include "setupcontroller.h"
 #include "takeoversetup.h"
 #include "theme.h"
@@ -101,6 +103,12 @@ int main(int argc, char **argv) {
 
     QTemporaryDir dir;
     put(dir.filePath("language"), lang.toUtf8() + "\n");
+    // "~" in the window is this temp folder, never the real home: the
+    // filters screen lists the synced folder, and pictures from here go in
+    // the README. Unless --real, which reads this machine on purpose.
+    const bool realMachine = args.contains("--real");
+    if (!realMachine)
+        qputenv("HOME", QFile::encodeName(dir.path()));
     const QDateTime now = QDateTime::currentDateTime();
 
     QString log;
@@ -171,6 +179,11 @@ int main(int argc, char **argv) {
     } else {
         QDir().mkpath(dir.filePath("Drive"));
     }
+    // A made-up synced folder for the filters screen's tree, with a link.
+    for (const char *file : {"Drive/Documents/budget-2026.ods", "Drive/GitHub/my-app/build/app.o",
+                             "Drive/GitHub/my-app/README.md", "Drive/Photos/trip/beach-01.jpg", "Drive/notes.txt"})
+        put(dir.filePath(file), "x");
+    QFile::link(dir.filePath("Drive/notes.txt"), dir.filePath("Drive/GitHub/my-app/notes.txt"));
 
     const QString fix = opt("--fix", "none");
     const QString systemctl = dir.filePath("systemctl");
@@ -298,9 +311,11 @@ int main(int argc, char **argv) {
     Backend backend(real ? BackendPaths::defaults() : fake);
     TakeoverSetup takeoverSetup(dir.filePath("drive-sync"));
     takeoverSetup.check();
-    SetupController setupController(dir.filePath("drive-sync"), "/home/someone/Drive");
+    SetupController setupController(dir.filePath("drive-sync"), dir.filePath("Drive"));
     SettingsController settingsController(dir.filePath("drive-sync"));
     FolderTree folderTree(dir.filePath("drive-sync"));
+    LocalTree localTree;
+    FilterEditor filterEditor;
 
     // none: the widget is already on the bar, so no banner shows.
     const QString bar = opt("--bar", "none");
@@ -337,6 +352,8 @@ int main(int argc, char **argv) {
     engine.rootContext()->setContextProperty("setupController", &setupController);
     engine.rootContext()->setContextProperty("settingsController", &settingsController);
     engine.rootContext()->setContextProperty("folderTree", &folderTree);
+    engine.rootContext()->setContextProperty("localTree", &localTree);
+    engine.rootContext()->setContextProperty("filterEditor", &filterEditor);
     // Qt.quit() from a shortcut: said, so a key that must not quit is caught.
     QObject::connect(&engine, &QQmlEngine::quit, [] { printf("quit asked\n"); });
     engine.load(QUrl("qrc:/Main.qml"));
@@ -393,7 +410,7 @@ int main(int argc, char **argv) {
     // must reach it and nothing else.
     if (QObject *editor = window->findChild<QObject *>("filtersEditor"); editor && keys.contains('~'))
         printf("filters editor: %s\nwindow page=%d help=%d\n",
-               qPrintable(QString::fromUtf8(QJsonDocument(QJsonArray{editor->property("text").toString()}).toJson(QJsonDocument::Compact))),
+               qPrintable(QString::fromUtf8(QJsonDocument(QJsonArray{filterEditor.text(localTree.excluded())}).toJson(QJsonDocument::Compact))),
                window->property("page").toInt(), window->property("helpVisible").toBool());
     if (!folderTree.rows().isEmpty())
         printf("tree left out: %s\n", qPrintable(folderTree.skipped().join(", ")));

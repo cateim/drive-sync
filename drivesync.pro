@@ -20,6 +20,9 @@ HEADERS += \
     src/pausestate.h \
     src/pluginsetup.h \
     src/selectivesync.h \
+    src/filterrules.h \
+    src/filtereditor.h \
+    src/localtree.h \
     src/settingscommand.h \
     src/settingscontroller.h \
     src/foldertree.h \
@@ -51,6 +54,9 @@ SOURCES += \
     src/pausestate.cpp \
     src/pluginsetup.cpp \
     src/selectivesync.cpp \
+    src/filterrules.cpp \
+    src/filtereditor.cpp \
+    src/localtree.cpp \
     src/settingscommand.cpp \
     src/settingscontroller.cpp \
     src/foldertree.cpp \

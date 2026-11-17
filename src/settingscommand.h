@@ -20,6 +20,9 @@
 // The drop-in that sets the packaged timer's interval:
 // <userUnits>/drive-sync.timer.d/drive-sync-interval.conf.
 QString intervalDropInPath(const QString &userUnits);
+// Empty when rclone reads every rule of these filters (checked on an empty
+// folder, so nothing is listed or copied); otherwise why, with rclone's words.
+QString filtersRefusal(const QString &rclone, const QByteArray &filters);
 // Its text. The empty OnUnitActiveSec= resets every timer of the unit
 // (systemd.timer(5)), OnBootSec included, so it repeats the packaged value.
 QByteArray intervalDropIn(int minutes);

@@ -54,6 +54,7 @@ Snapshot buildSnapshot(const SnapshotSources &src) {
     in.serviceActive = active;
     in.serviceResult = src.service.value("Result");
     in.serviceStart = fromUnixStamp(src.service.value("ExecMainStartTimestamp"));
+    in.serviceSkip = fromUnixStamp(src.service.value("InactiveEnterTimestamp"));
     in.timerActive = src.timer.value("ActiveState");
     in.timerFileState = src.timer.value("UnitFileState");
     in.resyncRunning = src.resyncRunning;
@@ -159,7 +160,7 @@ QString toneFor(const QString &status) {
 
 QStringList systemdShowArguments() {
     return {"--user", "show", "--timestamp=unix", "drive-sync.service", "drive-sync.timer", "drive-sync-fix.service", "-p",
-            "LoadState,ActiveState,Result,ExecMainStartTimestamp,UnitFileState"};
+            "LoadState,ActiveState,Result,ExecMainStartTimestamp,InactiveEnterTimestamp,UnitFileState"};
 }
 
 bool fixUnitBusy(const QHash<QString, QString> &unit) {

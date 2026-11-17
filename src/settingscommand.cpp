@@ -149,6 +149,8 @@ QString setInterval(const BackendPaths &paths, const TakeoverPaths &takeover, Sy
     return QString();
 }
 
+}  // namespace
+
 // rclone's own reading of the filters, on an empty folder: a rule it cannot
 // parse would stop every run, and the fix's dry run would fail on it after
 // the old filters were already replaced.
@@ -172,6 +174,8 @@ QString filtersRefusal(const QString &rclone, const QByteArray &filters) {
         why = why.mid(at + 9);
     return QString("rclone cannot read these filters: %1").arg(why.left(200));
 }
+
+namespace {
 
 // A change bisync must rebuild its base for (spec 8): the old and the new
 // bytes go into the pending mark, bound to the fix it starts, and the fix's
@@ -365,7 +369,7 @@ int runSettingsCommand(const QStringList &arguments, const BackendPaths &paths, 
             out << QJsonDocument(showSettings(*config)).toJson(QJsonDocument::Compact) << "\n";
         } else {
             const QJsonObject shown = showSettings(*config);
-            for (const QString &key : {"folder", "remote", "intervalMinutes", "maxDelete", "filtersFile"})
+            for (const char *key : {"folder", "remote", "intervalMinutes", "maxDelete", "filtersFile"})
                 out << key << ": " << shown.value(key).toVariant().toString() << "\n";
         }
         out.flush();

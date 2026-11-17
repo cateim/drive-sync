@@ -20,6 +20,7 @@
         <file alias="SetupDialog.qml">SetupDialog.qml</file>
         <file alias="SettingsDialog.qml">SettingsDialog.qml</file>
         <file alias="FolderTreeView.qml">FolderTreeView.qml</file>
+        <file alias="FiltersEditor.qml">FiltersEditor.qml</file>
         <file alias="format.js">format.js</file>
         <file alias="i18n/en.json">i18n/en.json</file>
         <file alias="i18n/pt-BR.json">i18n/pt-BR.json</file>

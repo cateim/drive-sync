@@ -3,15 +3,20 @@ import QtQuick.Controls
 import QtQuick.Controls.Material
 import QtQuick.Layouts
 
-// The cloud's folders with a tick each (selective sync), read a level at a
-// time by folderTree. Keyboard first: with the focus here, ↑ ↓ J K move,
+// A tree with a tick per row, read a level at a time by its model: the
+// cloud's folders (folderTree, selective sync) or the synced folder on this
+// computer (localTree, the filters screen). Keyboard first: with the focus here, ↑ ↓ J K move,
 // Space ticks, → opens and ← closes a folder; the window's shortcuts on
 // those keys stand down while it has the focus.
 FocusScope {
     id: view
 
     property int current: 0
-    readonly property var rows: folderTree.rows
+    // FolderTree or LocalTree: the same rows and calls.
+    property var tree: folderTree
+    property string loadingText: qsTr("Listing the folders in the cloud…")
+    property string emptyText: qsTr("The cloud has no folders.")
+    readonly property var rows: tree.rows
 
     activeFocusOnTab: true
     implicitHeight: 200
@@ -22,16 +27,16 @@ FocusScope {
         current = Math.max(0, Math.min(rows.length - 1, current + step))
         list.positionViewAtIndex(current, ListView.Contain)
     }
-    function toggleCurrent() { folderTree.toggle(current) }
+    function toggleCurrent() { tree.toggle(current) }
     function expandCurrent() {
         if (current < rows.length && !rows[current].expanded)
-            folderTree.expand(current)
+            tree.expand(current)
     }
     function collapseCurrent() {
         if (current >= rows.length)
             return
         if (rows[current].expanded) {
-            folderTree.collapse(current)
+            tree.collapse(current)
             return
         }
         // On a closed folder, ← goes up to the folder that holds it.
@@ -77,8 +82,7 @@ FocusScope {
     Label {
         anchors.centerIn: parent
         visible: view.rows.length === 0
-        text: folderTree.loading ? qsTr("Listing the folders in the cloud…")
-                                 : folderTree.error !== "" ? "" : qsTr("The cloud has no folders.")
+        text: view.tree.loading ? view.loadingText : view.tree.error !== "" ? "" : view.emptyText
         textFormat: Text.PlainText
         color: "#8a8a94"
     }
@@ -112,11 +116,14 @@ FocusScope {
                     textFormat: Text.PlainText
                     color: "#8a8a94"
                     Layout.preferredWidth: 12
+                    // A file has nothing to open; the cloud tree lists only folders.
+                    opacity: row.modelData.folder === false ? 0 : 1
                     MouseArea {
                         anchors.fill: parent
+                        enabled: row.modelData.folder !== false
                         onClicked: {
                             view.current = row.index
-                            row.modelData.expanded ? folderTree.collapse(row.index) : folderTree.expand(row.index)
+                            row.modelData.expanded ? view.tree.collapse(row.index) : view.tree.expand(row.index)
                         }
                     }
                 }
@@ -140,7 +147,7 @@ FocusScope {
                         anchors.fill: parent
                         onClicked: {
                             view.current = row.index
-                            folderTree.toggle(row.index)
+                            view.tree.toggle(row.index)
                         }
                     }
                 }
@@ -155,6 +162,15 @@ FocusScope {
                 Label {
                     visible: row.modelData.unsupported
                     text: qsTr("name with a line break: always synced")
+                    textFormat: Text.PlainText
+                    font.pixelSize: 11
+                    color: "#ffb74d"
+                }
+                Label {
+                    // rclone skips links, so a cloud file of the same name
+                    // would come down over this one unless it is left out.
+                    visible: row.modelData.link === true
+                    text: qsTr("link: rclone does not sync it")
                     textFormat: Text.PlainText
                     font.pixelSize: 11
                     color: "#ffb74d"

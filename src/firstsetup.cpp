@@ -10,9 +10,11 @@
 #include <QRegularExpression>
 
 #include "controlcommands.h"
+#include "filterrules.h"
 #include "fixcommand.h"
 #include "fixstate.h"
 #include "selectivesync.h"
+#include "settingscommand.h"
 #include "signin.h"
 #include "snapshot.h"
 
@@ -116,13 +118,20 @@ bool writeSetupMark(const QString &appState, const QString &config, const QStrin
 }
 
 QString setUp(const BackendPaths &paths, const TakeoverPaths &takeover, const QString &folder,
-              const QStringList &skipped) {
+              const QStringList &skipped, const std::optional<QByteArray> &imported) {
     if (const QString refusal = setupRefusal(paths, takeover, folder, takeover.rclone); !refusal.isEmpty())
         return refusal;
+    // Filters the user brought from an earlier sync (the setup dialog's
+    // import): rclone must read every rule before anything is written, or the
+    // first dry run would fail with a config already in place.
+    if (imported) {
+        if (const QString refusal = filtersRefusal(takeover.rclone, *imported); !refusal.isEmpty())
+            return refusal;
+    }
     // The cloud folders the user left out in the setup dialog: the first
     // dry run already leaves them in the cloud.
     QString skipError;
-    const std::optional<QByteArray> filters = withSkippedFolders(defaultFilters(), skipped, &skipError);
+    const std::optional<QByteArray> filters = withSkippedFolders(imported.value_or(defaultFilters()), skipped, &skipError);
     if (!filters)
         return skipError;
     // newUserConfig's paths, taken from the ones given: in production they
@@ -171,44 +180,6 @@ QString setUp(const BackendPaths &paths, const TakeoverPaths &takeover, const QS
 
 }  // namespace
 
-QByteArray defaultFilters() {
-    return "# What DriveSync does not sync between your folder and Google Drive.\n"
-           "# rclone bisync filter rules: \"- pattern\" leaves it out. A rule with no \"/\"\n"
-           "# at the start applies in every folder.\n"
-           "# bisync checks this file on every run: after editing it, open DriveSync and\n"
-           "# press F, which rebuilds the base with the new rules. Runs wait until then.\n"
-           "\n"
-           "# ---- Git: the history lives in the remote repository ----\n"
-           "- .git/**\n"
-           "- .git\n"
-           "\n"
-           "# ---- Dependencies and environments, rebuilt with one command ----\n"
-           "- node_modules/**\n"
-           "- .venv/**\n"
-           "- __pycache__/**\n"
-           "- *.pyc\n"
-           "\n"
-           "# ---- Google Docs shortcuts: the document lives in the cloud ----\n"
-           "- *.gdoc\n"
-           "- *.gsheet\n"
-           "- *.gslides\n"
-           "- *.gdraw\n"
-           "- *.gform\n"
-           "- *.gscript\n"
-           "- *.gsite\n"
-           "- *.gmap\n"
-           "- *.gjam\n"
-           "- *.glink\n"
-           "- *.gvid\n"
-           "\n"
-           "# ---- Windows, macOS, office suites and Drive for desktop ----\n"
-           "- desktop.ini\n"
-           "- Thumbs.db\n"
-           "- .DS_Store\n"
-           "- .~lock.*#\n"
-           "- .tmp.drivedownload/**\n"
-           "- .tmp.driveupload/**\n";
-}
 
 SyncConfig newUserConfig(const QString &folder, const QString &home) {
     SyncConfig config;
@@ -314,18 +285,21 @@ int runSetupCommand(const QStringList &arguments, const BackendPaths &paths, con
     // is a folder.
     bool json = false;
     bool valid = true;
-    QString folder;
+    QString folder, filtersFile;
     QStringList skipped;
     for (qsizetype i = 0; i < arguments.size() && valid; ++i) {
         const QString &argument = arguments.at(i);
         if (argument == "--json") {
             json = true;
-        } else if ((argument == "--folder" && folder.isNull()) || argument == "--skip") {
+        } else if ((argument == "--folder" && folder.isNull()) || argument == "--skip"
+                   || (argument == "--filters" && filtersFile.isNull())) {
             valid = i + 1 < arguments.size();
             if (!valid)
                 break;
             if (argument == "--folder")
                 folder = arguments.at(++i);
+            else if (argument == "--filters")
+                filtersFile = arguments.at(++i);
             else
                 skipped << arguments.at(++i);
         } else {
@@ -333,10 +307,21 @@ int runSetupCommand(const QStringList &arguments, const BackendPaths &paths, con
         }
     }
     if (!valid || folder.isNull()) {
-        err << "usage: drive-sync setup --folder <path> [--skip <cloud folder>]... [--json]\n";
+        err << "usage: drive-sync setup --folder <path> [--skip <cloud folder>]... [--filters <file>|-] [--json]\n";
         return 1;
+    }
+    // "-" is standard input: the window hands the imported rules over that
+    // way, so no copy of them is left in a temporary file.
+    std::optional<QByteArray> imported;
+    if (!filtersFile.isNull()) {
+        QFile in;
+        const bool opened = filtersFile == "-" ? in.open(stdin, QIODevice::ReadOnly)
+                                               : (in.setFileName(filtersFile), in.open(QIODevice::ReadOnly));
+        if (!opened)
+            return commandAnswer(json, QString("cannot read %1: %2").arg(filtersFile, in.errorString()), out, err);
+        imported = in.readAll();
     }
     // One setup, fix command or unit step at a time: they all write fix.json.
     const FixLock lock(paths.appState);
-    return commandAnswer(json, setUp(paths, takeover, folder, skipped), out, err);
+    return commandAnswer(json, setUp(paths, takeover, folder, skipped, imported), out, err);
 }

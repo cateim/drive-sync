@@ -43,6 +43,7 @@ struct SyncInputs {
     QString serviceActive;   // ActiveState
     QString serviceResult;   // Result of its latest run
     QDateTime serviceStart;  // ExecMainStartTimestamp of that run
+    QDateTime serviceSkip;   // InactiveEnterTimestamp: a skip has no main start
     QString timerActive;     // drive-sync.timer ActiveState
     QString timerFileState;  // UnitFileState: "enabled" starts it on boot
     bool resyncRunning = false;

@@ -21,6 +21,8 @@ inline constexpr char kSkipBlockEnd[] = "# END DriveSync: cloud folders left out
 
 // A folder path as a literal rclone glob: \ * ? [ ] { } get a backslash.
 QString escapeFilterPath(const QString &path);
+// The other way: a backslash keeps the character after it.
+QString unescapeFilterPath(const QString &escaped);
 
 // The folders the block leaves out, paths relative to the remote's root
 // ("Work/Old"); an empty list when there is no block. nullopt, with the

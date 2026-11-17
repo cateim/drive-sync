@@ -6,6 +6,7 @@
 #include <QTextStream>
 
 #include "backend.h"
+#include "filterrules.h"
 #include "syncconfig.h"
 #include "takeover.h"
 
@@ -15,8 +16,6 @@
 // run are the rest of the setup, and turns the timers on. The fix's mark is
 // written before the timers start, so no tick runs before the base.
 
-// The generic rules a new user starts with; editing them later needs F.
-QByteArray defaultFilters();
 
 // What a new user runs: remote kNewRemoteName, the given folder, the work dir
 // under DriveSync's own state (never ~/.cache), the usual log, and the flags

@@ -81,7 +81,7 @@ Popup {
         else if (page === 1)
             tree.forceActiveFocus()
         else
-            editor.forceActiveFocus()
+            filtersView.focusFirst()
     }
     function setFields() {
         folderField.text = Format.home(settingsController.folder)
@@ -97,8 +97,8 @@ Popup {
         // are still the ones they started from; else they start over from the
         // file, since edits made on an older file would undo the newer one.
         const firstRead = !fieldsSet
-        if (firstRead || editor.text === loadedFilters || settingsController.filters !== loadedFilters)
-            editor.text = settingsController.filters
+        if (firstRead || !filtersView.edited() || settingsController.filters !== loadedFilters)
+            filtersView.load(settingsController.filters, settingsController.folder)
         loadedFilters = settingsController.filters
         fieldsSet = true
         if (treeShown && (firstRead || !folderTree.dirty || !sameList(treeBase, settingsController.skipped)))
@@ -135,8 +135,8 @@ Popup {
         } else if (page === 1) {
             if (treeFromRead && folderTree.dirty && settingsController.skipError === "")
                 settingsController.setSkipped(folderTree.skipped)
-        } else if (editor.text !== settingsController.filters) {
-            settingsController.setFilters(editor.text)
+        } else if (filtersView.edited()) {
+            settingsController.setFilters(filtersView.text())
         }
     }
 
@@ -320,24 +320,17 @@ Popup {
 
                 Label {
                     Layout.fillWidth: true
-                    text: qsTr("rclone filter rules; the first rule that matches wins. Saving checks them with rclone, then the fix rebuilds the base with them: its dry run comes first, and runs wait until it ends. The block at the top belongs to the Cloud folders page.")
+                    text: qsTr("What does not sync. Saving checks the rules with rclone, then the fix rebuilds the base with them: its dry run comes first, and runs wait until it ends.")
                     textFormat: Text.PlainText
                     wrapMode: Text.WordWrap
                     color: "#c4c4cc"
                 }
-                ScrollView {
+                FiltersEditor {
+                    id: filtersView
+                    objectName: "filtersEditor"
                     Layout.fillWidth: true
                     Layout.fillHeight: true
-                    TextArea {
-                        id: editor
-                        objectName: "filtersEditor"
-                        textFormat: TextEdit.PlainText
-                        font.family: "monospace"
-                        font.pixelSize: 12
-                        selectByMouse: true
-                        wrapMode: TextEdit.NoWrap
-                        Keys.onShortcutOverride: (event) => dialog.keepTyping(event)
-                    }
+                    keepTyping: dialog.keepTyping
                 }
             }
         }

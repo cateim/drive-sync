@@ -46,6 +46,8 @@ Popup {
 
     onOpened: {
         field.text = Format.home(setupController.folder)
+        // A new user starts from the default groups; step 4 edits them.
+        filtersPopup.reload()
         if (signedIn && !again) {
             field.forceActiveFocus()
             folderTree.reset([], "drive-sync:")
@@ -65,13 +67,24 @@ Popup {
         }
     }
 
+    // Step 4 in words: how many groups, rules and paths the filters hold.
+    readonly property string filtersSummary: {
+        translator.language
+        let groups = 0
+        for (const p of filterEditor.presets)
+            if (p.ticked)
+                ++groups
+        return qsTr("%1 ready-made groups, %2 rules by name, %3 paths on this computer left out.")
+            .arg(groups).arg(filterEditor.nameRules.length).arg(localTree.excluded.length)
+    }
+
     function accept() {
         if (!canAccept)
             return
         if (again || !signedIn)
             setupController.signIn()
         else
-            setupController.start(field.text.trim(), folderTree.skipped)
+            setupController.start(field.text.trim(), folderTree.skipped, filtersPopup.text())
     }
 
     ColumnLayout {
@@ -190,10 +203,47 @@ Popup {
                   : qsTr("Untick what should stay only in the cloud; Tab reaches the list, Space ticks, → opens a folder. Settings change this later.")
         }
 
-        // 4. Start.
+        // 4. What does not sync: the default rules, or rules brought from an
+        // earlier sync, which a folder already full of files usually needs.
         Label {
             visible: !dialog.again
-            text: qsTr("4. Start")
+            text: qsTr("4. Choose what does not sync")
+            textFormat: Text.PlainText
+            font.weight: Font.DemiBold
+            color: dialog.signedIn ? "#e4e4e8" : "#6f6f7a"
+        }
+        Label {
+            Layout.fillWidth: true
+            visible: !dialog.again
+            textFormat: Text.PlainText
+            wrapMode: Text.WordWrap
+            color: dialog.signedIn ? "#c4c4cc" : "#6f6f7a"
+            text: dialog.filtersSummary
+        }
+        RowLayout {
+            visible: !dialog.again
+            spacing: 4
+            Button {
+                text: qsTr("Choose what does not sync…")
+                flat: true
+                enabled: dialog.phase === "signedIn"
+                focusPolicy: Qt.NoFocus
+                onClicked: filtersPopup.open()
+            }
+            Label { text: "Ctrl+E"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
+        }
+        // Keyboard first: Ctrl+E opens the editor and closes it again.
+        Shortcut {
+            sequence: "Ctrl+E"
+            context: Qt.ApplicationShortcut
+            enabled: dialog.visible && !dialog.again && dialog.phase === "signedIn"
+            onActivated: filtersPopup.visible ? filtersPopup.close() : filtersPopup.open()
+        }
+
+        // 5. Start.
+        Label {
+            visible: !dialog.again
+            text: qsTr("5. Start")
             textFormat: Text.PlainText
             font.weight: Font.DemiBold
             color: dialog.signedIn ? "#e4e4e8" : "#6f6f7a"
@@ -247,6 +297,64 @@ Popup {
                 onClicked: dialog.accept()
             }
             Label { text: "Enter"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
+        }
+    }
+
+    // Step 4's editor, the same one Settings' Filters page shows, over the
+    // dialog: it is too tall to sit inside it.
+    Popup {
+        id: filtersPopup
+        function reload() { editorView.load(filterEditor.defaultText(), field.text) }
+        function text() { return editorView.text() }
+        parent: Overlay.overlay
+        anchors.centerIn: Overlay.overlay
+        width: Math.min(760, Overlay.overlay ? Overlay.overlay.width - 48 : 760)
+        height: Overlay.overlay ? Overlay.overlay.height - 48 : 640
+        modal: true
+        closePolicy: Popup.NoAutoClose
+        padding: 24
+        Material.roundedScale: theme.radius
+        background: Rectangle {
+            color: "#1c1c21"
+            radius: theme.radius
+            border.color: "#2e2e36"
+        }
+        // The tree shows the folder as it stands in step 2 when it opens.
+        onOpened: {
+            localTree.reset(field.text, localTree.excluded)
+            editorView.focusFirst()
+        }
+        ColumnLayout {
+            anchors.fill: parent
+            spacing: 12
+            Label {
+                text: qsTr("What does not sync")
+                textFormat: Text.PlainText
+                font.pixelSize: 18
+                font.weight: Font.DemiBold
+                color: "#f4f4f5"
+            }
+            FiltersEditor {
+                id: editorView
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+            }
+            RowLayout {
+                Layout.alignment: Qt.AlignRight
+                spacing: 8
+                Button {
+                    text: qsTr("Back to the defaults")
+                    flat: true
+                    focusPolicy: Qt.NoFocus
+                    onClicked: filtersPopup.reload()
+                }
+                Button {
+                    text: qsTr("Done")
+                    focusPolicy: Qt.NoFocus
+                    onClicked: filtersPopup.close()
+                }
+                Label { text: "Ctrl+E"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
+            }
         }
     }
 }

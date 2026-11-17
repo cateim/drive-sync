@@ -40,7 +40,10 @@ public:
     // seconds and stopping it halfway would leave a config with no fix.
     Q_INVOKABLE void cancel();
     // skipped: the cloud folders left out from the start (selective sync).
-    Q_INVOKABLE void start(const QString &folder, const QStringList &skipped = {});
+    // filters: the whole filters text built on screen (step 4), sent over
+    // standard input; empty keeps setup's default rules. rclone checks it
+    // before setup writes anything.
+    Q_INVOKABLE void start(const QString &folder, const QStringList &skipped = {}, const QString &filters = {});
 
 signals:
     void changed();
@@ -51,7 +54,7 @@ signals:
     void setupStarted();
 
 private:
-    void run(const QStringList &arguments);
+    void run(const QStringList &arguments, const QByteArray &input = {});
     void finished(const QByteArray &output);
     void stopSignIn(bool thenAbandon);
 

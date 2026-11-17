@@ -44,7 +44,7 @@ void SetupController::cancel() {
     emit changed();
 }
 
-void SetupController::start(const QString &folder, const QStringList &skipped) {
+void SetupController::start(const QString &folder, const QStringList &skipped, const QString &filters) {
     if (m_state != "signedIn")
         return;
     // The dialog shows the home as "~", as the rest of the window does.
@@ -58,7 +58,9 @@ void SetupController::start(const QString &folder, const QStringList &skipped) {
     QStringList arguments{"setup", "--folder", path};
     for (const QString &cloudFolder : skipped)
         arguments << "--skip" << cloudFolder;
-    run(arguments << "--json");
+    if (!filters.isEmpty())
+        arguments << "--filters" << "-";
+    run(arguments << "--json", filters.toUtf8());
 }
 
 void SetupController::stopSignIn(bool thenAbandon) {
@@ -85,7 +87,7 @@ void SetupController::stopSignIn(bool thenAbandon) {
     });
 }
 
-void SetupController::run(const QStringList &arguments) {
+void SetupController::run(const QStringList &arguments, const QByteArray &input) {
     auto *process = new QProcess(this);
     m_child = process;
     // "signin --json" prints {"link": ...} as soon as rclone has its local
@@ -122,6 +124,12 @@ void SetupController::run(const QStringList &arguments) {
     });
     m_output.clear();
     process->start(m_program, arguments);
+    // The imported filters reach setup over standard input, so no copy of
+    // them is left in a temporary file.
+    if (!input.isEmpty()) {
+        process->write(input);
+        process->closeWriteChannel();
+    }
 }
 
 void SetupController::finished(const QByteArray &output) {

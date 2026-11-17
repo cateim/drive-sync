@@ -91,6 +91,9 @@ src/settingscommand.{h,cpp}  `drive-sync settings`: show; interval (config + tim
 src/selectivesync.{h,cpp}  the block of cloud folders left out (escape, parse, rewrite), the tick rules, `drive-sync folders` (rclone lsjson --dirs-only)
 src/settingscontroller.{h,cpp}  the window's side of Settings: a queue of `drive-sync settings ... --json` children
 src/foldertree.{h,cpp}  the cloud folder tree for Settings and first setup, a level at a time through `drive-sync folders`
+src/filterrules.{h,cpp}  the filters as the screen builds them: groups, paths, rules by name, advanced text; read, write, import; defaultFilters()
+src/filtereditor.{h,cpp}  the window's side of the filters screen (groups, rules by name, advanced, import); text() is the whole file
+src/localtree.{h,cpp}  the synced folder on this computer as a tree with ticks (QDir, never follows a link)
 src/takeoversetup.{h,cpp}  the window's side of a takeover, through a child process
 src/pluginsetup.{h,cpp} links the shipped bar widget and enables it through `omarchy plugin`
 src/theme.{h,cpp}       Omarchy accent and Hyprland rounding (from the skill template)
@@ -107,7 +110,8 @@ src/TakeoverBanner.qml  offer to take over (T), or what blocks it; TakeoverDialo
 src/SetupBanner.qml     offer first setup (T) when there is no drive-sync at all
 src/SetupDialog.qml     sign in, the folder, the cloud folders, start; with "again", only the sign-in (I)
 src/SettingsDialog.qml  Settings (,): General, Cloud folders and Filters pages (Ctrl+1/2/3), Ctrl+S saves the page shown
-src/FolderTreeView.qml  the tree with ticks; takes its own keys (arrows, J K, Space, Left, Right) while it has the focus
+src/FolderTreeView.qml  the tree with ticks, over folderTree or localTree; takes its own keys (arrows, J K, Space, Left, Right) while it has the focus
+src/FiltersEditor.qml   what does not sync: groups, the local tree, rules by name, advanced and import; Settings' Filters page and setup's step 4 (Ctrl+E)
 src/FixBanner.qml       offer to fix (F) after lost listings, out of sync or changed filters
 src/FixDialog.qml       the fix's start, the dry run to confirm (Enter) and a stopped step (retry; X cancels)
 src/FixQuestions.qml    the files that changed in the cloud during the base run: C cloud, L notebook, Enter sends
@@ -130,7 +134,7 @@ assets/images/          README pictures: window-*.png from bin/harness over a ma
 
 ```sh
 bin/build            # about 30 s from clean
-bin/test             # 289 cases, about 24 s (ten run real rclone on temp folders)
+bin/test             # 304 cases, about 24 s (twelve run real rclone on temp folders)
 bin/install          # needs sudo (pacman -U); run it in a real terminal
 bin/harness --scenario running --clock "h:mm AP" --out build/shot.png   # the window offscreen, made-up data; options atop tools/harness/harness.cpp
 makepkg -f           # from pkgbuild/, with BUILDDIR and PKGDEST set as in bin/install, to check packaging without sudo
@@ -164,6 +168,9 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   the log in the last 150 s (the log is watched, systemd is only polled).
 - systemd's `Result` counts only when no log run started after the service's
   `ExecMainStartTimestamp`: `drive-sync.sh resync` runs rclone outside the unit.
+  A skip (`exec-condition`) has no main start, so it is the headline only
+  when no log run started after its `InactiveEnterTimestamp`: the fix's
+  final run, outside the unit, comes after the ticks it held back.
 - Failure causes match `drive-sync-aviso`: lost listings, out of sync, else the
   first error that is not the generic "Bisync aborted" line.
 - The JSON (`snapshotToJson`, version 2) always has the same 20 keys (version
@@ -474,6 +481,28 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   named after the folder itself would nest the tree in itself (a crash seen
   with a wrong fake). `drive-sync folders` passes SIGTERM to its rclone and
   sets PR_SET_PDEATHSIG on it; the window stops a listing with SIGTERM.
+- **The filters screen (step 4c) owns three blocks at the end of the
+  filters file**: `# BEGIN DriveSync: ready-made groups` (a `# group: <id>`
+  line before each group's exact rules), `paths on this computer` and
+  `rules by name`, written in that order after every other byte. rclone
+  takes the first match, so text written by hand (the advanced part, the
+  cloud-folders block at the top included) keeps winning over them. A block
+  with a line the screen never writes is read as advanced text, whole, so
+  nothing is dropped. An import moves a plain line into the screen only
+  when the text has no `+` or `!` rule, since moving an exclude below an
+  include could change what matches first. `defaultFilters()` is the
+  default groups' block under a short header. The blocks are read only when
+  nothing but blank lines follows them; text after one (a hand edit) makes
+  the whole file advanced text, so nothing moves. The Filters page saves
+  only when `FilterEditor::edited()` (by meaning, never by bytes) says so,
+  since a save starts a resync. Values are never trimmed except where they
+  are typed: a tree path may begin or end with a space. rclone 1.75.2 drops
+  the spaces at the end of a rule line, escaped or not (tried 2026-11-17),
+  so a final space is written as `[ ]`; a name with a line break cannot be
+  a rule, and the local tree shows it always synced.
+- **The harness sets HOME to its temp folder** (unless `--real`), with a
+  made-up synced folder and a link in it: the filters screen lists the
+  folder in the setup field, and `~/Drive` must never be this machine's.
 - moc also breaks on JSON in raw string literals inside a test macro ("missing
   ')' in macro usage" at the end of the file): build test JSON with
   `QJsonObject`.

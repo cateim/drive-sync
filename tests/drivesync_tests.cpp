@@ -37,8 +37,11 @@
 #include "legacymigration.h"
 #include "fixcommand.h"
 #include "firstsetup.h"
+#include "filtereditor.h"
+#include "filterrules.h"
 #include "fixstate.h"
 #include "listingdiff.h"
+#include "localtree.h"
 #include "notifier.h"
 #include "oauthclient.h"
 #include "pausestate.h"
@@ -704,6 +707,12 @@ case "$1 $2" in
   "config update") exit "$(cat '%1/update-exit' 2>/dev/null || echo 0)" ;;
   "config dump") cat '%1/dump' 2>/dev/null || echo '{}' ;;
   "config delete") exit 0 ;;
+  "lsf "*)
+    if [ -f '%1/lsf-refuses' ]; then
+      echo 'CRITICAL: Failed to initialise global options: failed to reload "filter" options: malformed rule "Photos"' >&2
+      exit 1
+    fi
+    exit 0 ;;
   "lsjson "*)
     echo '[]'
     if [ -f '%1/lsjson-fails-once' ]; then rm '%1/lsjson-fails-once'; exit 1; fi
@@ -850,7 +859,9 @@ case "$*" in
     echo $$ > '%1/child.pid'
     trap 'kill $rc; echo cleaned >> %1/calls.log; exit 1' TERM INT
     wait $rc ;;
-  "setup "*) cat '%1/setup-answer' ;;
+  "setup "*)
+    case "$*" in *"--filters -"*) cat > '%1/setup-stdin' ;; esac
+    cat '%1/setup-answer' ;;
 esac
 exit 0
 )sh").arg(dir).toUtf8());
@@ -2265,6 +2276,24 @@ private slots:
         QCOMPARE(after.summary.status, QString("skipped"));
         QVERIFY(!after.paused);
         QVERIFY(after.canSyncNow);
+    }
+
+    void skipBeforeTheLastRunIsNoLongerNews()
+    {
+        // Seen on 2026-11-17: a tick skipped while the fix held the runs, then
+        // the fix's own final run succeeded, and "skipped" stayed on until the
+        // next tick. A skip has no ExecMainStartTimestamp; its time is
+        // InactiveEnterTimestamp.
+        const QDateTime now(QDate(2026, 11, 7), QTime(16, 0, 0), QTimeZone::UTC);
+        SnapshotSources src = idleSources(successfulRun(now.toLocalTime().addSecs(-600), 50), now);
+        src.service["Result"] = "exec-condition";
+        src.service.remove("ExecMainStartTimestamp");
+        src.service["InactiveEnterTimestamp"] = QString("@%1").arg(now.addSecs(-900).toSecsSinceEpoch());
+        QCOMPARE(buildSnapshot(src).summary.status, QString("ok"));
+
+        // A skip after that run is still the news.
+        src.service["InactiveEnterTimestamp"] = QString("@%1").arg(now.addSecs(-60).toSecsSinceEpoch());
+        QCOMPARE(buildSnapshot(src).summary.status, QString("skipped"));
     }
     void syncStartsTheServiceWithoutBlocking()
     {
@@ -6742,6 +6771,11 @@ private slots:
                           .toJson(QJsonDocument::Compact)));
         FolderTree tree(dir.filePath("drive-sync"));
         engine.rootContext()->setContextProperty("folderTree", &tree);
+        // Step 4's filters editor, over the same made-up folder.
+        LocalTree localTree;
+        FilterEditor filterEditor;
+        engine.rootContext()->setContextProperty("localTree", &localTree);
+        engine.rootContext()->setContextProperty("filterEditor", &filterEditor);
         QTest::failOnWarning(QRegularExpression("ReferenceError"));
         QQmlComponent component(&engine);
         component.setData(QString("import QtQuick\nimport QtQuick.Controls\nimport \"%1\"\n"
@@ -7514,6 +7548,300 @@ esac
         const QByteArray filters = readBytes(s.takeover.appConfigDir + "/filters.txt");
         QCOMPARE(*skippedFolders(filters, &error), (QStringList{"Old Stuff", "Photos"}));
         QVERIFY(filters.endsWith(defaultFilters()));
+    }
+    void filterModelRoundTrips()
+    {
+        FilterModel model;
+        model.presets = {"git", "python"};
+        model.localPaths = {"Projetos/velho/", "notas soltas.txt"};
+        model.nameRules = {{"name", "a*b"}, {"folder", "build"}, {"extension", "log"}, {"path", "Fotos/2019/"}};
+        model.advanced = "# mine\n+ /keep/**\n";
+        const QByteArray bytes = writeFilterModel(model);
+        const FilterModel back = readFilterModel(bytes);
+        QCOMPARE(back.presets, model.presets);
+        QCOMPARE(back.localPaths, model.localPaths);
+        QCOMPARE(back.nameRules, model.nameRules);
+        QCOMPARE(back.advanced, model.advanced);
+        QVERIFY(bytes.startsWith(model.advanced));
+        QVERIFY(bytes.contains("- a\\*b\n"));
+        QVERIFY(bytes.contains("- build/**\n"));
+        QVERIFY(bytes.contains("- *.log\n"));
+        QVERIFY(bytes.contains("- /Fotos/2019/**\n"));
+        QVERIFY(bytes.contains("- /notas soltas.txt\n"));
+    }
+    void filterModelKeepsTextItDidNotWrite()
+    {
+        // No blocks: everything is advanced, and writing it back changes no byte.
+        const QByteArray text = "# BEGIN DriveSync: cloud folders left out of this computer\n- /Fotos/**\n"
+                                "# END DriveSync: cloud folders left out of this computer\n\n- *.tmp\n";
+        QCOMPARE(readFilterModel(text).advanced, text);
+        QCOMPARE(writeFilterModel(readFilterModel(text)), text);
+        // A block with a line the screen never writes stays text, whole.
+        const QByteArray edited = "# BEGIN DriveSync: rules by name\n+ keep\n# END DriveSync: rules by name\n";
+        const FilterModel model = readFilterModel(edited);
+        QVERIFY(model.nameRules.isEmpty());
+        QCOMPARE(model.advanced, edited);
+    }
+    void filterModelRefusesUnwritableRules()
+    {
+        QCOMPARE(nameRuleLine({"name", "a/b"}), QString());
+        QCOMPARE(nameRuleLine({"extension", ""}), QString());
+        QCOMPARE(nameRuleLine({"folder", "x\ny"}), QString());
+        QCOMPARE(nameRuleLine({"extension", ".PDF"}), QString("- *.PDF"));
+        QCOMPARE(nameRuleLine({"path", "/Docs/"}), QString("- /Docs/**"));
+    }
+    void importedFiltersLightUpWhatTheScreenShows()
+    {
+        QByteArray old = "# old sync\n- .git/**\n- .git\n- *.log\n- /Old/**\n- /GitHub/**/build/**\n- tmp/**\n";
+        for (const FilterPreset &preset : filterPresets())
+            if (preset.id == "googleDocs")
+                old += preset.rules.join('\n').toUtf8() + '\n';
+        const FilterModel model = importedFilterModel(old);
+        QCOMPARE(model.presets, (QStringList{"git", "googleDocs"}));
+        QCOMPARE(model.nameRules, (QList<NameRule>{{"extension", "log"}, {"folder", "tmp"}}));
+        QCOMPARE(model.localPaths, QStringList{"Old/"});
+        QCOMPARE(model.advanced, QByteArray("# old sync\n- /GitHub/**/build/**\n"));
+        // An include anywhere: nothing moves.
+        const QByteArray withInclude = "+ /Old/keep\n" + old;
+        const FilterModel kept = importedFilterModel(withInclude);
+        QVERIFY(kept.presets.isEmpty() && kept.localPaths.isEmpty() && kept.nameRules.isEmpty());
+        QCOMPARE(kept.advanced, withInclude);
+    }
+    void rcloneReadsTheBuiltFilters()
+    {
+        QTemporaryDir dir;
+        for (const char *file : {"keep.txt", "a.log", "build/out.o", "Docs/x.txt", "Docs/y.txt", "deep/build/z.o",
+                                 "deep/ok.txt", "solo.txt"}) {
+            const QString path = dir.filePath("tree/") + file;
+            QVERIFY(QDir().mkpath(QFileInfo(path).path()));
+            QVERIFY(write(path, "x"));
+        }
+        FilterModel model;
+        model.localPaths = {"Docs/", "solo.txt"};
+        model.nameRules = {{"extension", "log"}, {"folder", "build"}};
+        QVERIFY(write(dir.filePath("filters.txt"), writeFilterModel(model)));
+        QByteArray listed;
+        QString error;
+        QVERIFY2(runProcess("rclone", {"lsf", "-R", "--files-only", dir.filePath("tree"), "--filter-from",
+                                       dir.filePath("filters.txt")},
+                            60000, &listed, &error),
+                 qPrintable(error));
+        QStringList files = QString::fromUtf8(listed).split('\n', Qt::SkipEmptyParts);
+        files.sort();
+        QCOMPARE(files, (QStringList{"deep/ok.txt", "keep.txt"}));
+    }
+    void localTreeLeavesPathsOut()
+    {
+        QTemporaryDir dir;
+        const QString root = dir.filePath("Drive");
+        QVERIFY(QDir().mkpath(root + "/Repo/build"));
+        QVERIFY(write(root + "/Repo/build/out.o", "x"));
+        QVERIFY(write(root + "/Repo/main.c", "x"));
+        QVERIFY(write(root + "/notes.txt", "x"));
+        QVERIFY(QFile::link(root + "/notes.txt", root + "/link.txt"));
+        LocalTree tree;
+        tree.reset(root, {"Repo/build/"});
+        auto row = [&](const QString &path) {
+            for (const QVariant &r : tree.rows())
+                if (r.toMap().value("path").toString() == path)
+                    return r.toMap();
+            return QVariantMap();
+        };
+        auto index = [&](const QString &path) {
+            const QVariantList rows = tree.rows();
+            for (int i = 0; i < rows.size(); ++i)
+                if (rows.at(i).toMap().value("path").toString() == path)
+                    return i;
+            return -1;
+        };
+        // Folders first, then files, each by name.
+        QCOMPARE(tree.rows().size(), 3);
+        QCOMPARE(tree.rows().first().toMap().value("path").toString(), QString("Repo/"));
+        QVERIFY(row("link.txt").value("link").toBool());
+        QVERIFY(!tree.dirty());
+        tree.expand(index("Repo/"));
+        QVERIFY(!row("Repo/build/").value("ticked").toBool());
+        QVERIFY(row("Repo/main.c").value("ticked").toBool());
+        // Leaving out a folder takes what was left out inside it with it.
+        tree.toggle(index("Repo/"));
+        QCOMPARE(tree.excluded(), QStringList{"Repo/"});
+        QVERIFY(!row("Repo/main.c").value("tickable").toBool());
+        tree.toggle(index("link.txt"));
+        QCOMPARE(tree.excluded(), (QStringList{"Repo/", "link.txt"}));
+        QVERIFY(tree.dirty());
+        tree.toggle(index("Repo/"));
+        QCOMPARE(tree.excluded(), QStringList{"link.txt"});
+        // A folder that is not there yet: no rows, no error.
+        tree.reset(dir.filePath("Nope"), {});
+        QVERIFY(tree.rows().isEmpty());
+        QCOMPARE(tree.error(), QString());
+    }
+    void filterEditorBuildsTheText()
+    {
+        FilterEditor editor;
+        editor.load(QString::fromUtf8(defaultFilters()));
+        QStringList ticked;
+        for (const QVariant &p : editor.presets())
+            if (p.toMap().value("ticked").toBool())
+                ticked << p.toMap().value("id").toString();
+        QCOMPARE(ticked, defaultPresetIds());
+        QCOMPARE(editor.addNameRule("folder", "build"), QString());
+        QVERIFY(!editor.addNameRule("name", "a/b").isEmpty());
+        QVERIFY(!editor.addNameRule("folder", "build").isEmpty());  // already there
+        QCOMPARE(editor.nameRules().size(), 1);
+        editor.setPreset("git", false);
+        editor.setAdvanced("# mine\n");
+        const FilterModel model = readFilterModel(editor.text({"Old/"}).toUtf8());
+        QVERIFY(!model.presets.contains("git"));
+        QCOMPARE(model.nameRules, (QList<NameRule>{{"folder", "build"}}));
+        QCOMPARE(model.localPaths, QStringList{"Old/"});
+        QCOMPARE(model.advanced, QByteArray("# mine\n"));
+        editor.removeNameRule(0);
+        QVERIFY(editor.nameRules().isEmpty());
+        // An old file lights up the groups and lists its rules.
+        QTemporaryDir dir;
+        QVERIFY(write(dir.filePath("old.txt"), "- .git/**\n- .git\n- *.iso\n- /Old/**\n"));
+        QSignalSpy loaded(&editor, &FilterEditor::loaded);
+        QCOMPARE(editor.importFile(dir.filePath("old.txt")), QString());
+        QCOMPARE(loaded.size(), 1);
+        QCOMPARE(editor.localPaths(), QStringList{"Old/"});
+        QCOMPARE(editor.nameRules().first().toMap().value("value").toString(), QString("iso"));
+        QVERIFY(!editor.importFile(dir.filePath("missing.txt")).isEmpty());
+    }
+    void filterModelIsStableOnTheFilesItMeets()
+    {
+        // What setup writes, with cloud folders left out on top.
+        QString error;
+        const QByteArray setupFile = *withSkippedFolders(defaultFilters(), {"Photos"}, &error);
+        QCOMPARE(writeFilterModel(readFilterModel(setupFile)), setupFile);
+        // An import written once is stable from then on.
+        const QByteArray once =
+            writeFilterModel(importedFilterModel("# old\n- .git/**\n- .git\n- *.iso\n- /Old/**\n- /x/**/y/**\n"));
+        QCOMPARE(writeFilterModel(readFilterModel(once)), once);
+        // Text after DriveSync's blocks: they stay text, so nothing moves and a
+        // "+" rule written after them keeps losing.
+        const QByteArray after = defaultFilters() + "+ /keep/**\n";
+        const FilterModel model = readFilterModel(after);
+        QVERIFY(model.presets.isEmpty());
+        QCOMPARE(model.advanced, after);
+        QCOMPARE(writeFilterModel(model), after);
+    }
+    void localPathsKeepTheirSpaces()
+    {
+        QTemporaryDir dir;
+        for (const char *file : {" lead.txt", "trail.txt ", "two  ", "dir trail /b", " dir lead/a", "keep.txt"}) {
+            const QString path = dir.filePath("tree/") + file;
+            QVERIFY(QDir().mkpath(QFileInfo(path).path()));
+            QVERIFY(write(path, "x"));
+        }
+        FilterModel model;
+        model.localPaths = {" lead.txt", "trail.txt ", "two  ", "dir trail /", " dir lead/"};
+        const QByteArray filters = writeFilterModel(model);
+        QCOMPARE(readFilterModel(filters).localPaths, model.localPaths);
+        QVERIFY(write(dir.filePath("filters.txt"), filters));
+        QByteArray listed;
+        QString error;
+        QVERIFY2(runProcess("rclone", {"lsf", "-R", "--files-only", dir.filePath("tree"), "--filter-from",
+                                       dir.filePath("filters.txt")},
+                            60000, &listed, &error),
+                 qPrintable(error));
+        QCOMPARE(QString::fromUtf8(listed), QString("keep.txt\n"));
+    }
+    void localTreeShowsWhatIsLeftOut()
+    {
+        QTemporaryDir dir;
+        const QString root = dir.filePath("Drive");
+        QVERIFY(QDir().mkpath(root));
+        QVERIFY(write(root + "/a\nb", "x"));
+        QVERIFY(write(root + "/here.txt", "x"));
+        LocalTree tree;
+        tree.reset(root, {"here.txt", "gone/"});
+        // A name with a line break cannot be a rule: shown, never ticked off.
+        const QVariantMap odd = tree.rows().first().toMap();
+        QCOMPARE(odd.value("path").toString(), QString("a\nb"));
+        QVERIFY(odd.value("unsupported").toBool());
+        QVERIFY(!odd.value("tickable").toBool());
+        tree.toggle(0);
+        QCOMPARE(tree.excluded(), (QStringList{"here.txt", "gone/"}));
+        // The flat list says which ones are not on this computer, and drops one.
+        QVERIFY(tree.exists("here.txt"));
+        QVERIFY(!tree.exists("gone/"));
+        tree.remove("gone/");
+        QCOMPARE(tree.excluded(), QStringList{"here.txt"});
+    }
+    void filterEditorSeesNoChangeWithoutEdits()
+    {
+        QString error;
+        const QString file = QString::fromUtf8(*withSkippedFolders(defaultFilters(), {"Photos"}, &error));
+        FilterEditor editor;
+        editor.load(file);
+        QVERIFY(!editor.edited(editor.localPaths()));
+        QCOMPARE(editor.text(editor.localPaths()), file);
+        editor.setPreset("builds", true);
+        QVERIFY(editor.edited(editor.localPaths()));
+        editor.setPreset("builds", false);
+        QVERIFY(!editor.edited(editor.localPaths()));
+        QVERIFY(editor.edited({"Old/"}));
+    }
+    void setupImportsTheFiltersItIsGiven()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        const QByteArray imported = "# from the old sync\n- /GitHub/**/build/**\n- /GitHub/**/venv/**\n";
+        QVERIFY(write(dir.filePath("old-filters.txt"), imported));
+        CommandResult r;
+        QTextStream out(&r.out);
+        QTextStream err(&r.err);
+        r.code = runSetupCommand({"--folder", s.folder, "--skip", "Photos", "--filters", dir.filePath("old-filters.txt"),
+                                  "--json"},
+                                 s.paths, s.takeover, out, err);
+        out.flush();
+        QVERIFY2(r.code == 0, qPrintable(r.out + r.err));
+        QString error;
+        const QByteArray filters = readBytes(s.takeover.appConfigDir + "/filters.txt");
+        QCOMPARE(*skippedFolders(filters, &error), QStringList{"Photos"});
+        QVERIFY(filters.endsWith(imported));
+        QVERIFY(!filters.contains(defaultFilters()));
+    }
+    void setupRefusesFiltersRcloneCannotRead()
+    {
+        QTemporaryDir dir;
+        const SetupFixture s = makeSetupFixture(dir.path());
+        QVERIFY(write(dir.filePath("lsf-refuses"), ""));
+        QVERIFY(write(dir.filePath("old-filters.txt"), "Photos/**\n"));
+        CommandResult r;
+        QTextStream out(&r.out);
+        QTextStream err(&r.err);
+        r.code = runSetupCommand({"--folder", s.folder, "--filters", dir.filePath("old-filters.txt"), "--json"}, s.paths,
+                                 s.takeover, out, err);
+        out.flush();
+        QCOMPARE(r.code, 1);
+        QVERIFY2(r.out.contains("rclone cannot read these filters: malformed rule"), qPrintable(r.out));
+        QVERIFY(!QFile::exists(s.takeover.appConfigDir + "/filters.txt"));
+        QVERIFY(!QFile::exists(s.paths.config));
+        QVERIFY(!fixPresent(s.paths.appState));
+    }
+    void setupControllerHandsTheFiltersOver()
+    {
+        QTemporaryDir dir;
+        SetupController controller(fakeSetupDrivesync(dir.path()), dir.filePath("Drive"));
+        QSignalSpy started(&controller, &SetupController::setupStarted);
+        QVERIFY(write(dir.filePath("signin-answer"), R"({"ok":true,"error":""})"));
+        QVERIFY(write(dir.filePath("setup-answer"), R"({"ok":true,"error":""})"));
+        controller.signIn();
+        QTRY_COMPARE(controller.state(), QString("signedIn"));
+        // The text built on screen goes over standard input.
+        const QString built = "# mine\n- /GitHub/**/build/**\n";
+        controller.start(dir.filePath("Drive"), {}, built);
+        QTRY_COMPARE(started.size(), 1);
+        QVERIFY(calls(dir.path()).contains("setup --folder " + dir.filePath("Drive") + " --filters - --json"));
+        QCOMPARE(readBytes(dir.filePath("setup-stdin")), built.toUtf8());
+        // No text: setup's own defaults, and no --filters.
+        controller.signIn();
+        QTRY_COMPARE(controller.state(), QString("signedIn"));
+        controller.start(dir.filePath("Drive"));
+        QTRY_COMPARE(started.size(), 2);
+        QVERIFY(calls(dir.path()).contains("setup --folder " + dir.filePath("Drive") + " --json"));
     }
     void settingsControllerFollowsTheCommands()
     {

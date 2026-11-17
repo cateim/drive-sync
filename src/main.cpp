@@ -23,7 +23,9 @@
 #include "selectivesync.h"
 #include "settingscommand.h"
 #include "settingscontroller.h"
+#include "filtereditor.h"
 #include "foldertree.h"
+#include "localtree.h"
 #include "setupcontroller.h"
 #include "signin.h"
 #include "statuscommand.h"
@@ -146,6 +148,9 @@ int main(int argc, char *argv[]) {
     // Settings and the tree of cloud folders, also through child processes.
     SettingsController settingsController(QCoreApplication::applicationFilePath());
     FolderTree folderTree(QCoreApplication::applicationFilePath());
+    // The filters screen: the synced folder on this computer, and the rules.
+    LocalTree localTree;
+    FilterEditor filterEditor;
 
     QQmlApplicationEngine engine;
     QObject::connect(&translator, &Translator::changed, &engine, &QQmlEngine::retranslate);
@@ -158,6 +163,8 @@ int main(int argc, char *argv[]) {
     engine.rootContext()->setContextProperty("setupController", &setupController);
     engine.rootContext()->setContextProperty("settingsController", &settingsController);
     engine.rootContext()->setContextProperty("folderTree", &folderTree);
+    engine.rootContext()->setContextProperty("localTree", &localTree);
+    engine.rootContext()->setContextProperty("filterEditor", &filterEditor);
     engine.load(QUrl("qrc:/Main.qml"));
     if (engine.rootObjects().isEmpty())
         return 1;
