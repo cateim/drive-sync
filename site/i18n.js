@@ -11,10 +11,9 @@ const PT = {
   "nav.home": "Início",
   "foot.text": `
           O DriveSync é software livre sob a licença MIT, feito por
-          <a href="https://github.com/CaTeIM">Gustavo Cateim</a>.
-          <a href="privacy.html">Política de privacidade</a>.
-          <a href="terms.html">Termos de serviço</a>. Sem vínculo com o Google. Google Drive é
-          uma marca do Google LLC.`,
+          <a href="https://github.com/CaTeIM">Gustavo Cateim</a>.<br />
+          <a href="privacy.html">Política de privacidade</a> · <a href="terms.html">Termos de serviço</a><br />
+          Sem vínculo com o Google. Google Drive é uma marca do Google LLC.`,
 
   // ---- Home ----
   "home.title": "DriveSync",

@@ -165,6 +165,22 @@ h2 {
 main {
   padding-bottom: 48px;
 }
+/* Running text is justified (owner's choice), with hyphens to keep the gaps
+   small. On a phone a line holds too few words, and a long URL in code left
+   gaps wider than the words, so there it stays flush left. */
+main p,
+.hero .sub,
+main li {
+  text-align: justify;
+  hyphens: auto;
+}
+@media (max-width: 560px) {
+  main p,
+  .hero .sub,
+  main li {
+    text-align: left;
+  }
+}
 
 /* ---- Footer ---- */
 footer {
@@ -172,6 +188,7 @@ footer {
   color: var(--muted);
   font-size: 14px;
   padding: 20px 0 32px;
+  line-height: 1.8;
 }
 
 @media (max-width: 560px) {
