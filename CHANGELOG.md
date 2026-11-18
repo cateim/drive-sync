@@ -58,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### 🐛 Fixed
 
+- A resync no longer shows as "No changes": rclone writes no change summary in a resync, so its copies are now counted from its "Copied" lines, each way.
 - After a fix ends, the window and the bar no longer say the last run was skipped: a tick the fix held back stayed the headline until the next tick, up to 15 minutes, although the fix's own final run had synced after it.
 - The shortcuts card no longer runs off the top and bottom of a short window: it scrolls (also with the arrows and `J` `K`) when it is taller than the window.
 - Clock times show 12 or 24 hours like the clock on the Omarchy bar, in the window, the bar panel and the notifications, and follow a right click on that clock. The window showed AM/PM whenever Omarchy was in English, even with the bar clock on 24 hours, and the panel always showed 24 hours.

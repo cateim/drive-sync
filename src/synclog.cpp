@@ -141,6 +141,24 @@ void addChange(SyncRun &run, const QString &tag, const QString &what, const QStr
         ++run.changesOmitted;
 }
 
+// "<path>: Copied (new)" or "(replaced existing)" during a resync. The
+// side is where the file came from, as bisync's own change lines name it.
+void addResyncCopy(SyncRun &run, const QString &from, const QString &message) {
+    static const QString added = QStringLiteral(": Copied (new)");
+    static const QString replaced = QStringLiteral(": Copied (replaced existing)");
+    const bool isNew = message.endsWith(added);
+    if (!isNew && !message.endsWith(replaced))
+        return;
+    const QString path = message.left(message.size() - (isNew ? added : replaced).size());
+    SyncCounts &counts = from == "Path1" ? run.cloud : run.notebook;
+    (isNew ? counts.added : counts.modified) += 1;
+    const QString side = from == "Path1" ? "cloud" : "notebook";
+    if (run.changes.size() < kMaxChanges)
+        run.changes.append({side, isNew ? "new" : "modified", path});
+    else
+        ++run.changesOmitted;
+}
+
 }  // namespace
 
 bool isTokenError(const QString &error) {
@@ -160,6 +178,10 @@ QList<SyncRun> SyncLog::parse(const QString &text, int maxRuns, bool startsMidwa
     bool open = false;
     bool skipping = startsMidway;
     QString openStamp;  // The newest line of the open run, turned into lastSeen when needed.
+    // The side a resync copies from ("Path1" or "Path2"): rclone 1.75.2
+    // writes no "PathN: N changes" summary in a resync, only one "Copied"
+    // line per file after the line that names the direction.
+    QString resyncFrom;
     QHash<QDate, int> offsets;
 
     for (QString line : text.split('\n')) {
@@ -195,6 +217,7 @@ QList<SyncRun> SyncLog::parse(const QString &text, int maxRuns, bool startsMidwa
             runs.append(run);
             open = true;
             skipping = false;
+            resyncFrom.clear();
             continue;
         }
         if (skipping)
@@ -242,6 +265,8 @@ QList<SyncRun> SyncLog::parse(const QString &text, int maxRuns, bool startsMidwa
         } else if (message.startsWith("Copying Path2 files to Path1") || message.contains("Resync is copying files")) {
             run.resync = true;
             run.phase = "applying";
+            if (const auto change = kChange.match(message); change.hasMatch())
+                resyncFrom = change.captured(1);
         } else if (message.contains("updating listings", Qt::CaseInsensitive) || message.startsWith("Validating listings")) {
             run.phase = "updating";
         } else if (message.startsWith(QLatin1String("Path")) && message.contains(QLatin1String(" changes"))) {
@@ -255,6 +280,8 @@ QList<SyncRun> SyncLog::parse(const QString &text, int maxRuns, bool startsMidwa
         } else if (!failure && message.startsWith(QLatin1String("- "))) {
             if (const auto change = kChange.match(message); change.hasMatch())
                 addChange(run, change.captured(1), change.captured(2).trimmed(), change.captured(3));
+        } else if (run.resync && !resyncFrom.isEmpty() && !failure) {
+            addResyncCopy(run, resyncFrom, message);
         }
     }
 

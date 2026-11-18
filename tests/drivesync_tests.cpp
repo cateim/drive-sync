@@ -1164,6 +1164,47 @@ private slots:
         QCOMPARE(runs.first().changesOmitted, 5);
     }
 
+    // rclone 1.75.2 writes no "Path1: N changes" summary in a resync, only
+    // one "Copied" line per file after the line that names the direction
+    // (seen in the owner's log, 2026-11-17 15:21: 193 copies, "No changes").
+    void countsTheCopiesOfAResync()
+    {
+        const QDateTime start(QDate(2026, 11, 17), QTime(15, 21, 49));
+        QString log;
+        log += line(start, "INFO", R"(Synching Path1 "drive-sync{x}:/" with Path2 "/home/someone/Drive/")");
+        log += line(start, "INFO", "Copying Path2 files to Path1");
+        log += line(start, "INFO", "- Path2             Resync is copying files to                  - Path1");
+        log += line(start.addSecs(30), "INFO", "Notes/new.md: Copied (new)");
+        log += line(start.addSecs(31), "INFO", "Notes/a: b.md: Copied (new)");
+        log += line(start.addSecs(32), "INFO", "Notes/old.md: Copied (replaced existing)");
+        log += line(start.addSecs(33), "INFO", "Notes/time.md: Updated modification time in destination");
+        log += line(start.addSecs(190), "INFO", "- Path1             Resync is copying files to                  - Path2");
+        log += line(start.addSecs(200), "INFO", "Photos/beach.jpg: Copied (new)");
+        log += line(start.addSecs(330), "INFO", "Resync updating listings");
+        log += line(start.addSecs(340), "INFO", "Bisync successful");
+        // A normal run copies too, but its summary lines count it already.
+        QString normal = successfulRun(start.addSecs(900), 60);
+        normal.insert(normal.indexOf("Updating listings") - 28,
+                      line(start.addSecs(950), "INFO", "GitHub/app/README.md: Copied (new)"));
+        log += normal;
+        const auto runs = SyncLog::parse(log);
+        QCOMPARE(runs.size(), 2);
+        const SyncRun &resync = runs.first();
+        QVERIFY(resync.resync);
+        QCOMPARE(resync.notebook.added, 2);
+        QCOMPARE(resync.notebook.modified, 1);
+        QCOMPARE(resync.cloud.added, 1);
+        QCOMPARE(resync.cloud.modified, 0);
+        QCOMPARE(resync.changes.size(), 4);
+        QCOMPARE(resync.changes.at(1).path, QString("Notes/a: b.md"));
+        QCOMPARE(resync.changes.at(1).side, QString("notebook"));
+        QCOMPARE(resync.changes.at(2).kind, QString("modified"));
+        QCOMPARE(resync.changes.at(3).side, QString("cloud"));
+        QVERIFY(!runs.last().resync);
+        QCOMPARE(runs.last().notebook.added, 1);
+        QCOMPARE(runs.last().changes.size(), 2);
+    }
+
     void keepsTheNewestRuns()
     {
         QString log;

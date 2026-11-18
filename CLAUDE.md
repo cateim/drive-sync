@@ -171,6 +171,9 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   A skip (`exec-condition`) has no main start, so it is the headline only
   when no log run started after its `InactiveEnterTimestamp`: the fix's
   final run, outside the unit, comes after the ticks it held back.
+- A resync (rclone 1.75.2) writes no "PathN: N changes" summary: its counts
+  come from the "Copied (new)" and "Copied (replaced existing)" lines after
+  "- PathN  Resync is copying files to  - PathM", which names the side.
 - Failure causes match `drive-sync-aviso`: lost listings, out of sync, else the
   first error that is not the generic "Bisync aborted" line.
 - The JSON (`snapshotToJson`, version 2) always has the same 20 keys (version
