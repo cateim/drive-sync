@@ -58,28 +58,20 @@ Rectangle {
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
+            ToolTip.visible: hovered
+            ToolTip.delay: 600
+            ToolTip.text: "B"
             onClicked: pluginSetup.accept()
-        }
-        Label {
-            visible: banner.offering
-            text: "B"
-            textFormat: Text.PlainText
-            color: "#6f6f7a"
-            font.pixelSize: 12
         }
         Button {
             visible: banner.dismissable
             text: banner.offering ? qsTr("No, thanks") : qsTr("Don't show again")
             flat: true
             focusPolicy: Qt.NoFocus
+            ToolTip.visible: hovered
+            ToolTip.delay: 600
+            ToolTip.text: "N"
             onClicked: pluginSetup.decline()
-        }
-        Label {
-            visible: banner.dismissable
-            text: "N"
-            textFormat: Text.PlainText
-            color: "#6f6f7a"
-            font.pixelSize: 12
         }
     }
 }

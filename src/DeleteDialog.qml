@@ -143,9 +143,11 @@ Popup {
                 text: qsTr("Close")
                 flat: true
                 focusPolicy: Qt.NoFocus
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Esc"
                 onClicked: dialog.close()
             }
-            Label { text: "Esc"; color: "#6f6f7a"; font.pixelSize: 12 }
             Button {
                 text: qsTr("Let one run delete them")
                 enabled: dialog.matches
@@ -163,9 +165,11 @@ Popup {
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Enter"
                 onClicked: dialog.accept()
             }
-            Label { text: "Enter"; color: "#6f6f7a"; font.pixelSize: 12 }
         }
     }
 }

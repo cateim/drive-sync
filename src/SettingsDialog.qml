@@ -9,7 +9,10 @@ import "format.js" as Format
 // guard apply at once. The folder, the cloud folders and the filters change
 // what bisync compares, so each page says before saving that the fix
 // rebuilds the base, whose dry run waits for the user's confirmation; the
-// dialog closes when that fix starts, and the fix dialog takes over.
+// dialog closes when that fix starts, and the fix dialog takes over. Save
+// closes the dialog too, once the change applied (or at once when the page
+// had nothing to save), unless another page still holds unsaved edits: a
+// Save that seemed to do nothing was the complaint (2026-11-18).
 Popup {
     id: dialog
 
@@ -34,6 +37,11 @@ Popup {
     readonly property bool busy: settingsController.state !== "idle"
     // The fields show the settings as read; set again after every read.
     property bool fieldsSet: false
+    // Save closes the dialog once its change applied, unless another page
+    // still has edits; note says why it stayed open.
+    property bool closeAfterSave: false
+    property bool savedWithOthers: false
+    property string note: ""
 
     focus: true
     modal: true
@@ -51,6 +59,9 @@ Popup {
 
     onOpened: {
         fieldsSet = false
+        closeAfterSave = false
+        savedWithOthers = false
+        note = ""
         loadedFilters = ""
         treeShown = false
         treeFromRead = false
@@ -60,6 +71,8 @@ Popup {
 
     function showPage(index) {
         page = index
+        note = ""
+        savedWithOthers = false
         if (index === 1 && !treeShown) {
             treeShown = true
             if (fieldsSet)
@@ -110,6 +123,11 @@ Popup {
             if (dialog.visible && settingsController.loaded && settingsController.state === "idle"
                     && (!dialog.fieldsSet || settingsController.saved))
                 dialog.setFields()
+            if (dialog.closeAfterSave && settingsController.state === "idle") {
+                dialog.closeAfterSave = false
+                if (settingsController.saved && settingsController.error === "")
+                    dialog.close()
+            }
         }
         function onFixStarted() { dialog.close() }
     }
@@ -120,22 +138,55 @@ Popup {
             tree.move(step)
     }
 
+    // What each page would save: General's three fields, the ticks once read
+    // from the settings, the filters by meaning.
+    function intervalEdited() {
+        return intervalTouched && intervals[intervalBox.currentIndex] !== settingsController.intervalMinutes
+    }
+    function guardEdited() {
+        return guardTouched && guardBox.value !== settingsController.maxDelete
+    }
+    function folderEdited() {
+        return folderField.text.trim() !== Format.home(settingsController.folder)
+    }
+    function pageEdited(index) {
+        if (index === 0)
+            return intervalEdited() || guardEdited() || folderEdited()
+        if (index === 1)
+            return treeFromRead && folderTree.dirty && settingsController.skipError === ""
+        return filtersView.edited()
+    }
+    function otherPagesEdited() {
+        return [0, 1, 2].some(index => index !== page && pageEdited(index))
+    }
+
     function save() {
         if (busy || !settingsController.loaded)
             return
+        note = ""
+        savedWithOthers = false
+        if (!pageEdited(page)) {
+            if (otherPagesEdited())
+                note = qsTr("Nothing to save on this page; another page still has changes.")
+            else
+                close()
+            return
+        }
+        // A fix closes the dialog by itself (fixStarted); a change that
+        // applies at once closes it when its command answers well.
+        closeAfterSave = !otherPagesEdited()
+        savedWithOthers = !closeAfterSave
         if (page === 0) {
-            const minutes = intervals[intervalBox.currentIndex]
-            if (intervalTouched && minutes !== settingsController.intervalMinutes)
-                settingsController.setInterval(minutes)
-            if (guardTouched && guardBox.value !== settingsController.maxDelete)
+            if (intervalEdited())
+                settingsController.setInterval(intervals[intervalBox.currentIndex])
+            if (guardEdited())
                 settingsController.setMaxDelete(guardBox.value)
             // Last: it starts a fix, and the dialog closes with it.
-            if (folderField.text.trim() !== Format.home(settingsController.folder))
+            if (folderEdited())
                 settingsController.setFolder(folderField.text.trim())
         } else if (page === 1) {
-            if (treeFromRead && folderTree.dirty && settingsController.skipError === "")
-                settingsController.setSkipped(folderTree.skipped)
-        } else if (filtersView.edited()) {
+            settingsController.setSkipped(folderTree.skipped)
+        } else {
             settingsController.setFilters(filtersView.text())
         }
     }
@@ -164,9 +215,9 @@ Popup {
             Layout.fillWidth: true
             currentIndex: dialog.page
             Material.background: "transparent"
-            TabButton { text: qsTr("General   Ctrl+1"); focusPolicy: Qt.NoFocus; onClicked: dialog.showPage(0) }
-            TabButton { text: qsTr("Cloud folders   Ctrl+2"); focusPolicy: Qt.NoFocus; onClicked: dialog.showPage(1) }
-            TabButton { text: qsTr("Filters   Ctrl+3"); focusPolicy: Qt.NoFocus; onClicked: dialog.showPage(2) }
+            TabButton { text: qsTr("General"); focusPolicy: Qt.NoFocus; onClicked: dialog.showPage(0) }
+            TabButton { text: qsTr("Cloud folders"); focusPolicy: Qt.NoFocus; onClicked: dialog.showPage(1) }
+            TabButton { text: qsTr("Filters"); focusPolicy: Qt.NoFocus; onClicked: dialog.showPage(2) }
         }
 
         StackLayout {
@@ -253,7 +304,7 @@ Popup {
                 }
                 Label {
                     Layout.fillWidth: true
-                    text: qsTr("Applies at once. A run that would delete more than this share of the files on either side stops, deletes nothing and lists them under D.")
+                    text: qsTr("Applies at once. A run that would delete more than this share of the files on either side stops, deletes nothing and lists them for you to review.")
                     textFormat: Text.PlainText
                     wrapMode: Text.WordWrap
                     color: "#c4c4cc"
@@ -355,7 +406,10 @@ Popup {
                         return qsTr("Reading the settings…")
                     if (settingsController.state === "saving")
                         return qsTr("Saving…")
-                    return settingsController.saved ? qsTr("Saved.") : ""
+                    if (dialog.note !== "")
+                        return dialog.note
+                    return settingsController.saved && dialog.savedWithOthers
+                            ? qsTr("Saved; another page still has changes.") : ""
                 }
                 textFormat: Text.PlainText
                 color: theme.accent
@@ -364,9 +418,11 @@ Popup {
                 text: qsTr("Close")
                 flat: true
                 focusPolicy: Qt.NoFocus
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Esc"
                 onClicked: dialog.close()
             }
-            Label { text: "Esc"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
             Button {
                 text: qsTr("Save")
                 enabled: !dialog.busy && settingsController.loaded
@@ -384,9 +440,11 @@ Popup {
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Ctrl+S"
                 onClicked: dialog.save()
             }
-            Label { text: "Ctrl+S"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
         }
     }
 }

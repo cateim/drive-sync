@@ -75,7 +75,7 @@ Rectangle {
                 textFormat: Text.PlainText
                 wrapMode: Text.WordWrap
                 color: "#c4c4cc"
-                text: qsTr("D lists what the run would delete, and lets one run through after you type how many files that is.")
+                text: qsTr("Review… lists what the run would delete, and lets one run through after you type how many files that is.")
             }
         }
         Button {
@@ -96,14 +96,10 @@ Rectangle {
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
+            ToolTip.visible: hovered
+            ToolTip.delay: 600
+            ToolTip.text: "D"
             onClicked: banner.reviewRequested()
-        }
-        Label {
-            visible: banner.deletesHeld
-            text: "D"
-            textFormat: Text.PlainText
-            color: "#6f6f7a"
-            font.pixelSize: 12
         }
     }
 }

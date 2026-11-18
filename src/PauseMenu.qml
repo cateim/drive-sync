@@ -77,10 +77,5 @@ Popup {
                 }
             }
         }
-        Label {
-            text: qsTr("Esc cancels")
-            color: "#6f6f7a"
-            font.pixelSize: 12
-        }
     }
 }

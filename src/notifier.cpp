@@ -135,15 +135,15 @@ void reportSolved(const NotifierPaths &tools, const QString &file, const QString
 
 QString causeSentence(const QString &kind, const QString &detail) {
     if (kind == "lostListings")
-        return tr("bisync lost its listings, the base of both sides. To recover: open DriveSync and press F.");
+        return tr("bisync lost its listings, the base of both sides. To recover, use Fix… in DriveSync.");
     if (kind == "outOfSync")
         return tr("The listings of the two sides don't match, so bisync dropped its base. "
-                  "To recover: open DriveSync and press F.");
+                  "To recover, use Fix… in DriveSync.");
     if (kind == "filtersChanged")
         return tr("The filters changed since the last base, so every run waits. "
-                  "Open DriveSync and press F to rebuild the base with them.");
+                  "Open DriveSync and use Fix… to rebuild the base with them.");
     if (kind == "firstSyncPending")
-        return tr("The first sync was never confirmed, so nothing syncs yet. Open DriveSync and press F to see "
+        return tr("The first sync was never confirmed, so nothing syncs yet. Open DriveSync and use Fix… to see "
                   "its dry run.");
     if (kind == "signIn")
         return tr("Google no longer accepts DriveSync's sign-in, so nothing syncs. Open DriveSync and sign in again.");
@@ -174,7 +174,7 @@ QString cause(const QString &serviceResult, const BackendPaths &paths, QString *
         // deletion counts, both sides, as the window lists them.
         if (*kind == "filtersChanged" && guardStopHolds(runs))
             return tr("The filters changed after a run stopped at the max-delete guard, and a fix would bring those "
-                      "files back. Undo the filters edit first: the next run shows the deletions under D.")
+                      "files back. Undo the filters edit first: the next run lists the deletions for you to review.")
                 .left(200);
         if (*kind == "maxDelete")
             if (const auto blocked = blockedDeletes(text, 0)) {
@@ -184,11 +184,11 @@ QString cause(const QString &serviceResult, const BackendPaths &paths, QString *
                 *news = !blocked->keptReason.isEmpty();
                 if (*news)
                     return tr("The run you let through kept the usual guard and stopped again: it would delete %Ln "
-                              "files. Open DriveSync and press D to review them.",
+                              "files. Open DriveSync and use Review… to see them.",
                               blocked->count)
                         .left(200);
                 return tr("A run would delete %Ln files, more than the guard allows, so it stopped and deleted "
-                          "nothing. Open DriveSync and press D to review them.",
+                          "nothing. Open DriveSync and use Review… to see them.",
                           blocked->count)
                     .left(200);
             }
@@ -359,7 +359,7 @@ void notifyFixNeedsYou(const NotifierPaths &tools, const FixState &state, bool s
                    + tr("Drive does not sync until it ends. Open DriveSync to retry or cancel it."));
     else
         notify(tools, "normal", "dialog-information", waiting,
-               tr("Drive does not sync until you answer. Open DriveSync and press F."));
+               tr("Drive does not sync until you answer. Open DriveSync and use Fix… to answer."));
 }
 
 void notifyFixEnded(const BackendPaths &paths, const NotifierPaths &tools) {

@@ -82,24 +82,24 @@ Rectangle {
         switch (kind) {
         // DriveSync fixes the drive-sync it runs; the old scripts fix their own.
         case "lostListings": return backend.managed
-            ? qsTr("bisync lost its listings, the base of both sides. Press F to fix it.")
+            ? qsTr("bisync lost its listings, the base of both sides. Use Fix… to rebuild it.")
             : qsTr("bisync lost its listings, the base of both sides. To recover: drive-sync.sh resync")
         case "outOfSync": return backend.managed
-            ? qsTr("The listings of the two sides don't match, so bisync dropped its base. Press F to fix it.")
+            ? qsTr("The listings of the two sides don't match, so bisync dropped its base. Use Fix… to rebuild it.")
             : qsTr("The listings of the two sides don't match, so bisync dropped its base. To recover: drive-sync.sh resync")
         case "filtersChanged": return backend.guardStopHolds
-            ? qsTr("The filters changed after a run stopped at the max-delete guard, and a fix would bring those files back. Undo the filters edit first: the next run shows the deletions under D.")
-            : qsTr("The filters changed since the last base, so every run waits. Press F to rebuild the base with them.")
-        case "firstSyncPending": return qsTr("The first sync was never confirmed, so nothing syncs yet. Press F to see its dry run.")
+            ? qsTr("The filters changed after a run stopped at the max-delete guard, and a fix would bring those files back. Undo the filters edit first: the next run lists the deletions for you to review.")
+            : qsTr("The filters changed since the last base, so every run waits. Use Fix… to rebuild the base with them.")
+        case "firstSyncPending": return qsTr("The first sync was never confirmed, so nothing syncs yet. Use Fix… to see its dry run.")
         // DriveSync lists the deletions and lets one run through (D); the
         // old scripts leave it to rclone by hand.
         case "maxDelete": return backend.managed && backend.blockedCount > 0
-            ? qsTr("A run would delete %Ln files, more than the guard allows, so it stopped and deleted nothing. Press D to review them.", "", backend.blockedCount)
-            : qsTr("%1\nA fix would bring the deleted files back, so F is off. Restore them, or let one run through by hand with --force.").arg(detail)
+            ? qsTr("A run would delete %Ln files, more than the guard allows, so it stopped and deleted nothing. Use Review… to see them.", "", backend.blockedCount)
+            : qsTr("%1\nA fix would bring the deleted files back, so Fix… is off. Restore them, or let one run through by hand with --force.").arg(detail)
         // DriveSync signs in again through the browser; rclone's own advice
         // (rclone config reconnect) needs a terminal.
         case "signIn": return backend.managed
-            ? qsTr("Google no longer accepts DriveSync's sign-in (it expired or was revoked), so nothing syncs. Press I to sign in again.")
+            ? qsTr("Google no longer accepts DriveSync's sign-in (it expired or was revoked), so nothing syncs. Use Sign in again… to fix it.")
             : qsTr("Google no longer accepts this rclone remote's sign-in (it expired or was revoked), so nothing syncs. To sign in again: rclone config reconnect, with the remote's name, in a terminal.")
         case "timeout": return qsTr("The run went past its time limit (TimeoutStartSec) and systemd stopped it.")
         case "systemd": return qsTr("systemd says the last run failed (%1), and the log has nothing about it.").arg(detail)
@@ -141,10 +141,10 @@ Rectangle {
     function pauseLine() {
         const until = backend.pausedUntil
         if (!Format.valid(until))
-            return qsTr("Until you resume (U).")
+            return qsTr("Until you resume.")
         if (until.getTime() <= now)
             return qsTr("Resumes on the next run.")
-        return qsTr("Until %1 (U resumes now).").arg(Format.when(until, now, clockFormat.timeFormat))
+        return qsTr("Until %1.").arg(Format.when(until, now, clockFormat.timeFormat))
     }
 
     function lastRunLine() {
@@ -169,18 +169,18 @@ Rectangle {
             break
         case "fixWaiting":
             lines.push(backend.fixStep === "confirm"
-                ? qsTr("The dry run would make %Ln copies. Press F to see them and confirm.", "", backend.fixCopies)
-                : qsTr("%Ln files changed in the cloud during the base run. Press F to answer for each one.", "", backend.fixQuestions.length))
+                ? qsTr("The dry run would make %Ln copies. Use Fix… to see them and confirm.", "", backend.fixCopies)
+                : qsTr("%Ln files changed in the cloud during the base run. Use Fix… to answer for each one.", "", backend.fixQuestions.length))
             break
         case "fixFailed":
             if (backend.causeKind === "signIn") {
-                lines.push(qsTr("Google no longer accepts DriveSync's sign-in, so the fix stopped. Press I to sign in again, then F to retry it."))
+                lines.push(qsTr("Google no longer accepts DriveSync's sign-in, so the fix stopped. Use Sign in again…, then Fix… to retry it."))
                 break
             }
             lines.push(backend.causeKind !== "fixInterrupted" ? backend.causeDetail
                 : backend.causeDetail === "the fix stopped halfway" ? qsTr("It stopped halfway: a logout, a shutdown or a kill.")
                 : qsTr("drive-sync-fix.service ended with %1. See: journalctl --user -u drive-sync-fix.service").arg(backend.causeDetail),
-                qsTr("Press F to retry or cancel it."))
+                qsTr("Use Fix… to retry or cancel it."))
             break
         }
         lines.push(qsTr("Runs wait until the fix ends."))
@@ -320,9 +320,11 @@ Rectangle {
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "I"
                 onClicked: panel.signInRequested()
             }
-            Label { text: "I"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
         }
 
         ProgressBar {

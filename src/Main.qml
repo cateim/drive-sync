@@ -196,16 +196,18 @@ ApplicationWindow {
         sequence: "T"
         context: Qt.ApplicationShortcut
         enabled: !win.dialogOpen && (takeoverSetup.state === "offer" || win.takeoverWaitsForRun || win.setupOffered)
-        onActivated: {
-            if (win.setupOffered)
-                setupDialog.openSetup()
-            else if (takeoverSetup.state === "offer")
-                takeoverDialog.open()
-            else if (takeoverSetup.pending)
-                takeoverSetup.cancelPending()
-            else
-                win.takeoverArmed = !win.takeoverArmed
-        }
+        onActivated: win.takeoverKey()
+    }
+    // T, and the takeover banner's button while a run is going.
+    function takeoverKey() {
+        if (win.setupOffered)
+            setupDialog.openSetup()
+        else if (takeoverSetup.state === "offer")
+            takeoverDialog.open()
+        else if (takeoverSetup.pending)
+            takeoverSetup.cancelPending()
+        else
+            win.takeoverArmed = !win.takeoverArmed
     }
     // F offers the fix, or opens the step that waits for the user. While its
     // unit works there is nothing to decide.
@@ -306,6 +308,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.topMargin: -6
                 onPauseRequested: pauseMenu.open()
+                onSettingsRequested: settingsDialog.open()
             }
 
             FixBanner {
@@ -324,6 +327,7 @@ ApplicationWindow {
                 armed: win.takeoverArmed
                 waitsForRun: win.takeoverWaitsForRun
                 onConfirmRequested: takeoverDialog.open()
+                onWaitToggled: win.takeoverKey()
             }
 
             SetupBanner {
@@ -379,7 +383,7 @@ ApplicationWindow {
                     elide: Text.ElideRight
                 }
                 Label {
-                    text: qsTr("Space refreshes   ? shortcuts")
+                    text: qsTr("? shortcuts")
                     color: "#6f6f7a"
                     font.pixelSize: 12
                 }

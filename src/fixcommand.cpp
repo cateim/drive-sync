@@ -258,8 +258,8 @@ QString maxDeleteRefusal(const SyncConfig &config) {
     // list cannot show until the edit is undone.
     if (runs.last().causeKind == "filtersChanged")
         return "the last run that reached bisync stopped because it would delete too many files (--max-delete), and "
-               "a fix would bring them back; undo the filters edit first: the next run then shows the deletions "
-               "under D";
+               "a fix would bring them back; undo the filters edit first: the next run then lists the deletions "
+               "to review";
     return "the last run stopped because it would delete too many files (--max-delete); a fix would bring "
            "them back, so it is refused";
 }

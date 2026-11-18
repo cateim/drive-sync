@@ -123,7 +123,7 @@ Popup {
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
             color: "#c4c4cc"
-            text: qsTr("These changed in the cloud while the base run listed both sides. For each one, keep the cloud's version (C) or the notebook's (L); a file only in the cloud goes to the Drive trash with L. Files newer on the notebook were kept without asking.")
+            text: qsTr("These changed in the cloud while the base run listed both sides. For each one, keep the cloud's version or the notebook's; a file only in the cloud goes to the Drive trash when you pick the notebook. Files newer on the notebook were kept without asking.")
         }
         ListView {
             id: list
@@ -189,7 +189,7 @@ Popup {
         Label {
             Layout.fillWidth: true
             visible: dialog.cancelArmed
-            text: qsTr("The base run already ran. Cancelling throws it away, and every run fails until another fix. X again cancels.")
+            text: qsTr("The base run already ran. Cancelling throws it away, and every run fails until another fix. Cancel the fix again to confirm.")
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
             color: "#ffb74d"
@@ -208,16 +208,20 @@ Popup {
                 text: qsTr("Cancel the fix")
                 flat: true
                 focusPolicy: Qt.NoFocus
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "X"
                 onClicked: dialog.cancelFix()
             }
-            Label { text: "X"; color: "#6f6f7a"; font.pixelSize: 12 }
             Button {
                 text: qsTr("Close")
                 flat: true
                 focusPolicy: Qt.NoFocus
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Esc"
                 onClicked: dialog.close()
             }
-            Label { text: "Esc"; color: "#6f6f7a"; font.pixelSize: 12 }
             Button {
                 text: qsTr("Send the answers")
                 enabled: dialog.complete
@@ -235,9 +239,11 @@ Popup {
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Enter"
                 onClicked: dialog.send()
             }
-            Label { text: "Enter"; color: "#6f6f7a"; font.pixelSize: 12 }
         }
     }
 }

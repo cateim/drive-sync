@@ -64,6 +64,9 @@ an interval of 15 minutes or undoing the takeover removes.
 
 ## Shortcuts
 
+The window shows no keys beside its buttons: `?` lists them all, and a
+button names its key when the pointer rests on it.
+
 | Key              | Action                                                          |
 | ---------------- | --------------------------------------------------------------- |
 | `Space`          | Read the log and ask systemd again                              |
@@ -80,6 +83,10 @@ an interval of 15 minutes or undoing the takeover removes.
 | `C`, `L`         | Keep the cloud's or the notebook's file, in the fix's questions |
 | `D`              | Review what a max-delete stop would delete                      |
 | `,`              | Settings: folder, interval, guard, cloud folders, filters       |
+| `Ctrl+1` `2` `3` | In Settings: General, Cloud folders, Filters                    |
+| `Ctrl+S`         | In Settings: save the page shown and close                      |
+| `Ctrl+E`         | In first setup: choose what does not sync                       |
+| `Enter`, `Esc`   | In a dialog: confirm, or close it                               |
 | `B`              | Put DriveSync on the Omarchy bar, when offered                  |
 | `N`              | Say no to that offer, or hide its notice for good               |
 | `?`              | Show or hide the shortcuts                                      |
@@ -188,7 +195,9 @@ while fetching the token is an ordinary error, not a sign-in.
 ## Settings
 
 `,` opens Settings once DriveSync runs drive-sync. `Ctrl+1`, `Ctrl+2` and
-`Ctrl+3` pick a page, `Ctrl+S` saves the page shown, `Esc` closes. Every
+`Ctrl+3` pick a page, `Ctrl+S` (or Save) saves the page shown and closes,
+`Esc` closes without saving. Save stays open only when another page still
+has unsaved edits, and says so. Every
 change goes through `drive-sync settings`, so the window writes nothing itself.
 
 - **Sync interval**, from 5 minutes to 4 hours in the window (5 to 1440 on

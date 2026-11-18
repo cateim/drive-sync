@@ -2501,7 +2501,7 @@ private slots:
         const NotifierPaths tools = fakeNotifier(dir.path());
         QCOMPARE(runNotifyCommand("exit-code", paths, tools, QDateTime::currentDateTimeUtc()), 0);
         QVERIFY(notifications(dir.path()).at(0).contains("bisync lost its listings"));
-        QVERIFY(notifications(dir.path()).at(0).contains("press F"));
+        QVERIFY(notifications(dir.path()).at(0).contains("use Fix…"));
         QVERIFY(!notifications(dir.path()).at(0).contains("takeover --undo"));
 
         QTemporaryDir other;
@@ -2530,7 +2530,7 @@ private slots:
         const QStringList sent = notifications(dir.path());
         QCOMPARE(sent.size(), 1);
         QVERIFY2(sent.at(0).contains("would delete 11 files"), qPrintable(sent.at(0)));
-        QVERIFY(sent.at(0).contains("press D"));
+        QVERIFY(sent.at(0).contains("use Review…"));
         QVERIFY(sent.at(0).contains("-u critical"));  // nothing syncs until it is answered
     }
 
@@ -4533,7 +4533,7 @@ private slots:
         QCOMPARE(sent.size(), 1);
         QVERIFY2(sent.at(0).contains("-u normal"), qPrintable(sent.at(0)));
         QVERIFY(sent.at(0).contains("Drive filters changed"));
-        QVERIFY(sent.at(0).contains("press F"));
+        QVERIFY(sent.at(0).contains("use Fix…"));
         QVERIFY(!sent.at(0).contains("Drive stopped syncing"));
         // Every refused tick does not bring a new card.
         QCOMPARE(runNotifyCommand("exit-code", paths, tools, now.addSecs(900)), 0);
@@ -5533,7 +5533,7 @@ private slots:
     void notifyNamesTheGuardBehindEditedFilters()
     {
         // Edited filters after a guard stop: F would bring the deleted files
-        // back, so the card must not say "press F".
+        // back, so the card must not say "use Fix…".
         QTemporaryDir dir;
         const BackendPaths paths = controlPaths(dir.path(), true);
         const QDateTime start = QDateTime::currentDateTime().addSecs(-900);
@@ -5547,7 +5547,7 @@ private slots:
         const QStringList sent = notifications(dir.path());
         QCOMPARE(sent.size(), 1);
         QVERIFY2(sent.at(0).contains("Undo the filters edit first"), qPrintable(sent.at(0)));
-        QVERIFY(!sent.at(0).contains("press F"));
+        QVERIFY(!sent.at(0).contains("use Fix…"));
     }
 
     void backendSeesTheGuardBehindARefusal()
@@ -6280,7 +6280,7 @@ private slots:
                                  "- .~lock.*#", "- .tmp.drivedownload/**", "- .tmp.driveupload/**"})
             QVERIFY2(filters.contains(QByteArray(rule) + "\n"), rule);
         QVERIFY(!filters.contains("/GitHub/"));
-        QVERIFY(filters.contains("press F"));
+        QVERIFY(filters.contains("use Fix…"));
     }
 
     void setupRefusesWhenAConfigExists()
@@ -6530,7 +6530,7 @@ private slots:
         QCOMPARE(runNotifyCommand("exit-code", cardPaths, tools, QDateTime::currentDateTimeUtc()), 0);
         const QStringList sent = notifications(dir.path());
         QCOMPARE(sent.size(), 1);
-        QVERIFY2(sent.at(0).contains("-u normal") && sent.at(0).contains("press F") && !sent.at(0).contains("filters"),
+        QVERIFY2(sent.at(0).contains("-u normal") && sent.at(0).contains("use Fix…") && !sent.at(0).contains("filters"),
                  qPrintable(sent.at(0)));
 
         // Even with an .md5 in place, bisync without listings aborts and

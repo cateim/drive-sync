@@ -104,7 +104,7 @@ src/RunsPage.qml        run list; RunDetail.qml shows the picked run
 src/ConflictsPage.qml   conflict copies
 src/HelpOverlay.qml     "?" overlay
 src/BarBanner.qml       offer to put the widget on the bar (B), or why it could not
-src/ControlsRow.qml     sync now (S), pause (P), resume (U), open ~/Drive (O)
+src/ControlsRow.qml     sync now (S), pause (P), resume (U), open folder (O); Settings (,) on the right
 src/PauseMenu.qml       the three pause lengths (1, 2, 3)
 src/TakeoverBanner.qml  offer to take over (T), or what blocks it; TakeoverDialog.qml confirms
 src/SetupBanner.qml     offer first setup (T) when there is no drive-sync at all
@@ -278,6 +278,10 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
 
 - C++ owns logic and anything that can fail; QML owns layout and keys. Every
   shortcut is a `Shortcut` with `Qt.ApplicationShortcut`.
+- No key is printed beside a button or in a footer, nor named in a sentence
+  ("Use Fix… to rebuild it", never "Press F") (Omarchy's apps do the
+  same): `?` lists every key (`HelpOverlay.qml` and the README table, kept
+  together), and each button names its key in a `ToolTip` on hover.
 - Every visible string goes through `qsTr()`/`tr()` with `%1` placeholders and
   `%n`/`%Ln` plurals; add each new one to `src/i18n/pt-BR.json` (and to
   `en.json` when it is plural). Bindings that format times read
@@ -309,8 +313,8 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   `HOME=<dir>`). `PluginSetup` swaps the `drivesync` widget for `drive-sync`
   on the bar by itself (`enable drive-sync --after drivesync`, then `disable
   drivesync`, then it removes the dangling link). The PKGBUILD
-  `conflicts`/`replaces` `syncwatch` and `conflicts` `drivesync`; drop the
-  last one before publishing, because that name belongs to another project.
+  `conflicts`/`replaces` `syncwatch` only: `drivesync` was dropped on
+  2026-11-18, because that name belongs to another project in the AUR.
   Keep the old names only in those places, in `takeoverLockHeld` and in the
   tests of them.
 - **`~/.local/state/drive-sync` is the old drive-sync.sh's**, not the app's: it

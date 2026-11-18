@@ -36,7 +36,7 @@ Rectangle {
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
             color: "#c4c4cc"
-            text: qsTr("F rebuilds the base of both sides: about 40 min, and the folder stays in use.")
+            text: qsTr("Fix… rebuilds the base of both sides: about 40 min, and the folder stays in use.")
         }
         Button {
             text: qsTr("Fix…")
@@ -55,13 +55,10 @@ Rectangle {
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
+            ToolTip.visible: hovered
+            ToolTip.delay: 600
+            ToolTip.text: "F"
             onClicked: banner.fixRequested()
-        }
-        Label {
-            text: "F"
-            textFormat: Text.PlainText
-            color: "#6f6f7a"
-            font.pixelSize: 12
         }
     }
 }

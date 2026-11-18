@@ -10,10 +10,10 @@ makedepends=('gcc' 'make')
 # and every one of them ships the same drive-sync units: pacman -U offers to
 # remove the old package, and the first drive-sync command moves its folders
 # under the home to the new names.
-# TRANSITION ONLY for 'drivesync': the AUR has an unrelated drivesync (a Ruby
-# Google Drive client). Nothing here shares a file with it any more, so drop it
-# from conflicts before publishing this package anywhere.
-conflicts=('syncwatch' 'drivesync')
+# The AUR's drivesync is an unrelated project (a Ruby Google Drive client), so
+# it is not listed: the old drivesync build of this app is gone from every
+# machine (2026-11-18), and nothing here shares a file with that one.
+conflicts=('syncwatch')
 replaces=('syncwatch')
 # A local app has no use for the split -debug package makepkg.conf asks for.
 options=('!debug')

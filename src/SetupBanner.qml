@@ -54,13 +54,10 @@ Rectangle {
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
+            ToolTip.visible: hovered
+            ToolTip.delay: 600
+            ToolTip.text: "T"
             onClicked: banner.setupRequested()
-        }
-        Label {
-            text: "T"
-            textFormat: Text.PlainText
-            color: "#6f6f7a"
-            font.pixelSize: 12
         }
     }
 }

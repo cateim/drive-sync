@@ -64,9 +64,11 @@ Popup {
                 text: qsTr("Cancel")
                 flat: true
                 focusPolicy: Qt.NoFocus
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Esc"
                 onClicked: dialog.close()
             }
-            Label { text: "Esc"; color: "#6f6f7a"; font.pixelSize: 12 }
             Button {
                 text: qsTr("Take over")
                 focusPolicy: Qt.NoFocus
@@ -83,9 +85,11 @@ Popup {
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Enter"
                 onClicked: dialog.confirm()
             }
-            Label { text: "Enter"; color: "#6f6f7a"; font.pixelSize: 12 }
         }
     }
 }

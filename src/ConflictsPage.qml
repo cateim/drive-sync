@@ -113,13 +113,5 @@ Rectangle {
                 color: backend.conflictError === "" ? "#8a8a96" : "#ff8a80"
             }
         }
-
-        Label {
-            Layout.fillWidth: true
-            visible: list.count > 0
-            text: qsTr("Enter shows the picked copy in the file manager.")
-            color: "#8a8a96"
-            font.pixelSize: 12
-        }
     }
 }

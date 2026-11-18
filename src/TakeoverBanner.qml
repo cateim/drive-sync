@@ -9,6 +9,8 @@ Rectangle {
     id: banner
 
     signal confirmRequested()
+    // While a run is going: take over when it ends, or cancel that.
+    signal waitToggled()
 
     property bool armed: false
     property bool waitsForRun: false
@@ -59,11 +61,11 @@ Rectangle {
                 case "working": return qsTr("Taking over drive-sync…")
                 case "blocked":
                     if (banner.waitsForRun && takeoverSetup.pending)
-                        return qsTr("Takeover confirmed: it happens as soon as this run ends (T cancels).")
+                        return qsTr("Takeover confirmed: it happens as soon as this run ends.")
                     if (banner.waitsForRun)
                         return banner.armed
-                            ? qsTr("A run is going. The takeover dialog opens as soon as it ends (T cancels).")
-                            : qsTr("A run is going. Press T and the takeover dialog opens as soon as it ends.")
+                            ? qsTr("A run is going. The takeover dialog opens as soon as it ends.")
+                            : qsTr("A run is going. The takeover dialog can open as soon as it ends.")
                     return qsTr("DriveSync cannot take over drive-sync yet: %1.")
                                     .arg(takeoverSetup.blockers.map(code => banner.blockerText(code)).join("; "))
                 }
@@ -88,14 +90,21 @@ Rectangle {
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
+            ToolTip.visible: hovered
+            ToolTip.delay: 600
+            ToolTip.text: "T"
             onClicked: banner.confirmRequested()
         }
-        Label {
-            visible: banner.setupState === "offer" || banner.waitsForRun
-            text: "T"
-            textFormat: Text.PlainText
-            color: "#6f6f7a"
-            font.pixelSize: 12
+        Button {
+            visible: banner.setupState === "blocked" && banner.waitsForRun
+            text: takeoverSetup.pending || banner.armed ? qsTr("Cancel") : qsTr("Take over when it ends")
+            flat: true
+            focusPolicy: Qt.NoFocus
+            Material.foreground: banner.accent
+            ToolTip.visible: hovered
+            ToolTip.delay: 600
+            ToolTip.text: "T"
+            onClicked: banner.waitToggled()
         }
     }
 }

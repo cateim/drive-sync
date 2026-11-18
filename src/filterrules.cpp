@@ -334,8 +334,8 @@ QByteArray defaultFilters() {
     // block, which the filters screen shows as ticked boxes.
     model.advanced = "# What DriveSync does not sync between your folder and Google Drive.\n"
                      "# rclone bisync filter rules: \"- pattern\" leaves it out. A rule with no \"/\"\n"
-                     "# at the start applies in every folder. DriveSync's Settings (,) edit this\n"
-                     "# file on screen. Edited by hand instead? Open DriveSync and press F, which\n"
+                     "# at the start applies in every folder. DriveSync's Settings edit this file\n"
+                     "# on screen. Edited by hand instead? Open DriveSync and use Fix…, which\n"
                      "# rebuilds the base with the new rules: bisync needs it, and runs wait.\n";
     return writeFilterModel(model);
 }

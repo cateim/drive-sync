@@ -161,7 +161,7 @@ Popup {
         Label {
             Layout.fillWidth: true
             visible: dialog.cancelArmed
-            text: qsTr("The base run already ran. Cancelling throws it away, and every run fails until another fix. X again cancels.")
+            text: qsTr("The base run already ran. Cancelling throws it away, and every run fails until another fix. Cancel the fix again to confirm.")
             textFormat: Text.PlainText
             wrapMode: Text.WordWrap
             color: "#ffb74d"
@@ -174,16 +174,20 @@ Popup {
                 text: qsTr("Cancel the fix")
                 flat: true
                 focusPolicy: Qt.NoFocus
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "X"
                 onClicked: dialog.cancelFix()
             }
-            Label { visible: dialog.hasFix; text: "X"; color: "#6f6f7a"; font.pixelSize: 12 }
             Button {
                 text: qsTr("Close")
                 flat: true
                 focusPolicy: Qt.NoFocus
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Esc"
                 onClicked: dialog.close()
             }
-            Label { text: "Esc"; color: "#6f6f7a"; font.pixelSize: 12 }
             Button {
                 text: {
                     translator.language
@@ -205,9 +209,11 @@ Popup {
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Enter"
                 onClicked: dialog.accept()
             }
-            Label { text: "Enter"; color: "#6f6f7a"; font.pixelSize: 12 }
         }
     }
 }

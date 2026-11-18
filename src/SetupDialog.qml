@@ -116,7 +116,7 @@ Popup {
             text: {
                 translator.language
                 if (dialog.phase === "signingIn")
-                    return qsTr("Waiting for the browser. Finish the sign-in there, or press X to cancel.")
+                    return qsTr("Waiting for the browser. Finish the sign-in there, or cancel it here.")
                 if (dialog.again)
                     return qsTr("Google no longer accepts DriveSync's sign-in, so nothing syncs. Your browser opens Google's sign-in page; after it, DriveSync starts a run.")
                 return qsTr("Your browser opens Google's sign-in page for DriveSync. Google gives the access to rclone, which keeps it in its own config; DriveSync never sees your password.")
@@ -228,9 +228,11 @@ Popup {
                 flat: true
                 enabled: dialog.phase === "signedIn"
                 focusPolicy: Qt.NoFocus
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Ctrl+E"
                 onClicked: filtersPopup.open()
             }
-            Label { text: "Ctrl+E"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
         }
         // Keyboard first: Ctrl+E opens the editor and closes it again.
         Shortcut {
@@ -266,17 +268,21 @@ Popup {
                 text: qsTr("Close")
                 flat: true
                 focusPolicy: Qt.NoFocus
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Esc"
                 onClicked: dialog.close()
             }
-            Label { text: "Esc"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
             Button {
                 visible: dialog.phase === "signingIn"
                 text: qsTr("Cancel the sign-in")
                 flat: true
                 focusPolicy: Qt.NoFocus
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "X"
                 onClicked: setupController.cancel()
             }
-            Label { visible: dialog.phase === "signingIn"; text: "X"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
             Button {
                 text: dialog.again || !dialog.signedIn ? qsTr("Sign in…") : qsTr("Start")
                 enabled: dialog.canAccept
@@ -294,9 +300,11 @@ Popup {
                     horizontalAlignment: Text.AlignHCenter
                     verticalAlignment: Text.AlignVCenter
                 }
+                ToolTip.visible: hovered
+                ToolTip.delay: 600
+                ToolTip.text: "Enter"
                 onClicked: dialog.accept()
             }
-            Label { text: "Enter"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
         }
     }
 
@@ -351,9 +359,11 @@ Popup {
                 Button {
                     text: qsTr("Done")
                     focusPolicy: Qt.NoFocus
+                    ToolTip.visible: hovered
+                    ToolTip.delay: 600
+                    ToolTip.text: "Ctrl+E"
                     onClicked: filtersPopup.close()
                 }
-                Label { text: "Ctrl+E"; textFormat: Text.PlainText; color: "#6f6f7a"; font.pixelSize: 12 }
             }
         }
     }
