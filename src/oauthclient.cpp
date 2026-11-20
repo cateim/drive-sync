@@ -1,6 +1,6 @@
 #include "oauthclient.h"
 
-// drivesync.pro defines HAVE_LOCAL_OAUTH only when the git-ignored file
+// drive-sync.pro defines HAVE_LOCAL_OAUTH only when the git-ignored file
 // exists, so a fresh clone builds and simply has no client.
 #ifdef HAVE_LOCAL_OAUTH
 #include "oauthclient.local.h"

@@ -61,7 +61,7 @@ const PT = {
   "home.install2": `
         O comando compila o app, empacota e instala com o pacman. Depois disso o DriveSync
         aparece no lançador do Omarchy. O código, a licença (MIT) e o manual completo estão no
-        <a href="https://github.com/CaTeIM/drivesync">GitHub</a>.`,
+        <a href="https://github.com/CaTeIM/drive-sync">GitHub</a>.`,
 
   // ---- Privacy policy ----
   "privacy.title": "Política de privacidade do DriveSync",
@@ -142,8 +142,8 @@ const PT = {
   "privacy.changesTitle": "Mudanças e contato",
   "privacy.changes1": `
         Uma mudança nesta política é publicada nesta página com uma data nova, e o histórico fica
-        no <a href="https://github.com/CaTeIM/drivesync">repositório do código</a>. Dúvidas vão
-        para o <a href="https://github.com/CaTeIM/drivesync/issues">rastreador de issues</a> do
+        no <a href="https://github.com/CaTeIM/drive-sync">repositório do código</a>. Dúvidas vão
+        para o <a href="https://github.com/CaTeIM/drive-sync/issues">rastreador de issues</a> do
         projeto.`,
 
   // ---- Terms of service ----
@@ -158,7 +158,7 @@ const PT = {
   "terms.softwareTitle": "O software",
   "terms.software1": `
         O DriveSync é software livre e de código aberto sob a
-        <a href="https://github.com/CaTeIM/drivesync/blob/master/LICENSE">licença MIT</a>, que é
+        <a href="https://github.com/CaTeIM/drive-sync/blob/master/LICENSE">licença MIT</a>, que é
         o que rege copiar, alterar e compartilhar o programa. Ele não custa nada, não precisa de
         conta com o desenvolvedor e roda inteiro no seu computador.`,
   "terms.googleTitle": "A sua conta Google",
@@ -183,8 +183,8 @@ const PT = {
   "terms.changesTitle": "Mudanças e contato",
   "terms.changes1": `
         Uma mudança nestes termos é publicada nesta página com uma data nova, e o histórico fica
-        no <a href="https://github.com/CaTeIM/drivesync">repositório do código</a>. Dúvidas vão
-        para o <a href="https://github.com/CaTeIM/drivesync/issues">rastreador de issues</a> do
+        no <a href="https://github.com/CaTeIM/drive-sync">repositório do código</a>. Dúvidas vão
+        para o <a href="https://github.com/CaTeIM/drive-sync/issues">rastreador de issues</a> do
         projeto.`,
 };
 

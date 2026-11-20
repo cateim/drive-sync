@@ -753,7 +753,7 @@ QStringList systemctlCalls(const QString &dir) {
 
 // A drive-sync that appends its arguments to calls.log and answers with
 // answer.json for "takeover", or fails "sync" when told to.
-QString fakeDrivesync(const QString &dir, const QByteArray &takeoverAnswer, bool syncFails = false) {
+QString fakeDriveSync(const QString &dir, const QByteArray &takeoverAnswer, bool syncFails = false) {
     write(dir + "/answer.json", takeoverAnswer);
     const QString path = dir + "/drive-sync";
     write(path, QString("#!/bin/sh\n"
@@ -3802,7 +3802,7 @@ private slots:
     void takeoverSetupOffersOnlyWhenItCanApply()
     {
         QTemporaryDir dir;
-        const QString program = fakeDrivesync(
+        const QString program = fakeDriveSync(
             dir.path(), R"({"ok":true,"error":"","state":"found","found":["/a/drive-sync.service"],"blockers":[]})");
         TakeoverSetup setup(program);
         setup.check();
@@ -3818,7 +3818,7 @@ private slots:
 
         // Nothing to take over: no offer, and accept does nothing.
         QTemporaryDir none;
-        TakeoverSetup quiet(fakeDrivesync(none.path(), R"({"ok":true,"error":"","state":"none","found":[],"blockers":[]})"));
+        TakeoverSetup quiet(fakeDriveSync(none.path(), R"({"ok":true,"error":"","state":"none","found":[],"blockers":[]})"));
         quiet.check();
         QTRY_COMPARE(quiet.state(), QString("none"));
         quiet.accept();
@@ -3828,7 +3828,7 @@ private slots:
     void takeoverSetupShowsBlockersAndFailures()
     {
         QTemporaryDir dir;
-        const QString program = fakeDrivesync(
+        const QString program = fakeDriveSync(
             dir.path(), R"({"ok":true,"error":"","state":"found","found":[],"blockers":["running","differentValue:Nice"]})");
         TakeoverSetup setup(program);
         setup.check();
@@ -3836,7 +3836,7 @@ private slots:
         QCOMPARE(setup.blockers(), (QStringList{"running", "differentValue:Nice"}));
 
         QTemporaryDir failing;
-        TakeoverSetup broken(fakeDrivesync(
+        TakeoverSetup broken(fakeDriveSync(
             failing.path(), R"({"ok":true,"error":"","state":"found","found":["/a"],"blockers":[]})"));
         broken.check();
         QTRY_COMPARE(broken.state(), QString("offer"));
@@ -3848,7 +3848,7 @@ private slots:
 
         // An answer that is not JSON is a failure too, never an offer.
         QTemporaryDir garbage;
-        TakeoverSetup confused(fakeDrivesync(garbage.path(), "not json"));
+        TakeoverSetup confused(fakeDriveSync(garbage.path(), "not json"));
         confused.check();
         QTRY_COMPARE(confused.state(), QString("failed"));
     }
@@ -3860,7 +3860,7 @@ private slots:
         QTemporaryDir dir;
         const QByteArray offer = R"({"ok":true,"error":"","state":"found","found":["/a"],"blockers":[]})";
         const QByteArray running = R"({"ok":false,"error":"running","state":"found","found":["/a"],"blockers":["running"]})";
-        TakeoverSetup setup(fakeDrivesync(dir.path(), offer));
+        TakeoverSetup setup(fakeDriveSync(dir.path(), offer));
         setup.check();
         QTRY_COMPARE(setup.state(), QString("offer"));
         write(dir.filePath("answer.json"), running);
@@ -3881,7 +3881,7 @@ private slots:
 
         // Cancelled while waiting: the next offer is only an offer.
         QTemporaryDir other;
-        TakeoverSetup cancelled(fakeDrivesync(other.path(), offer));
+        TakeoverSetup cancelled(fakeDriveSync(other.path(), offer));
         cancelled.check();
         QTRY_COMPARE(cancelled.state(), QString("offer"));
         write(other.filePath("answer.json"), running);
@@ -3895,7 +3895,7 @@ private slots:
 
         // Blocked by something else than a run: the confirmation is dropped.
         QTemporaryDir third;
-        TakeoverSetup dropped(fakeDrivesync(third.path(), offer));
+        TakeoverSetup dropped(fakeDriveSync(third.path(), offer));
         dropped.check();
         QTRY_COMPARE(dropped.state(), QString("offer"));
         write(third.filePath("answer.json"), running);
@@ -3918,7 +3918,7 @@ private slots:
                            dir.filePath("proc"), fakeSystemctl(dir.path(), start),
                            QStandardPaths::findExecutable("find"), dir.filePath("app")};
         paths.managed = true;
-        paths.self = fakeDrivesync(dir.path(), "{}");
+        paths.self = fakeDriveSync(dir.path(), "{}");
         Backend backend(paths);
         QTRY_COMPARE(backend.status(), QString("ok"));
         QVERIFY(backend.managed());
@@ -3973,7 +3973,7 @@ private slots:
         BackendPaths paths{dir.filePath("drive-sync.log"), dir.filePath("Drive"), dir.filePath("state"),
                            dir.filePath("proc"), fakeSystemctl(dir.path(), start),
                            QStandardPaths::findExecutable("find"), dir.filePath("app")};
-        paths.self = fakeDrivesync(dir.path(), "{}", true);
+        paths.self = fakeDriveSync(dir.path(), "{}", true);
         Backend backend(paths);
         QTRY_COMPARE(backend.status(), QString("ok"));
         backend.syncNow();
@@ -5130,7 +5130,7 @@ private slots:
                            dir.filePath("proc"), fakeSystemctl(dir.path(), start),
                            QStandardPaths::findExecutable("find"), dir.filePath("app")};
         paths.managed = true;
-        paths.self = fakeDrivesync(dir.path(), "{}");
+        paths.self = fakeDriveSync(dir.path(), "{}");
         FixState state = fixAt("questions");
         state.questions = {question("a.txt", "differs"), question("b.txt", "onlyCloud")};
         state.questions[0].cloudTime = 1762862500;
@@ -5192,7 +5192,7 @@ private slots:
                            dir.filePath("proc"), fakeSystemctl(dir.path(), start),
                            QStandardPaths::findExecutable("find"), dir.filePath("app")};
         paths.managed = true;
-        paths.self = fakeDrivesync(dir.path(), "{}");
+        paths.self = fakeDriveSync(dir.path(), "{}");
         Backend backend(paths);
         QTRY_COMPARE(backend.status(), QString("failed"));
         QCOMPARE(backend.causeKind(), QString("maxDelete"));
@@ -5377,7 +5377,7 @@ private slots:
                            dir.filePath("proc"), fakeSystemctl(dir.path(), start),
                            QStandardPaths::findExecutable("find"), dir.filePath("app")};
         paths.managed = true;
-        paths.self = fakeDrivesync(dir.path(), "{}");
+        paths.self = fakeDriveSync(dir.path(), "{}");
         FixState state = fixAt("questions");
         state.questions = {question("__proto__", "differs"), question("constructor", "onlyCloud")};
         QVERIFY(writeFix(paths.appState, state));
@@ -7291,7 +7291,7 @@ private slots:
                            dir.filePath("proc"), fakeSystemctl(dir.path(), start),
                            QStandardPaths::findExecutable("find"), dir.filePath("app")};
         paths.config = dir.filePath("config/config.json");
-        paths.self = fakeDrivesync(dir.path(), "{}");
+        paths.self = fakeDriveSync(dir.path(), "{}");
         Backend backend(paths);
         QVERIFY(!backend.managed());
         QCOMPARE(backend.fixStep(), QString());
@@ -11811,4 +11811,4 @@ esac
 };
 
 QTEST_MAIN(DrivesyncTests)
-#include "drivesync_tests.moc"
+#include "drive-sync-tests.moc"

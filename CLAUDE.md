@@ -1,4 +1,4 @@
-# CLAUDE.md - drivesync
+# CLAUDE.md - drive-sync
 
 Single source of truth for agents and humans working on this repository.
 `AGENTS.md` only points here.
@@ -54,9 +54,12 @@ one window, one job, keyboard first, follows the Omarchy theme and language.
 `~/.local/share/drive-sync`) and `drive-sync-app` for the state folder, because
 `drive-sync` is also what it manages: the units, `drive-sync.log` and the old
 `drive-sync.sh` and `drive-sync-aviso`. The AUR has an unrelated `drivesync`, so
-that name must never come back. Things named after the repository keep
-`drivesync` until the repository is renamed: `drivesync.pro`,
-`tests/drivesync_tests.*`, `fakeDrivesync` and the `action.drivesync` i18n key.
+that name must never come back. The repository was `drivesync` until
+2026-11-20 and is now `drive-sync` (`github.com/CaTeIM/drive-sync`, the page
+at `cateim.github.io/drive-sync`); what was named after it followed:
+`drive-sync.pro`, `tests/drive-sync-tests.*`, `fakeDriveSync` and the bar's
+`action.open` i18n key. `drivesync` stays only where it names the app's old
+name (the legacy migration, the plugin swap, `takeoverLockHeld` and their tests).
 
 ## Stack
 
@@ -68,9 +71,9 @@ that name must never come back. Things named after the repository keep
 ## Structure
 
 ```text
-drivesync.pro           qmake project
+drive-sync.pro          qmake project
 bin/build               qmake6 + make into build/drive-sync
-bin/test                builds and runs build/tests/drivesync_tests offscreen
+bin/test                builds and runs build/tests/drive-sync-tests offscreen
 bin/install             bin/build, then makepkg -fsi with BUILDDIR/PKGDEST under build/
 bin/harness             builds tools/harness into build/harness and runs it with the given options
 src/accounts.{h,cpp}    the one resolver: legacy or accounts mode, every account's BackendPaths (paths and unit names), notices, labels; --account and chooseAccounts (which accounts a command acts on)
@@ -132,7 +135,7 @@ src/i18n/*.json         en (plural forms only) and pt-BR
 tests/                  Qt Test suite
 tools/harness/          offscreen harness: the real Main.qml over a made-up drive-sync, saved as a PNG
 plugin/                 Omarchy bar widget (id drive-sync), installed to /usr/share/drive-sync/omarchy-plugin; reads `drive-sync status --json`
-site/                   project page on GitHub Pages (cateim.github.io/drivesync): index.html, privacy.html, terms.html, style.css, i18n.js (pt-BR and the EN/PT switch)
+site/                   project page on GitHub Pages (cateim.github.io/drive-sync): index.html, privacy.html, terms.html, style.css, i18n.js (pt-BR and the EN/PT switch)
 .github/workflows/pages.yml  publishes site/, copying the icon and window-runs.png in from assets/
 docs/superpowers/       git-ignored, local only: design (specs/) and step plans (plans/)
 pkgbuild/               PKGBUILD, .desktop, units/ (/usr/lib/systemd/user: the plain drive-sync, drive-sync-watchdog and drive-sync-fix user units, and the templates drive-sync@.service, drive-sync@.timer and drive-sync-fix@.service, one instance per account)
@@ -557,7 +560,7 @@ shows through the notice. The window's own commands still carry no
   `<client id>` and `<client secret>`, keeps rclone's stdout (which can hold
   the section and the token) in memory, and the tests use a made-up client.
   `src/oauthclient.local.h` is git-ignored and filled by the maintainer by
-  hand; `drivesync.pro` and the test project define `HAVE_LOCAL_OAUTH` only
+  hand; `drive-sync.pro` and the test project define `HAVE_LOCAL_OAUTH` only
   when it exists, and qmake must run again after it appears (`bin/build`
   does).
 - **Every test reaches rclone in a sandbox.** `initTestCase` points
@@ -818,7 +821,7 @@ and open the HTML file; delete the copies afterwards, since `site/` syncs to Dri
 
 - **`site/privacy.html` and `site/terms.html` are what Google's sign-in
   screen links to.** The Branding of the DriveSync Google Cloud project
-  points at `https://cateim.github.io/drivesync/`, `.../privacy.html` and
+  points at `https://cateim.github.io/drive-sync/`, `.../privacy.html` and
   `.../terms.html`, with `cateim.github.io` as the authorized domain
   (verified in Search Console through the `cateim.github.io` user-site
   repository). A change in what the app reads, stores or sends changes the

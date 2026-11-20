@@ -1,16 +1,16 @@
 QT += core gui quick quickcontrols2 testlib dbus
 CONFIG += c++17 testcase
-TARGET = drivesync_tests
+TARGET = drive-sync-tests
 TEMPLATE = app
 
 INCLUDEPATH += ../src
 
 HEADERS += ../src/filterrules.h ../src/filtereditor.h ../src/localtree.h ../src/settingscontroller.h ../src/foldertree.h ../src/selectivesync.h ../src/settingscommand.h ../src/setupcontroller.h ../src/firstsetup.h ../src/oauthclient.h ../src/signin.h ../src/accountmove.h ../src/accounts.h ../src/backend.h ../src/blockeddeletes.h ../src/clockformat.h ../src/conflictcache.h ../src/controlcommands.h ../src/fixcommand.h ../src/fixstate.h ../src/legacymigration.h ../src/listingdiff.h ../src/machineguard.h ../src/notifier.h ../src/pausestate.h ../src/pluginsetup.h ../src/snapshot.h ../src/statuscommand.h ../src/syncconfig.h ../src/synclog.h ../src/takeover.h ../src/takeoversetup.h ../src/theme.h ../src/translator.h
-SOURCES += drivesync_tests.cpp ../src/filterrules.cpp ../src/filtereditor.cpp ../src/localtree.cpp ../src/settingscontroller.cpp ../src/foldertree.cpp ../src/selectivesync.cpp ../src/settingscommand.cpp ../src/firstsetup.cpp ../src/setupcontroller.cpp ../src/oauthclient.cpp ../src/signin.cpp ../src/accountmove.cpp ../src/accounts.cpp ../src/backend.cpp ../src/blockeddeletes.cpp ../src/clockformat.cpp ../src/conflictcache.cpp ../src/controlcommands.cpp ../src/fixcommand.cpp ../src/fixstate.cpp ../src/legacymigration.cpp ../src/listingdiff.cpp ../src/machineguard.cpp ../src/notifier.cpp ../src/pausestate.cpp ../src/pluginsetup.cpp ../src/snapshot.cpp ../src/statuscommand.cpp ../src/syncconfig.cpp ../src/synclog.cpp ../src/takeover.cpp ../src/takeoversetup.cpp ../src/theme.cpp ../src/translator.cpp
+SOURCES += drive-sync-tests.cpp ../src/filterrules.cpp ../src/filtereditor.cpp ../src/localtree.cpp ../src/settingscontroller.cpp ../src/foldertree.cpp ../src/selectivesync.cpp ../src/settingscommand.cpp ../src/firstsetup.cpp ../src/setupcontroller.cpp ../src/oauthclient.cpp ../src/signin.cpp ../src/accountmove.cpp ../src/accounts.cpp ../src/backend.cpp ../src/blockeddeletes.cpp ../src/clockformat.cpp ../src/conflictcache.cpp ../src/controlcommands.cpp ../src/fixcommand.cpp ../src/fixstate.cpp ../src/legacymigration.cpp ../src/listingdiff.cpp ../src/machineguard.cpp ../src/notifier.cpp ../src/pausestate.cpp ../src/pluginsetup.cpp ../src/snapshot.cpp ../src/statuscommand.cpp ../src/syncconfig.cpp ../src/synclog.cpp ../src/takeover.cpp ../src/takeoversetup.cpp ../src/theme.cpp ../src/translator.cpp
 
 # The tests read the shipped catalogs straight from the source tree.
 DEFINES += SRCDIR=\\\"$$PWD\\\"
 
-# The same switch as drivesync.pro: the client is compiled in only when the
+# The same switch as drive-sync.pro: the client is compiled in only when the
 # git-ignored file exists.
 exists($$PWD/../src/oauthclient.local.h): DEFINES += HAVE_LOCAL_OAUTH

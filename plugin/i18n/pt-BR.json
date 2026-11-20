@@ -50,7 +50,7 @@
   "action.pause": "Pausar por uma hora",
   "action.resume": "Retomar a sincronização",
   "action.pauseUnavailable": "Pausar exige que o DriveSync rode o drive-sync",
-  "action.drivesync": "Abrir o DriveSync: histórico das rodadas e conflitos",
+  "action.open": "Abrir o DriveSync: histórico das rodadas e conflitos",
   "action.folder": "Abrir o ~/Drive",
   "keys.toggle": "? atalhos",
   "keys.sync": "Sincronizar agora",

@@ -50,7 +50,7 @@
   "action.pause": "Pause for an hour",
   "action.resume": "Resume syncing",
   "action.pauseUnavailable": "Pausing needs DriveSync to run drive-sync",
-  "action.drivesync": "Open DriveSync: run history and conflicts",
+  "action.open": "Open DriveSync: run history and conflicts",
   "action.folder": "Open ~/Drive",
   "keys.toggle": "? keys",
   "keys.sync": "Sync now",

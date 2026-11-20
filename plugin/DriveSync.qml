@@ -316,7 +316,7 @@ Panel {
           }
           PanelActionButton {
             iconText: String.fromCodePoint(0xF021A)
-            tooltipText: strings.t("action.drivesync")
+            tooltipText: strings.t("action.open")
             hasCursor: root.cursorActive && root.actionIndex === 2
             foreground: root.foreground
             fontFamily: root.fontFamily
