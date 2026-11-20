@@ -33,10 +33,13 @@ package() {
   install -Dm644 "$startdir/drive-sync.desktop" "$pkgdir/usr/share/applications/drive-sync.desktop"
 
   # User units, inert until a takeover enables them: a unit of the same name
-  # in ~/.config/systemd/user wins over these.
+  # in ~/.config/systemd/user wins over these. The plain drive-sync units run
+  # the single config of older versions until it moves to accounts; the
+  # templates run one instance per account after that.
   install -Dm644 pkgbuild/units/drive-sync.service pkgbuild/units/drive-sync.timer \
     pkgbuild/units/drive-sync-watchdog.service pkgbuild/units/drive-sync-watchdog.timer \
-    pkgbuild/units/drive-sync-fix.service -t "$pkgdir/usr/lib/systemd/user"
+    pkgbuild/units/drive-sync-fix.service pkgbuild/units/drive-sync@.service \
+    pkgbuild/units/drive-sync@.timer pkgbuild/units/drive-sync-fix@.service -t "$pkgdir/usr/lib/systemd/user"
 
   # The bar widget. Omarchy loads third-party plugins only from
   # ~/.config/omarchy/plugins, which a package cannot write, so it lands here

@@ -9,10 +9,12 @@
 #include <QJsonObject>
 #include <QRegularExpression>
 
+#include "accounts.h"
 #include "controlcommands.h"
 #include "filterrules.h"
 #include "fixcommand.h"
 #include "fixstate.h"
+#include "machineguard.h"
 #include "selectivesync.h"
 #include "settingscommand.h"
 #include "signin.h"
@@ -21,7 +23,8 @@
 namespace {
 
 constexpr int kToolTimeoutMs = 60 * 1000;
-const QStringList kTimers{"drive-sync.timer", "drive-sync-watchdog.timer"};
+// The account's timer, and the watchdog that checks every account.
+QStringList setupTimers(const BackendPaths &paths) { return {paths.timerUnit, "drive-sync-watchdog.timer"}; }
 
 // The folder as bisync will see it: absolute, with no "." or ".." and no
 // trailing slash. The listings are named after this string, so it must not
@@ -138,7 +141,9 @@ QString setUp(const BackendPaths &paths, const TakeoverPaths &takeover, const QS
     // are the same, and tests keep every file inside their temp dir.
     SyncConfig config = newUserConfig(cleanFolder(folder), QString());
     config.workDir = paths.appState + "/bisync";
-    config.filtersFile = takeover.appConfigDir + "/filters.txt";
+    // Beside the config: <configRoot>/accounts/account1/filters.txt for the
+    // accounts layout, the config folder itself for paths built by hand.
+    config.filtersFile = QFileInfo(paths.config).path() + "/filters.txt";
     config.logFile = paths.log;
 
     Written written;
@@ -171,10 +176,11 @@ QString setUp(const BackendPaths &paths, const TakeoverPaths &takeover, const QS
     }
     // From here the fix owns the state: its mark holds every tick, so the
     // timers can start, and a failure leaves everything as it is.
-    if (!runProcess(paths.systemctl, QStringList{"--user", "enable", "--now"} + kTimers, kToolTimeoutMs, nullptr, &error))
+    const QStringList timers = setupTimers(paths);
+    if (!runProcess(paths.systemctl, QStringList{"--user", "enable", "--now"} + timers, kToolTimeoutMs, nullptr, &error))
         return QString("the setup started, but systemd did not turn on %1: %2; turn them on with: "
                        "systemctl --user enable --now %3")
-            .arg(kTimers.join(" and "), error, kTimers.join(' '));
+            .arg(timers.join(" and "), error, timers.join(' '));
     return QString();
 }
 
@@ -206,6 +212,19 @@ QString resolvedFolder(const QString &path) {
     if (real.isEmpty())
         real = existing;
     return rest.isEmpty() ? real : QDir::cleanPath(real + "/" + rest);
+}
+
+bool foldersOverlap(const QString &a, const QString &b) {
+    if (a.isEmpty() || b.isEmpty())
+        return false;
+    const auto inside = [](const QString &path, const QString &folder) {
+        return path.startsWith(folder.endsWith('/') ? folder : folder + "/");
+    };
+    for (const QString &left : {cleanFolder(a), resolvedFolder(cleanFolder(a))})
+        for (const QString &right : {cleanFolder(b), resolvedFolder(cleanFolder(b))})
+            if (left == right || inside(left, right) || inside(right, left))
+                return true;
+    return false;
 }
 
 QString folderRefusal(const BackendPaths &paths, const TakeoverPaths &takeover, const QString &folder,
@@ -259,12 +278,20 @@ QString setupRefusal(const BackendPaths &paths, const TakeoverPaths &takeover, c
                      const QString &rclone) {
     if (const QString refusal = folderRefusal(paths, takeover, folder); !refusal.isEmpty())
         return refusal;
+    // Any account at all in the accounts layout; legacy mode is refused just
+    // below, by the single config's name.
+    if (const AccountLayout layout = readAccountLayout(takeover.appConfigDir);
+        layout.mode == "accounts" && !layout.ids.isEmpty())
+        return QString("DriveSync already runs drive-sync (%1)").arg(layout.ids.join(", "));
     if (QFile::exists(paths.config))
         return QString("DriveSync already runs drive-sync (%1 exists)").arg(paths.config);
     if (fixPresent(paths.appState))
         return "a fix is under way; open DriveSync to follow it";
-    if (takeoverLockHeld(paths.appState, paths.proc))
+    if (takeoverLockHeld(paths.globalState(), paths.proc))
         return "a takeover is running";
+    // Setup has no config yet: the machine's guard is machine.json's.
+    if (const QString refusal = machineGuardRefusal(paths, SyncConfig()); !refusal.isEmpty())
+        return refusal;
     const TakeoverPlan plan = detectTakeover(takeover, Snapshot());
     if (plan.state == "found")
         return "an older drive-sync is set up here; take it over instead (T in DriveSync, or drive-sync takeover "
@@ -277,6 +304,15 @@ QString setupRefusal(const BackendPaths &paths, const TakeoverPaths &takeover, c
     if (const QString refusal = rcloneVersionRefusal(rclone); !refusal.isEmpty())
         return refusal;
     return remoteRefusal(rclone);
+}
+
+BackendPaths setupAccountPaths(const AccountRoots &roots, const BackendPaths &chosen) {
+    // Nothing configured: the resolver is in the accounts layout, where a
+    // config written at the old place would be ignored, so the new user's
+    // drive-sync is account1 there.
+    if (chosen.id.isEmpty())
+        return newAccountPaths(roots, "account1");
+    return chosen;
 }
 
 int runSetupCommand(const QStringList &arguments, const BackendPaths &paths, const TakeoverPaths &takeover,
@@ -322,6 +358,11 @@ int runSetupCommand(const QStringList &arguments, const BackendPaths &paths, con
         imported = in.readAll();
     }
     // One setup, fix command or unit step at a time: they all write fix.json.
-    const FixLock lock(paths.appState);
+    // None while the move to account1 runs, and none over paths it changed.
+    const AccountWriteLock lock(paths);
+    if (!lock.refusal().isEmpty())
+        return commandAnswer(json, lock.refusal(), out, err);
+    if (lock.stale())
+        return kAccountPathsMoved;
     return commandAnswer(json, setUp(paths, takeover, folder, skipped, imported), out, err);
 }

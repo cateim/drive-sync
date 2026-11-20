@@ -4,6 +4,7 @@
 #include <QJsonDocument>
 #include <QProcess>
 
+#include "accounts.h"
 #include "conflictcache.h"
 #include "synclog.h"
 
@@ -51,16 +52,20 @@ int countConflicts(const BackendPaths &paths, const QDateTime &now) {
         error = "noFind";
     else if (!ok && output.isEmpty())
         error = "scanFailed";
-    if (!cacheFile.isEmpty())
+    // Never during the move to account1: the cache would land at a place it
+    // is leaving (the move deletes the old cache instead of moving it).
+    if (!cacheFile.isEmpty() && !moveInProgress(paths.globalState()))
         writeConflictCache(cacheFile, {count, error, now});
     return count;
 }
 
-}  // namespace
-
-SnapshotSources gatherSources(const BackendPaths &paths, const QDateTime &now, int timeoutMs, QDateTime *nextRun) {
+// What one account's own files say: the log, the folder, the conflict
+// count, the pause, the fix and its config. systemd is asked for every
+// account at once by gatherAccounts.
+SnapshotSources readAccountFiles(const BackendPaths &paths, const QDateTime &now) {
     SnapshotSources src;
     src.now = now;
+    src.configError = accountConfigError(paths);
 
     bool found = false;
     bool truncated = false;
@@ -68,25 +73,12 @@ SnapshotSources gatherSources(const BackendPaths &paths, const QDateTime &now, i
     src.logFound = found;
     src.runs = SyncLog::parse(text, kStateRuns, truncated);
 
-    QByteArray show;
-    const bool showOk = runAndWait(paths.systemctl, systemdShowArguments(), timeoutMs, &show);
-    const auto units = Backend::parseShow(show);
-    src.systemctlWorks = showOk && units.size() == 3;
-    if (src.systemctlWorks) {
-        src.service = units.at(0);
-        src.timer = units.at(1);
-        src.fixUnitActive = fixUnitBusy(units.at(2));
-        src.fixUnitResult = units.at(2).value("Result");
-        QByteArray timers;
-        if (nextRun && runAndWait(paths.systemctl, listTimersArguments(), timeoutMs, &timers))
-            *nextRun = Backend::parseNextElapse(timers);
-    }
-
     src.resyncRunning = Backend::resyncRunning(paths.stateDir, paths.proc);
     src.driveFound = QFileInfo(paths.drive).isDir();
     src.conflicts = src.driveFound ? countConflicts(paths, now) : 0;
     src.managed = paths.managed;
     src.intervalSeconds = paths.intervalSeconds;
+    src.moving = moveInProgress(paths.globalState());
     if (!paths.appState.isEmpty()) {
         src.pause = readPause(pauseFilePath(paths.appState));
         src.fixPresent = fixPresent(paths.appState);
@@ -96,8 +88,101 @@ SnapshotSources gatherSources(const BackendPaths &paths, const QDateTime &now, i
     return src;
 }
 
-int runStatusCommand(const QStringList &arguments, const BackendPaths &paths, QTextStream &out, QTextStream &err,
-                     int timeoutMs) {
+// The tone's rank for worstAccount: anything unknown counts as an error,
+// as toneFor makes an unknown status one.
+int toneRank(const QString &tone) {
+    if (tone == "ok")
+        return 0;
+    if (tone == "busy")
+        return 1;
+    if (tone == "warning")
+        return 2;
+    return 3;
+}
+
+// One line of "status" as text: the headline and what it leaves out.
+QString statusLine(const Snapshot &snapshot) {
+    QString line = snapshot.summary.status;
+    if (!snapshot.summary.warnings.isEmpty())
+        line += " (warnings: " + snapshot.summary.warnings.join(", ") + ")";
+    return line;
+}
+
+}  // namespace
+
+QList<SnapshotSources> gatherAccounts(const QList<BackendPaths> &accounts, const QDateTime &now, int timeoutMs,
+                                      QList<QDateTime> *nextRuns, const OldDriveSyncCheck &oldDriveSync) {
+    QStringList units;
+    QStringList timers;
+    bool accountsMode = false;
+    for (const BackendPaths &paths : accounts) {
+        units << accountUnits(paths);
+        timers << paths.timerUnit;
+        accountsMode = accountsMode || paths.accountsMode;
+    }
+    // An old drive-sync next to accounts: the plain units in the same call.
+    const bool lookForOld = accountsMode && oldDriveSync;
+    if (lookForOld)
+        units << plainDriveSyncUnits();
+    // Every account's units in one call, and one list-timers: the bar polls
+    // this, and a call per account would multiply its cost.
+    const QString systemctl = accounts.isEmpty() ? QString() : accounts.first().systemctl;
+    QByteArray show;
+    const bool showOk = !accounts.isEmpty() && runAndWait(systemctl, systemdShowArguments(units), timeoutMs, &show);
+    const auto byId = Backend::parseShowById(show);
+
+    QList<SnapshotSources> sources;
+    bool anyWorks = false;
+    for (const BackendPaths &paths : accounts) {
+        SnapshotSources src = readAccountFiles(paths, now);
+        // Each of the account's three units must answer, found by its Id; a
+        // missing one makes this account alone unavailable.
+        src.systemctlWorks = showOk;
+        for (const QString &unit : accountUnits(paths))
+            src.systemctlWorks = src.systemctlWorks && byId.contains(unit);
+        if (src.systemctlWorks) {
+            src.service = byId.value(paths.serviceUnit);
+            src.timer = byId.value(paths.timerUnit);
+            src.fixUnitActive = fixUnitBusy(byId.value(paths.fixUnit));
+            src.fixUnitResult = byId.value(paths.fixUnit).value("Result");
+            anyWorks = true;
+        }
+        if (lookForOld && paths.accountsMode)
+            src.oldDriveSync = oldDriveSync(byId, paths.drive, &src.oldDriveSyncHold);
+        sources << src;
+    }
+
+    if (nextRuns) {
+        nextRuns->clear();
+        QByteArray json;
+        const bool timersOk = anyWorks && runAndWait(systemctl, listTimersArguments(timers), timeoutMs, &json);
+        for (qsizetype i = 0; i < accounts.size(); ++i)
+            *nextRuns << (timersOk && sources.at(i).systemctlWorks
+                              ? Backend::parseNextElapse(json, accounts.at(i).timerUnit)
+                              : QDateTime());
+    }
+    return sources;
+}
+
+SnapshotSources gatherSources(const BackendPaths &paths, const QDateTime &now, int timeoutMs, QDateTime *nextRun) {
+    QList<QDateTime> nextRuns;
+    const QList<SnapshotSources> sources = gatherAccounts({paths}, now, timeoutMs, nextRun ? &nextRuns : nullptr);
+    if (nextRun)
+        *nextRun = nextRuns.value(0);
+    return sources.first();
+}
+
+int worstAccount(const QList<Snapshot> &snapshots) {
+    int worst = snapshots.isEmpty() ? -1 : 0;
+    for (int i = 1; i < snapshots.size(); ++i)
+        if (toneRank(snapshots.at(i).tone) > toneRank(snapshots.at(worst).tone))
+            worst = i;
+    return worst;
+}
+
+int runStatusCommand(const QStringList &arguments, const QList<BackendPaths> &accounts,
+                     const QList<AccountNotice> &notices, QTextStream &out, QTextStream &err, int timeoutMs,
+                     const OldDriveSyncCheck &oldDriveSync) {
     bool json = false;
     for (const QString &argument : arguments) {
         if (argument != "--json") {
@@ -108,18 +193,38 @@ int runStatusCommand(const QStringList &arguments, const BackendPaths &paths, QT
         json = true;
     }
 
+    // On stderr, so the bar, which reads stdout, never sees them.
+    for (const AccountNotice &notice : notices) {
+        if (notice.kind == "staleConfig")
+            err << "drive-sync: " << notice.path
+                << " is ignored: DriveSync keeps each account's config under accounts/\n";
+        else if (notice.kind == "moveStuck")
+            err << "drive-sync: the move to accounts stopped halfway; clear what stuckReason in " << notice.path
+                << " names, then run: drive-sync accounts --migrate\n";
+    }
+    err.flush();
+
+    // main always passes at least the view with no account; an empty list
+    // reads as a drive-sync nobody can ask about.
+    const QList<BackendPaths> read = accounts.isEmpty() ? QList<BackendPaths>{BackendPaths()} : accounts;
     // UTC for the same reason as Backend::recompute: local-time comparisons
     // make Qt resolve the zone on every call.
     const QDateTime now = QDateTime::currentDateTimeUtc();
-    QDateTime nextRun;
-    const Snapshot snapshot = buildSnapshot(gatherSources(paths, now, timeoutMs, &nextRun));
+    QList<QDateTime> nextRuns;
+    QList<Snapshot> snapshots;
+    for (const SnapshotSources &src : gatherAccounts(read, now, timeoutMs, json ? &nextRuns : nullptr, oldDriveSync))
+        snapshots << buildSnapshot(src);
     if (json) {
-        out << QJsonDocument(snapshotToJson(snapshot, nextRun, now)).toJson(QJsonDocument::Compact) << "\n";
+        // Version 2 has room for one account: the one that needs the user most.
+        const int worst = worstAccount(snapshots);
+        out << QJsonDocument(snapshotToJson(snapshots.at(worst), nextRuns.value(worst), now))
+                   .toJson(QJsonDocument::Compact)
+            << "\n";
+    } else if (snapshots.size() == 1) {
+        out << statusLine(snapshots.first()) << "\n";
     } else {
-        out << snapshot.summary.status;
-        if (!snapshot.summary.warnings.isEmpty())
-            out << " (warnings: " << snapshot.summary.warnings.join(", ") << ")";
-        out << "\n";
+        for (qsizetype i = 0; i < snapshots.size(); ++i)
+            out << read.at(i).id << ": " << statusLine(snapshots.at(i)) << "\n";
     }
     out.flush();
     return 0;
@@ -139,6 +244,10 @@ QString usageText() {
            "       drive-sync takeover --check | --apply | --undo [--json]\n"
            "       drive-sync fix --start | --confirm | --answers <file.json> | --cancel | --retry [--json]\n"
            "       drive-sync deletes --list | --allow <count> [--json]\n"
+           "       drive-sync accounts [--migrate] [--json]\n"
            "       drive-sync run-condition | run | notify | watchdog | fix-run    (for the units)\n"
-           "       drive-sync --help\n";
+           "       drive-sync --help\n"
+           "Every command but setup, takeover, watchdog and accounts takes --account <id> (account1...) as its first\n"
+           "two arguments. Without it, status, sync, pause and resume act on every account, and the others on\n"
+           "the only one.\n";
 }

@@ -59,7 +59,8 @@ Rectangle {
         case "noRuns": return qsTr("No sync in the log yet")
         case "conflicts": return qsTr("%n conflict copies to sort out", "", backend.conflicts.length)
         case "unavailable": return qsTr("Can't ask systemd")
-        case "notLoaded": return qsTr("drive-sync.service doesn't load")
+        case "configError": return qsTr("DriveSync cannot read this account's config")
+        case "notLoaded": return qsTr("%1 doesn't load").arg(backend.serviceUnit)
         case "noLog": return qsTr("No drive-sync log")
         case "fixing": return qsTr("Fixing Drive")
         case "fixWaiting": return qsTr("The fix is waiting for you")
@@ -179,7 +180,7 @@ Rectangle {
             }
             lines.push(backend.causeKind !== "fixInterrupted" ? backend.causeDetail
                 : backend.causeDetail === "the fix stopped halfway" ? qsTr("It stopped halfway: a logout, a shutdown or a kill.")
-                : qsTr("drive-sync-fix.service ended with %1. See: journalctl --user -u drive-sync-fix.service").arg(backend.causeDetail),
+                : qsTr("%1 ended with %2. See: journalctl --user -u %1").arg(backend.fixUnit).arg(backend.causeDetail),
                 qsTr("Use Fix… to retry or cancel it."))
             break
         }
@@ -214,10 +215,14 @@ Rectangle {
                        lastRunLine(), nextRunLine())
             break
         case "skipped":
-            lines.push(qsTr("systemd skips every run because /home isn't the Crucial one (emergency home?)."))
+            if (backend.causeKind === "oldDriveSync")
+                lines.push(qsTr("An old drive-sync (%1) syncs this folder too, so DriveSync holds its runs. Remove it by hand.")
+                           .arg(backend.causeDetail))
+            else
+                lines.push(qsTr("systemd skips every run because /home isn't the Crucial one (emergency home?)."))
             break
         case "timerOff":
-            lines.push(qsTr("No run happens until the timer is back on: systemctl --user enable --now drive-sync.timer"),
+            lines.push(qsTr("No run happens until the timer is back on: systemctl --user enable --now %1").arg(backend.timerUnit),
                        lastSyncLine())
             break
         case "noDrive":
@@ -229,8 +234,12 @@ Rectangle {
         case "unavailable":
             lines.push(qsTr("systemctl didn't answer, so the state below comes from the log alone."))
             break
+        case "configError":
+            // The loader's own reason: which file, and what is wrong in it.
+            lines.push(backend.causeDetail)
+            break
         case "notLoaded":
-            lines.push(qsTr("LoadState is %1. See: systemctl --user status drive-sync.service").arg(backend.causeDetail))
+            lines.push(qsTr("LoadState is %1. See: systemctl --user status %2").arg(backend.causeDetail).arg(backend.serviceUnit))
             break
         case "noLog":
             lines.push(qsTr("Expected at %1.").arg(Format.home(backend.logPath)))
@@ -244,12 +253,29 @@ Rectangle {
         return lines.filter(line => line !== "").join("\n")
     }
 
+    // What the resolver says about the set of accounts, one line each.
+    function noticeLines() {
+        translator.language
+        return backend.notices.map(notice => {
+            switch (notice.kind) {
+            case "staleConfig":
+                return qsTr("%1 is ignored: DriveSync keeps each account's config under accounts/. Remove it by hand.")
+                    .arg(Format.home(notice.path))
+            case "moveStuck":
+                return qsTr("DriveSync's move to accounts stopped halfway, so nothing syncs. Clear what stuckReason in %1 names, then run: drive-sync accounts --migrate")
+                    .arg(Format.home(notice.path))
+            }
+            return ""
+        }).filter(line => line !== "").join("\n")
+    }
+
     function warningText(code) {
         translator.language
         switch (code) {
         case "timerOff": return qsTr("Timer is off")
         case "timerDisabled": return qsTr("Timer won't start on boot")
         case "conflicts": return qsTr("%n conflict copies", "", backend.conflicts.length)
+        case "oldDriveSync": return qsTr("Old drive-sync found")
         }
         return code
     }
@@ -296,6 +322,17 @@ Rectangle {
             wrapMode: Text.Wrap
             lineHeight: 1.25
             color: "#c4c4cc"
+            font.pixelSize: 14
+        }
+
+        Label {
+            Layout.fillWidth: true
+            text: panel.noticeLines()
+            visible: text !== ""
+            textFormat: Text.PlainText
+            wrapMode: Text.Wrap
+            lineHeight: 1.25
+            color: "#ffcc80"
             font.pixelSize: 14
         }
 

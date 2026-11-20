@@ -37,7 +37,7 @@
     <main class="wrap">
       <header class="hero">
         <h1 data-i18n="privacy.h1">Privacy policy</h1>
-        <p class="updated" data-i18n="privacy.updated">Last updated: 14 November 2026</p>
+        <p class="updated" data-i18n="privacy.updated">Last updated: 19 November 2026</p>
       </header>
 
       <p data-i18n="privacy.intro">
@@ -73,7 +73,7 @@
           Your files: in the folder you chose (<code>~/Drive</code> by default) and in your Google
           Drive. They travel only between your computer and Google's servers, over HTTPS. When you
           let one run past the max-delete guard, the files that run deletes or overwrites on your
-          computer are moved to <code>~/.local/state/drive-sync-app/allowed-backup/</code> instead,
+          computer are moved to <code>~/.local/state/drive-sync-app/accounts/&lt;account&gt;/allowed-backup/</code> instead,
           and stay there until you delete them.
         </li>
         <li data-i18n="privacy.store2">
@@ -81,9 +81,12 @@
           (by default <code>~/.config/rclone/rclone.conf</code>).
         </li>
         <li data-i18n="privacy.store3">
-          The sync log, with file names: <code>~/.local/state/drive-sync.log</code>. DriveSync's
-          settings and state: <code>~/.config/drive-sync/</code> and
-          <code>~/.local/state/drive-sync-app/</code>.
+          The sync log, with file names: <code>~/.local/state/drive-sync-app/accounts/&lt;account&gt;/drive-sync.log</code>,
+          or <code>~/.local/state/drive-sync.log</code> for a drive-sync DriveSync took over or an
+          earlier version set up. DriveSync's settings: <code>~/.config/drive-sync/</code>, with each
+          account's config in <code>accounts/&lt;account&gt;/</code> and the <code>runOnlyWhen</code> check
+          every account shares in <code>machine.json</code>. Its state:
+          <code>~/.local/state/drive-sync-app/</code>, with each account's in <code>accounts/&lt;account&gt;/</code>.
         </li>
       </ul>
       <p data-i18n="privacy.store4">

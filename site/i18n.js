@@ -68,7 +68,7 @@ const PT = {
   "privacy.description":
     "Como o DriveSync acessa, usa, guarda e compartilha dados de usuário do Google: ele roda no seu computador, e o desenvolvedor não recebe nenhum dado seu.",
   "privacy.h1": "Política de privacidade",
-  "privacy.updated": "Atualizada em 14 de novembro de 2026",
+  "privacy.updated": "Atualizada em 19 de novembro de 2026",
   "privacy.intro": `
         O DriveSync é um app de desktop que roda no seu próprio computador. Ele mantém uma pasta
         desse computador e o seu Google Drive sincronizados, usando o
@@ -98,14 +98,17 @@ const PT = {
           Google Drive. Eles só trafegam entre o seu computador e os servidores do Google, por
           HTTPS. Quando você deixa uma rodada passar pela trava de max-delete, os arquivos que essa
           rodada apaga ou sobrescreve no seu computador vão para
-          <code>~/.local/state/drive-sync-app/allowed-backup/</code>, e ficam lá até você apagá-los.`,
+          <code>~/.local/state/drive-sync-app/accounts/&lt;conta&gt;/allowed-backup/</code>, e ficam lá até você apagá-los.`,
   "privacy.store2": `
           O token de acesso que o Google devolve: no arquivo de configuração do rclone no seu
           computador (por padrão <code>~/.config/rclone/rclone.conf</code>).`,
   "privacy.store3": `
-          O log da sincronização, com os nomes dos arquivos: <code>~/.local/state/drive-sync.log</code>.
-          As configurações e o estado do DriveSync: <code>~/.config/drive-sync/</code> e
-          <code>~/.local/state/drive-sync-app/</code>.`,
+          O log da sincronização, com os nomes dos arquivos: <code>~/.local/state/drive-sync-app/accounts/&lt;conta&gt;/drive-sync.log</code>,
+          ou <code>~/.local/state/drive-sync.log</code> num drive-sync que o DriveSync assumiu ou que uma
+          versão anterior configurou. As configurações do DriveSync: <code>~/.config/drive-sync/</code>, com a
+          configuração de cada conta em <code>accounts/&lt;conta&gt;/</code> e a verificação <code>runOnlyWhen</code>,
+          comum a todas as contas, em <code>machine.json</code>. O estado dele:
+          <code>~/.local/state/drive-sync-app/</code>, com o de cada conta em <code>accounts/&lt;conta&gt;/</code>.`,
   "privacy.store4": `
         Tudo isso fica no seu computador até você apagar. O desenvolvedor não tem cópia de nada
         disso, então não há nada para guardar ou apagar do lado dele.`,

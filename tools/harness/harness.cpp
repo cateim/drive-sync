@@ -16,6 +16,11 @@
 //                                        setup-folder: that, with a sign-in that ends at once;
 //                                        signin-needed: the last run failed on a revoked token (implies --managed;
 //                                        with --fix failed, the fix stopped on it)
+//                                        config-error: account1's config cannot be read (implies --managed)
+//                                        stale-config: account1 in accounts/, and an old config.json beside it
+//                                        that is ignored (implies --managed)
+//                                        move-stuck: the move to accounts stopped halfway (its journal says
+//                                        stuck; implies --managed)
 //   --clock "<Qt format>"                the bar clock; without it, the system locale's hours
 //   --pause none|hour|forever|ended      a pause mark; --managed: DriveSync's own units
 //   --takeover managed|none|offer|running|blocked|failed   managed by default: "none" means no
@@ -49,6 +54,7 @@
 #include <QTemporaryDir>
 #include <QtTest>
 
+#include "accounts.h"
 #include "backend.h"
 #include "clockformat.h"
 #include "fixstate.h"
@@ -187,10 +193,31 @@ int main(int argc, char **argv) {
 
     const QString fix = opt("--fix", "none");
     const QString systemctl = dir.filePath("systemctl");
-    put(systemctl, QString("#!/bin/sh\ncase \"$*\" in\n  *list-timers*) echo '[{\"next\":%1}]' ;;\n"
-                           "  *) printf 'LoadState=loaded\\nActiveState=%2\\nUnitFileState=static\\nResult=success\\nExecMainStartTimestamp=@%3\\n\\n"
-                           "LoadState=loaded\\nActiveState=active\\nUnitFileState=enabled\\nResult=success\\n\\n"
-                           "LoadState=loaded\\nActiveState=%4\\nUnitFileState=static\\nResult=success\\n' ;;\nesac\n")
+    // One show block per unit asked, starting with its Id, as systemd answers:
+    // the window maps the answers by Id. list-timers names each timer asked.
+    put(systemctl, QString(R"sh(#!/bin/sh
+case "$*" in
+  *list-timers*)
+    out=''
+    for a in "$@"; do
+      case "$a" in *.timer) [ -n "$out" ] && out="$out,"; out="$out"'{"next":%1,"unit":"'"$a"'"}' ;; esac
+    done
+    echo "[$out]" ;;
+  *)
+    first=1
+    for a in "$@"; do
+      case "$a" in
+        drive-sync-fix*.service) block='LoadState=loaded\nActiveState=%4\nUnitFileState=static\nResult=success\n' ;;
+        *.service) block='LoadState=loaded\nActiveState=%2\nUnitFileState=static\nResult=success\nExecMainStartTimestamp=@%3\n' ;;
+        *.timer) block='LoadState=loaded\nActiveState=active\nUnitFileState=enabled\nResult=success\n' ;;
+        *) continue ;;
+      esac
+      [ $first = 1 ] || printf '\n'
+      first=0
+      printf "Id=%s\n$block" "$a"
+    done ;;
+esac
+)sh")
                        .arg(now.addSecs(380).toMSecsSinceEpoch() * 1000).arg(active).arg(now.addSecs(-1400).toSecsSinceEpoch())
                        .arg(fix == "fixing" ? "activating" : "inactive").toUtf8());
     QFile::setPermissions(systemctl, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
@@ -203,7 +230,39 @@ int main(int argc, char **argv) {
     BackendPaths fake{dir.filePath("drive-sync.log"), dir.filePath("Drive"), dir.filePath("state"),
                       dir.filePath("proc"), systemctl, QStandardPaths::findExecutable("find"), dir.filePath("app"),
                       QString(), QString()};
-    fake.managed = args.contains("--managed") || fix != "none" || scenario == "signin-needed";
+    fake.managed = args.contains("--managed") || fix != "none" || scenario == "signin-needed" || scenario == "config-error"
+                   || scenario == "stale-config" || scenario == "move-stuck";
+    // The resolver reads these made-up roots, as the window reads the home.
+    AccountRoots roots;
+    roots.configRoot = dir.filePath("config");
+    roots.stateRoot = fake.appState;
+    roots.userUnits = dir.filePath("units");
+    roots.base = fake;
+    // A valid config for account1, naming the made-up log and folder.
+    auto writeConfig = [&](const QString &file) {
+        const QJsonObject config{{"version", 1}, {"remote", "gdrive:"}, {"localPath", fake.drive},
+                                 {"workDir", fake.appState + "/bisync"}, {"filtersFile", dir.filePath("config/filters.txt")},
+                                 {"logFile", fake.log}, {"rcloneFlags", QJsonArray()}, {"runOnlyWhen", ""}};
+        put(file, QJsonDocument(config).toJson());
+    };
+    if (scenario == "stale-config") {
+        writeConfig(dir.filePath("config/accounts/account1/config.json"));
+        writeConfig(dir.filePath("config/config.json"));
+    }
+    if (scenario == "move-stuck") {
+        writeConfig(dir.filePath("config/config.json"));
+        put(migrationJournalPath(roots.stateRoot),
+            R"({"version": 1, "account": "account1", "moves": [], "created": [], "plainTimerEnabled": true, )"
+            R"("plainTimerActive": true, "stuck": true, "stuckReason": "paused.json is at both places"})");
+    }
+    if (scenario == "config-error") {
+        // An account whose config.json is no longer JSON: listed, managed,
+        // and its headline says why it cannot be read.
+        fake.id = "account1";
+        fake.config = dir.filePath("config/config.json");
+        QDir().mkpath(dir.filePath("config"));
+        put(fake.config, "{\"version\": 1, \"remote\": ");
+    }
     if (confirmedAt.isValid()) {
         ConfirmedRun run;
         run.at = confirmedAt;
@@ -300,15 +359,42 @@ int main(int argc, char **argv) {
         QString("#!/bin/sh\necho \"$*\" >> '%2'\n[ \"$*\" = 'signin --json' ] && { %3; }\n"
                 "case \"$1\" in\n"
                 "  settings) if [ \"$2\" = --json ]; then %5cat '%4/settings.json'; else echo '{\"ok\":true,\"error\":\"\",\"fixStarted\":false}'; fi; exit 0 ;;\n"
+                "  accounts) echo '%6'; exit %7 ;;\n"
                 "  folders) case \" $* \" in *\" -- \"*) for last in \"$@\"; do :; done; cat \"%4/folders-$last.json\" 2>/dev/null || echo '{\"ok\":true,\"error\":\"\",\"folders\":[]}' ;; *) cat '%4/folders-root.json' ;; esac; exit 0 ;;\n"
                 "esac\n"
                 "cat '%1' 2>/dev/null\n")
             .arg(dir.filePath("answer.json"), dir.filePath("calls.log"), signinAnswer, dir.path(),
-                 args.contains("--slow-settings") ? QString("sleep 1; ") : QString())
+                 args.contains("--slow-settings") ? QString("sleep 1; ") : QString(),
+                 // "accounts --migrate --json": the move to account1, which
+                 // only the move-stuck scenario sees stop halfway.
+                 scenario == "move-stuck"
+                     ? QString(R"({"ok":false,"error":"the move to accounts stopped halfway","mode":"legacy","accounts":[],)"
+                               R"("moveBlocker":"","notices":[],"move":{"result":"stuck","reason":"paused.json is at both places"}})")
+                     : QString(R"({"ok":true,"error":"","mode":"accounts","accounts":[],"moveBlocker":"","notices":[],)"
+                               R"("move":{"result":"notNeeded","reason":""}})"),
+                 scenario == "move-stuck" ? QString("1") : QString("0"))
             .toUtf8());
     QFile::setPermissions(dir.filePath("drive-sync"), QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
     fake.self = dir.filePath("drive-sync");
-    Backend backend(real ? BackendPaths::defaults() : fake);
+    roots.base.self = fake.self;
+    // As main does: the window follows the resolver over the roots. With no
+    // account there, the made-up paths stand in for one, so every older
+    // scenario (a managed drive-sync with no config file) looks as before.
+    const AccountRoots realRoots = real ? AccountRoots::defaults() : AccountRoots();
+    const std::function<WindowAccount()> resolve = [&]() -> WindowAccount {
+        if (real)
+            return windowAccount(realRoots);
+        WindowAccount account = windowAccount(roots);
+        if (account.paths.id.isEmpty())
+            account.paths = fake;
+        return account;
+    };
+    Backend backend(resolve().paths);
+    backend.setResolver(resolve);
+    // The move runs as a child of the fake drive-sync, never with --real,
+    // where it would be this machine's move.
+    if (!real && (readAccountLayout(roots.configRoot).mode == "legacy" || moveInProgress(roots.stateRoot)))
+        backend.startMove();
     TakeoverSetup takeoverSetup(dir.filePath("drive-sync"));
     takeoverSetup.check();
     SetupController setupController(dir.filePath("drive-sync"), dir.filePath("Drive"));

@@ -10,7 +10,7 @@ var EPOCH_MAX = 99999999999
 // Every status the app can print (Backend::summarize), and its tones.
 var STATUSES = ["ok", "running", "resync", "paused", "failed", "interrupted", "skipped", "timerOff",
                 "stale", "noDrive", "noRuns", "noLog", "notLoaded", "unavailable", "conflicts",
-                "fixing", "fixWaiting", "fixFailed"]
+                "fixing", "fixWaiting", "fixFailed", "configError"]
 var TONES = ["ok", "busy", "warning", "error"]
 var OUTCOMES = ["success", "failed", "interrupted"]
 
@@ -120,6 +120,11 @@ function barState(snapshot) {
     case "error": return snapshot.status === "failed" ? "failing" : "broken"
   }
   return "unknown"
+}
+
+// Whether the app named this warning (parseSnapshot keeps at most 8).
+function hasWarning(snapshot, key) {
+  return !!snapshot && snapshot.ok && Array.isArray(snapshot.warnings) && snapshot.warnings.indexOf(key) !== -1
 }
 
 // The app knows whether a manual run makes sense; the widget just asks.

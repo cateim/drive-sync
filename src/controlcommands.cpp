@@ -1,17 +1,25 @@
 #include "controlcommands.h"
 
+#include <QCoreApplication>
+#include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QScopeGuard>
 #include <QSet>
 #include <QStandardPaths>
+#include <fcntl.h>
 #include <limits>
+#include <sys/file.h>
 #include <unistd.h>
 
+#include "accounts.h"
 #include "fixstate.h"
 #include "listingdiff.h"
+#include "machineguard.h"
 #include "pausestate.h"
 #include "snapshot.h"
 #include "synclog.h"
@@ -50,12 +58,46 @@ QStringList withLogFile(QStringList arguments, const QString &file) {
     return arguments;
 }
 
+
+// One account's answer to sync, pause or resume: empty error is ok.
+struct AccountAnswer {
+    QString id;
+    QString error;
+};
+
+// Answers sync, pause or resume once, over every account they acted on. The
+// JSON keeps "ok" and "error" at the top (the window and the bar read those;
+// the error is the first account's that failed) and lists each account.
+// Without JSON each refusal is a line, named by its account when there are
+// several.
+int answerAccounts(bool json, const QList<AccountAnswer> &answers, QTextStream &out, QTextStream &err) {
+    QString firstError;
+    QJsonArray list;
+    for (const AccountAnswer &a : answers) {
+        list.append(QJsonObject{{"id", a.id}, {"ok", a.error.isEmpty()}, {"error", a.error}});
+        if (firstError.isEmpty())
+            firstError = a.error;
+    }
+    if (json) {
+        out << QJsonDocument(QJsonObject{{"ok", firstError.isEmpty()}, {"error", firstError}, {"accounts", list}})
+                   .toJson(QJsonDocument::Compact)
+            << "\n";
+        out.flush();
+    } else {
+        for (const AccountAnswer &a : answers)
+            if (!a.error.isEmpty())
+                err << "drive-sync: " << (answers.size() > 1 ? a.id + ": " : QString()) << a.error << "\n";
+        err.flush();
+    }
+    return firstError.isEmpty() ? 0 : 1;
+}
+
 }  // namespace
 
 QString startOneRun(const BackendPaths &paths) {
     QString error;
     // --no-block: the run takes minutes; the state shows it once it starts.
-    runProgram(paths.systemctl, {"--user", "start", "--no-block", "drive-sync.service"}, &error);
+    runProgram(paths.systemctl, {"--user", "start", "--no-block", paths.serviceUnit}, &error);
     return error;
 }
 
@@ -81,6 +123,46 @@ bool takeoverLockHeld(const QString &appState, const QString &proc) {
     // the lock.
     const QString program = QFileInfo(QString::fromLocal8Bit(cmdline.readAll().split('\0').value(0))).fileName();
     return program == "drive-sync" || program == "drivesync" || program == "syncwatch";
+}
+
+bool takeTakeoverLock(const QString &stateRoot, QString *error) {
+    const QString path = takeoverLockPath(stateRoot);
+    QDir().mkpath(stateRoot);
+    // The check, the removal of a stale file and the new file are one step:
+    // two takers that both saw the same stale file would otherwise both
+    // remove it and write their own. An flock on the state root itself
+    // serialises them and leaves no file behind; the pid file stays the
+    // lock every reader (and an older drive-sync) checks.
+    const int folder = ::open(QFile::encodeName(stateRoot).constData(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (folder < 0 || ::flock(folder, LOCK_EX) != 0) {
+        if (folder >= 0)
+            ::close(folder);
+        *error = "cannot take the takeover lock " + path;
+        return false;
+    }
+    const auto unlockFolder = qScopeGuard([folder] { ::close(folder); });
+    if (QFileInfo::exists(path)) {
+        if (takeoverLockHeld(stateRoot, "/proc")) {
+            *error = "another takeover, undo or move to accounts is running";
+            return false;
+        }
+        QFile::remove(path);
+    }
+    QFile lock(path);
+    if (!lock.open(QIODevice::WriteOnly | QIODevice::NewOnly)
+        || lock.write(QByteArray::number(QCoreApplication::applicationPid()) + "\n") <= 0) {
+        *error = "cannot take the takeover lock " + path;
+        return false;
+    }
+    return true;
+}
+
+void releaseTakeoverLock(const QString &stateRoot) {
+    QFile lock(takeoverLockPath(stateRoot));
+    if (lock.open(QIODevice::ReadOnly) && lock.readAll().trimmed() == QByteArray::number(QCoreApplication::applicationPid())) {
+        lock.close();
+        lock.remove();
+    }
 }
 
 bool runProcess(const QString &program, const QStringList &arguments, int timeoutMs, QByteArray *output,
@@ -110,25 +192,73 @@ bool runProcess(const QString &program, const QStringList &arguments, int timeou
     return false;
 }
 
-int runSyncCommand(const QStringList &arguments, const BackendPaths &paths, QTextStream &out, QTextStream &err) {
+namespace {
+
+QString syncOne(const BackendPaths &paths) {
+    if (takeoverLockHeld(paths.globalState(), paths.proc))
+        return "a takeover is running; sync when it ends";
+    // run-condition would skip the run anyway: say so instead of "ok".
+    if (fixPresent(paths.appState))
+        return "a fix is under way, and it holds every run until it ends";
+    // A pause that ended is cleared by the next run itself, so it does not stop one.
+    const PauseMark mark = readPause(pauseFilePath(paths.appState));
+    if (paths.managed && mark.present && !pauseEnded(mark, QDateTime::currentDateTimeUtc()))
+        return "drive-sync is paused; run drive-sync resume first";
+    return startOneRun(paths);
+}
+
+QString pauseOne(const BackendPaths &paths, const QDateTime &now, const QDateTime &until, bool *stale) {
+    if (!paths.managed)
+        return "pausing needs DriveSync to run drive-sync; take it over first";
+    // The mark is the account's state: never written at a place the move to
+    // account1 has just left.
+    const AccountWriteLock lock(paths);
+    if (!lock.refusal().isEmpty())
+        return lock.refusal();
+    if ((*stale = lock.stale()))
+        return QString();
+    const QString file = pauseFilePath(paths.appState);
+    PauseMark mark = readPause(file);
+    if (!mark.present || !mark.since.isValid())
+        mark.since = now;  // a new end keeps when the pause began
+    mark.present = true;
+    mark.until = until;
+    if (!writePause(file, mark))
+        return QString("cannot write %1").arg(file);
+    return QString();
+}
+
+QString resumeOne(const BackendPaths &paths, bool *stale) {
+    const AccountWriteLock lock(paths);
+    if (!lock.refusal().isEmpty())
+        return lock.refusal();
+    if ((*stale = lock.stale()))
+        return QString();
+    const QString file = pauseFilePath(paths.appState);
+    if (!clearPause(file))
+        return QString("cannot remove %1").arg(file);
+    // The pause is gone; a fix still holds the runs, and its end brings them back.
+    if (fixPresent(paths.appState))
+        return QString();
+    return startOneRun(paths);
+}
+
+}  // namespace
+
+int runSyncCommand(const QStringList &arguments, const QList<BackendPaths> &accounts, QTextStream &out,
+                   QTextStream &err) {
     QStringList rest = arguments;
     const bool json = takeJson(&rest);
     if (!rest.isEmpty())
         return answer(json, "usage: drive-sync sync [--json]", out, err);
-    if (takeoverLockHeld(paths.appState, paths.proc))
-        return answer(json, "a takeover is running; sync when it ends", out, err);
-    // run-condition would skip the run anyway: say so instead of "ok".
-    if (fixPresent(paths.appState))
-        return answer(json, "a fix is under way, and it holds every run until it ends", out, err);
-    // A pause that ended is cleared by the next run itself, so it does not stop one.
-    const PauseMark mark = readPause(pauseFilePath(paths.appState));
-    if (paths.managed && mark.present && !pauseEnded(mark, QDateTime::currentDateTimeUtc()))
-        return answer(json, "drive-sync is paused; run drive-sync resume first", out, err);
-    return answer(json, startOneRun(paths), out, err);
+    QList<AccountAnswer> answers;
+    for (const BackendPaths &paths : accounts)
+        answers << AccountAnswer{paths.id, syncOne(paths)};
+    return answerAccounts(json, answers, out, err);
 }
 
-int runPauseCommand(const QStringList &arguments, const BackendPaths &paths, const QDateTime &now, QTextStream &out,
-                    QTextStream &err) {
+int runPauseCommand(const QStringList &arguments, const QList<BackendPaths> &accounts, const QDateTime &now,
+                    QTextStream &out, QTextStream &err) {
     QStringList rest = arguments;
     const bool json = takeJson(&rest);
     const QString usage = "usage: drive-sync pause [--minutes N | --until-tomorrow] [--json]";
@@ -144,54 +274,63 @@ int runPauseCommand(const QStringList &arguments, const BackendPaths &paths, con
     } else if (!rest.isEmpty()) {
         return answer(json, usage, out, err);
     }
-    if (!paths.managed)
-        return answer(json, "pausing needs DriveSync to run drive-sync; take it over first", out, err);
-
-    const QString file = pauseFilePath(paths.appState);
-    PauseMark mark = readPause(file);
-    if (!mark.present || !mark.since.isValid())
-        mark.since = now;  // a new end keeps when the pause began
-    mark.present = true;
-    mark.until = until;
-    if (!writePause(file, mark))
-        return answer(json, QString("cannot write %1").arg(file), out, err);
-    return answer(json, QString(), out, err);
+    QList<AccountAnswer> answers;
+    for (const BackendPaths &paths : accounts) {
+        bool stale = false;
+        answers << AccountAnswer{paths.id, pauseOne(paths, now, until, &stale)};
+        if (stale)
+            return kAccountPathsMoved;  // nothing printed: main runs it again
+    }
+    return answerAccounts(json, answers, out, err);
 }
 
-int runResumeCommand(const QStringList &arguments, const BackendPaths &paths, QTextStream &out, QTextStream &err) {
+int runResumeCommand(const QStringList &arguments, const QList<BackendPaths> &accounts, QTextStream &out,
+                     QTextStream &err) {
     QStringList rest = arguments;
     const bool json = takeJson(&rest);
     if (!rest.isEmpty())
         return answer(json, "usage: drive-sync resume [--json]", out, err);
-    const QString file = pauseFilePath(paths.appState);
-    if (!clearPause(file))
-        return answer(json, QString("cannot remove %1").arg(file), out, err);
-    // The pause is gone; a fix still holds the runs, and its end brings them back.
-    if (fixPresent(paths.appState))
-        return answer(json, QString(), out, err);
-    return answer(json, startOneRun(paths), out, err);
+    QList<AccountAnswer> answers;
+    for (const BackendPaths &paths : accounts) {
+        // With several accounts, resume resumes the paused ones (spec 12,
+        // "Commands"): an account that was not paused gets no extra run. One
+        // account keeps what resume always did.
+        if (accounts.size() > 1 && !readPause(pauseFilePath(paths.appState)).present) {
+            answers << AccountAnswer{paths.id, QString()};
+            continue;
+        }
+        bool stale = false;
+        answers << AccountAnswer{paths.id, resumeOne(paths, &stale)};
+        if (stale)
+            return kAccountPathsMoved;  // nothing printed: main runs it again
+    }
+    return answerAccounts(json, answers, out, err);
 }
 
-int runConditionCommand(const BackendPaths &paths, const SyncConfig &config, const QDateTime &now) {
+int runConditionCommand(const BackendPaths &paths, const SyncConfig &config, const QDateTime &now,
+                        bool oldDriveSyncHold) {
+    // The move to account1 renames the config and the state under the
+    // units: no run until it ends or rolls back.
+    if (moveInProgress(paths.globalState()))
+        return 1;
     // A fix holds every run from its first step to its end: its own unit
     // runs rclone, and a normal run in between would break the new base.
     if (fixPresent(paths.appState))
         return 1;
-    if (!config.runOnlyWhen.isEmpty()) {
-        // As systemd reads an ExecCondition: a crash or 255 is a failure,
-        // any other non-zero exit a skip.
-        QProcess check;
-        check.start(QStandardPaths::findExecutable("sh"), {"-c", config.runOnlyWhen});
-        if (!check.waitForStarted(kCommandTimeoutMs) || !check.waitForFinished(kCommandTimeoutMs)) {
-            check.kill();
-            check.waitForFinished(1000);
-            return 255;
-        }
-        if (check.exitStatus() != QProcess::NormalExit || check.exitCode() == 255)
-            return 255;
-        if (check.exitCode() != 0)
-            return 1;
-    }
+    // An old drive-sync syncs this folder too (accounts mode only: before the
+    // move its units are what a takeover moves aside). Two schedulers on one
+    // folder would break its base, so this one waits until it is removed.
+    if (paths.accountsMode && oldDriveSyncHold)
+        return 1;
+    // The machine's runOnlyWhen, as systemd reads an ExecCondition: a crash
+    // or 255 is a failure, any other non-zero exit a skip. A machine.json it
+    // cannot read holds too, as a failure.
+    QString guardError;
+    const QString guard = machineGuardCommand(paths, config, &guardError);
+    if (!guardError.isEmpty())
+        return 255;
+    if (const int verdict = runMachineGuard(guard); verdict != 0)
+        return verdict;
     const QString file = pauseFilePath(paths.appState);
     const PauseMark mark = readPause(file);
     if (!mark.present)

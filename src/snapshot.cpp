@@ -48,6 +48,7 @@ Snapshot buildSnapshot(const SnapshotSources &src) {
 
     SyncInputs in;
     in.systemctlWorks = src.systemctlWorks;
+    in.configError = src.configError;
     in.logFound = src.logFound;
     in.driveFound = src.driveFound;
     in.serviceLoad = src.service.value("LoadState");
@@ -72,6 +73,8 @@ Snapshot buildSnapshot(const SnapshotSources &src) {
     in.now = now;
     in.intervalSeconds = src.intervalSeconds;
     in.conflicts = src.conflicts;
+    in.oldDriveSync = src.oldDriveSync;
+    in.oldDriveSyncHold = src.oldDriveSyncHold;
     if (src.fixPresent) {
         in.fixStep = src.fix.step;
         in.fixError = src.fix.error;
@@ -95,9 +98,12 @@ Snapshot buildSnapshot(const SnapshotSources &src) {
     s.paused = paused;
     s.pausedUntil = paused ? src.pause.until : QDateTime();
     // A run started while paused would only be skipped by run-condition; one
-    // after the pause ended runs and clears the mark.
+    // after the pause ended runs and clears the mark. drive-sync run refuses
+    // a config it cannot read, so that is no run to offer either, and
+    // run-condition skips every tick while the move's journal is there.
     s.canSyncNow = src.systemctlWorks && in.serviceLoad == "loaded" && !serviceBusy && !running && !src.resyncRunning
-                   && !(paused && !pauseEnded(src.pause, now)) && !src.fixPresent;
+                   && !(paused && !pauseEnded(src.pause, now)) && !src.fixPresent && src.configError.isEmpty()
+                   && !src.moving;
     if (lastFinished) {
         s.lastRunStart = lastFinished->start;
         s.lastRunEnd = lastFinished->end;
@@ -145,7 +151,8 @@ QJsonObject snapshotToJson(const Snapshot &s, const QDateTime &nextRun, const QD
 }
 
 QString toneFor(const QString &status) {
-    static const QStringList errors{"failed", "timerOff", "unavailable", "notLoaded", "noLog", "noDrive", "fixFailed"};
+    static const QStringList errors{"failed", "timerOff", "unavailable", "notLoaded",
+                                    "noLog", "noDrive", "fixFailed", "configError"};
     static const QStringList warnings{"interrupted", "skipped", "paused", "stale", "noRuns", "conflicts", "fixWaiting"};
     if (errors.contains(status))
         return "error";
@@ -158,9 +165,10 @@ QString toneFor(const QString &status) {
     return status == "ok" ? "ok" : "error";
 }
 
-QStringList systemdShowArguments() {
-    return {"--user", "show", "--timestamp=unix", "drive-sync.service", "drive-sync.timer", "drive-sync-fix.service", "-p",
-            "LoadState,ActiveState,Result,ExecMainStartTimestamp,InactiveEnterTimestamp,UnitFileState"};
+QStringList systemdShowArguments(const QStringList &units) {
+    return QStringList{"--user", "show", "--timestamp=unix"} + units
+           + QStringList{"-p", "Id,LoadState,ActiveState,Result,ExecMainStartTimestamp,InactiveEnterTimestamp,"
+                               "UnitFileState,FragmentPath"};
 }
 
 bool fixUnitBusy(const QHash<QString, QString> &unit) {
@@ -169,8 +177,8 @@ bool fixUnitBusy(const QHash<QString, QString> &unit) {
     return active == "activating" || active == "active" || active == "deactivating" || active == "reloading";
 }
 
-QStringList listTimersArguments() {
-    return {"--user", "list-timers", "--all", "-o", "json", "drive-sync.timer"};
+QStringList listTimersArguments(const QStringList &timers) {
+    return QStringList{"--user", "list-timers", "--all", "-o", "json"} + timers;
 }
 
 QDateTime fromUnixStamp(const QString &value) {

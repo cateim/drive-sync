@@ -5,6 +5,7 @@
 #include <QStringList>
 #include <QTextStream>
 
+#include "accounts.h"
 #include "backend.h"
 #include "filterrules.h"
 #include "syncconfig.h"
@@ -32,6 +33,10 @@ QString folderRefusal(const BackendPaths &paths, const TakeoverPaths &takeover, 
                       const QStringList &alsoOwn = {});
 // The path with its existing part resolved (links, ".."), the rest as written.
 QString resolvedFolder(const QString &path);
+// Whether two folders are the same, or one holds the other, compared as
+// folderRefusal compares them: cleaned, as written and with links resolved.
+// An empty path overlaps nothing.
+bool foldersOverlap(const QString &a, const QString &b);
 
 // The oldest rclone whose bisync DriveSync relies on.
 inline constexpr int kMinRcloneMajor = 1;
@@ -40,6 +45,12 @@ inline constexpr int kMinRcloneMinor = 66;
 // Why setup cannot start, or empty. Asks rclone its version and its remotes.
 QString setupRefusal(const BackendPaths &paths, const TakeoverPaths &takeover, const QString &folder,
                      const QString &rclone);
+
+// The account first setup writes, from the one the dispatcher chose: with
+// no account listed (chosen has no id), account1 of the accounts layout
+// (newAccountPaths), whose files do not exist yet; otherwise chosen, which
+// setup then refuses.
+BackendPaths setupAccountPaths(const AccountRoots &roots, const BackendPaths &chosen);
 
 // "drive-sync setup --folder <path> [--skip <cloud folder>]... [--json]":
 // each --skip is a cloud folder left out from the start (selectivesync.h).

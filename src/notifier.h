@@ -4,8 +4,10 @@
 #include <QLocale>
 #include <QString>
 
+#include "accounts.h"
 #include "backend.h"
 #include "syncconfig.h"
+#include "takeover.h"
 
 // The desktop notifications of drive-sync, ported from drive-sync-aviso:
 // a critical card when a run fails, a reminder every hour while it keeps
@@ -34,10 +36,19 @@ struct NotifierPaths {
 int runNotifyCommand(const QString &serviceResult, const BackendPaths &paths, const NotifierPaths &tools,
                      const QDateTime &now);
 
-// "drive-sync watchdog", from drive-sync-watchdog.timer every hour. A config
-// that cannot be read (configError) is the problem it reports.
-int runWatchdogCommand(const BackendPaths &paths, const SyncConfig &config, const NotifierPaths &tools,
-                       const QDateTime &now, const QString &configError = {});
+// "drive-sync watchdog", from drive-sync-watchdog.timer every hour. First
+// the move to account1 (accountmove.h), with the rollback of one that
+// stopped halfway; then, once for the machine, the runOnlyWhen guard, which
+// silences it when it says no; then each account the resolver lists: a
+// config that cannot be read or units that keep every run from happening (a
+// card every hour, kept in the account's notify-watchdog.json), and the
+// reminders of a pause with no end and of a fix that waits. While the
+// move's journal exists no account is checked. Last, the cards about every
+// account, kept in <stateRoot>/notify-accounts.json: an ignored old config
+// and a stuck move (every hour), and an old drive-sync next to accounts
+// (one card per list of what was found, through takeover's tools).
+int runWatchdogCommand(const AccountRoots &roots, const TakeoverPaths &takeover, const NotifierPaths &tools,
+                       const QDateTime &now);
 
 // A fix that waits for the user (stopped false) or stopped: the card the unit
 // sends at once, and the watchdog repeats every hour.

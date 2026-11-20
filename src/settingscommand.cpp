@@ -9,6 +9,7 @@
 #include <QSaveFile>
 #include <QTemporaryDir>
 
+#include "accounts.h"
 #include "blockeddeletes.h"
 #include "controlcommands.h"
 #include "firstsetup.h"
@@ -130,7 +131,7 @@ QString setInterval(const BackendPaths &paths, const TakeoverPaths &takeover, Sy
     QString error;
     if (!saveSyncConfig(paths.config, config, &error))
         return error;
-    const QString dropIn = intervalDropInPath(takeover.userUnits);
+    const QString dropIn = intervalDropInPath(takeover.userUnits, paths.timerUnit);
     if (*minutes == kDefaultIntervalMinutes) {
         // The packaged value needs no drop-in, and none keeps DropInPaths
         // empty, as a takeover expects.
@@ -144,8 +145,8 @@ QString setInterval(const BackendPaths &paths, const TakeoverPaths &takeover, Sy
     // daemon-reload (a login, a package upgrade) applies them.
     if (const QString problem = systemctl(paths, {"daemon-reload"}); !problem.isEmpty())
         return QString("the interval is saved, but systemd did not reload: %1").arg(problem);
-    if (const QString problem = systemctl(paths, {"try-restart", "drive-sync.timer"}); !problem.isEmpty())
-        return QString("the interval is saved, but drive-sync.timer did not restart: %1").arg(problem);
+    if (const QString problem = systemctl(paths, {"try-restart", paths.timerUnit}); !problem.isEmpty())
+        return QString("the interval is saved, but %1 did not restart: %2").arg(paths.timerUnit, problem);
     return QString();
 }
 
@@ -313,8 +314,8 @@ Answer setSkipped(const BackendPaths &paths, const SyncConfig &config, const QSt
 
 }  // namespace
 
-QString intervalDropInPath(const QString &userUnits) {
-    return userUnits + "/drive-sync.timer.d/drive-sync-interval.conf";
+QString intervalDropInPath(const QString &userUnits, const QString &timerUnit) {
+    return userUnits + "/" + timerUnit + ".d/drive-sync-interval.conf";
 }
 
 QByteArray intervalDropIn(int minutes) {
@@ -379,15 +380,24 @@ int runSettingsCommand(const QStringList &arguments, const BackendPaths &paths, 
     // One writer at a time: the fix, setup and the unit take this lock too,
     // and a change must not land between a fix's read and write. The config
     // is read under it, so a change starts from the config as it is now.
-    const FixLock lock(paths.appState);
+    // None while the move to account1 runs, and none over paths it changed.
+    const AccountWriteLock lock(paths);
+    if (!lock.refusal().isEmpty())
+        return answerChange(json, {lock.refusal()}, out, err);
+    if (lock.stale())
+        return kAccountPathsMoved;
     if (!paths.managed)
         return answerChange(json, {kNotManaged}, out, err);
-    const auto config = loadSyncConfig(paths.config, &error);
+    auto config = loadSyncConfig(paths.config, &error);
     if (!config)
         return answerChange(json, {error}, out, err);
+    // In accounts mode the check is the machine's (machine.json), and one
+    // left in an account's config would only mislead: every save drops it.
+    if (paths.accountsMode)
+        config->runOnlyWhen.clear();
     if (fixPresent(paths.appState))
         return answerChange(json, {"a fix is under way; change the settings when it ends"}, out, err);
-    if (takeoverLockHeld(paths.appState, paths.proc))
+    if (takeoverLockHeld(paths.globalState(), paths.proc))
         return answerChange(json, {"a takeover is running; change the settings when it ends"}, out, err);
     if (action == "--max-delete")
         return answerChange(json, {setMaxDelete(paths, *config, value)}, out, err);

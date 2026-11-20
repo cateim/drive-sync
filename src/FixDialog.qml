@@ -114,7 +114,7 @@ Popup {
                         : qsTr("The dry run says the base run would make %Ln copies, each side getting what it lacks and the newer file winning:", "", backend.fixCopies)
                 const why = backend.causeKind !== "fixInterrupted" ? backend.fixError
                     : backend.causeDetail === "the fix stopped halfway" ? qsTr("It stopped halfway: a logout, a shutdown or a kill.")
-                    : qsTr("drive-sync-fix.service ended with %1. See: journalctl --user -u drive-sync-fix.service").arg(backend.causeDetail)
+                    : qsTr("%1 ended with %2. See: journalctl --user -u %1").arg(backend.fixUnit).arg(backend.causeDetail)
                 return why + "\n" + qsTr("Retry goes on from the same step. Runs wait until the fix ends or you cancel it.")
             }
         }

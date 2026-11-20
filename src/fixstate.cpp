@@ -116,11 +116,11 @@ bool clearFix(const QString &appState) {
     return (!QFile::exists(file) || QFile::remove(file)) && logGone;
 }
 
-FixLock::FixLock(const QString &appState) {
+FixLock::FixLock(const QString &appState, bool wait) {
     if (!QDir().mkpath(appState))
         return;
     m_fd = ::open(QFile::encodeName(appState + "/fix.lock").constData(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-    if (m_fd >= 0 && ::flock(m_fd, LOCK_EX) != 0) {
+    if (m_fd >= 0 && ::flock(m_fd, wait ? LOCK_EX : LOCK_EX | LOCK_NB) != 0) {
         ::close(m_fd);
         m_fd = -1;
     }

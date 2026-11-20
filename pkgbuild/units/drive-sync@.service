@@ -1,0 +1,20 @@
+# Shipped by DriveSync. One instance per account, drive-sync@<id>.service
+# (drive-sync@account1.service...), started by drive-sync@<id>.timer; the
+# account's own state is in ~/.local/state/drive-sync-app/accounts/<id>/.
+[Unit]
+Description=drive-sync: rclone bisync of %i run by DriveSync
+
+[Service]
+Type=oneshot
+# A stuck run becomes a failure, and a notification, instead of a silent stop
+# (a normal run takes about 8 min).
+TimeoutStartSec=2h
+# Skips the run while paused, while a fix or the move to accounts is under
+# way, or when the machine's runOnlyWhen check fails.
+ExecCondition=/usr/bin/drive-sync run-condition --account %i
+# Checks the filters' md5 first, then becomes rclone.
+ExecStart=/usr/bin/drive-sync run --account %i
+# Notifies when a run fails, and when runs work again.
+ExecStopPost=-/usr/bin/drive-sync notify --account %i
+Nice=10
+IOSchedulingClass=idle

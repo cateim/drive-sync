@@ -7,17 +7,24 @@ Single source of truth for agents and humans working on this repository.
 
 DriveSync is an Omarchy desktop app (Qt 6, C++ and QML) that shows the state
 of `drive-sync`, the rclone bisync of `~/Drive` with Google Drive that runs
-from the `drive-sync.timer` user unit every 15 minutes, in a window, on the
+from a user timer every 15 minutes (`drive-sync@account1.timer` since step
+5.1, `drive-sync.timer` for the single config of older versions until the
+move to accounts), in a window, on the
 Omarchy bar (its widget ships in the package) and through
 `drive-sync status --json`. It reads the rclone log, asks systemd, and looks
 for conflict copies. It writes its own state (`~/.local/state/drive-sync-app/`),
 the link to its bar widget, and, when the user accepts, the bar layout through
 `omarchy plugin`. Since step 2 it can take over a drive-sync made by
 `drive-sync.sh` (`drive-sync takeover`): its packaged user units then run the
-same rclone command from `~/.config/drive-sync/config.json`, and the window,
+same rclone command (since step 5.1 as `account1`: config and filters with
+their `.md5` in `~/.config/drive-sync/accounts/account1/`, the old
+`ExecCondition` in `machine.json`, `drive-sync@account1.timer` turned on;
+`takeover --undo` only from a pre-accounts takeover, refused and touching
+nothing once `accounts/` or `disconnected/` exists), and the window,
 the bar and the command line can sync now, pause and resume. Since step 3 it
 fixes a broken base (`F`, `drive-sync fix`): a resync with the folder in use,
-run by `drive-sync-fix.service`, which only starts after the user confirms a
+run by the account's fix unit (`drive-sync-fix@<id>.service`, the plain
+`drive-sync-fix.service` in legacy mode), which only starts after the user confirms a
 dry run and touches single synced files only as the fix's comparison or the
 user's answers say. It never starts a resync or touches a synced file
 otherwise. Since step 5b, after `--max-delete` stopped a run, it lists what
@@ -66,23 +73,26 @@ bin/build               qmake6 + make into build/drive-sync
 bin/test                builds and runs build/tests/drivesync_tests offscreen
 bin/install             bin/build, then makepkg -fsi with BUILDDIR/PKGDEST under build/
 bin/harness             builds tools/harness into build/harness and runs it with the given options
-src/main.cpp            commands run headless (status, sync, pause, resume, takeover, fix, deletes, signin, setup, settings, folders, and run-condition, run, notify, watchdog, fix-run for the units); otherwise the window
+src/accounts.{h,cpp}    the one resolver: legacy or accounts mode, every account's BackendPaths (paths and unit names), notices, labels; --account and chooseAccounts (which accounts a command acts on)
+src/accountmove.{h,cpp}  the move of the single config to account1: plannedMoves, moveBlocker, moveToAccounts with its journal and rollback; `drive-sync accounts [--migrate]`
+src/main.cpp            commands run headless (status, sync, pause, resume, takeover, fix, deletes, signin, setup, settings, folders, accounts, and run-condition, run, notify, watchdog, fix-run for the units); otherwise the window
 src/synclog.{h,cpp}     pure parser of the rclone bisync log into SyncRun records
 src/snapshot.{h,cpp}    buildSnapshot(): the one place the state is decided; tone; the JSON contract
-src/backend.{h,cpp}     the window's state: log watch, systemctl calls, conflict scan, headline rules (summarize)
+src/backend.{h,cpp}     the window's state: log watch, systemctl calls, conflict scan, headline rules (summarize); follows the resolver (setResolver), starts the move (startMove)
 src/clockformat.{h,cpp}  12 or 24 hours, read from the Omarchy bar clock in shell.json
-src/conflictcache.{h,cpp}  conflict count shared through ~/.local/state/drive-sync-app/conflicts.json
+src/conflictcache.{h,cpp}  conflict count shared through <appState>/conflicts.json (the account's state folder: ~/.local/state/drive-sync-app/accounts/<id>/, or the state root in legacy mode)
 src/statuscommand.{h,cpp}  `drive-sync status [--json]`: same sources, read once, synchronously
 src/syncconfig.{h,cpp}  the config a takeover writes; rclone arguments; filtersUsable (the md5 check)
-src/pausestate.{h,cpp}  the pause mark (~/.local/state/drive-sync-app/paused.json) and "next 08:00"
+src/pausestate.{h,cpp}  the pause mark (<appState>/paused.json) and "next 08:00"
 src/controlcommands.{h,cpp}  sync, pause, resume, run-condition, run (execs rclone); runProcess
-src/fixstate.{h,cpp}    the fix's state machine in ~/.local/state/drive-sync-app/fix.json (steps, questions)
-src/fixcommand.{h,cpp}  `drive-sync fix` and `fix-run` (drive-sync-fix.service): dry run, base run, questions, final run
+src/fixstate.{h,cpp}    the fix's state machine in <appState>/fix.json (steps, questions)
+src/fixcommand.{h,cpp}  `drive-sync fix` and `fix-run` (the account's fix unit, drive-sync-fix@<id>.service): dry run, base run, questions, final run
 src/listingdiff.{h,cpp}  reads bisync's .lst listings (Go %q names) and compares both sides, as drive-sync.sh did
+src/machineguard.{h,cpp}  the runOnlyWhen check of the machine: the config's in legacy mode, machine.json in accounts mode
 src/blockeddeletes.{h,cpp}  a max-delete stop: its deletions from the log, the one-run mark (allow-deletes.json), the raised guard, `drive-sync deletes`
 src/legacymigration.{h,cpp}  moves the SyncWatch and drivesync folders to the drive-sync names (state to drive-sync-app); first thing main() does
 src/notifier.{h,cpp}    notify (ExecStopPost) and watchdog: the port of drive-sync-aviso
-src/takeover.{h,cpp}    detect, apply with rollback, undo; `drive-sync takeover`
+src/takeover.{h,cpp}    detect, apply with rollback, undo; `drive-sync takeover`; checkPackagedUnits and foreignDropIns (packaged units and template instances, by Id); findOldDriveSync (an old drive-sync next to accounts)
 src/oauthclient.{h,cpp}  shippedOAuthClient(): the Google client, compiled in only from the git-ignored src/oauthclient.local.h (template: src/oauthclient.local.h.example)
 src/signin.{h,cpp}      `drive-sync signin [--abandon]`: rclone's browser flow creates the drive-sync remote, or refreshes the config's remote
 src/firstsetup.{h,cpp}  `drive-sync setup --folder`: refusals, default filters, the new user's config, startFix, then the timers
@@ -99,7 +109,7 @@ src/pluginsetup.{h,cpp} links the shipped bar widget and enables it through `oma
 src/theme.{h,cpp}       Omarchy accent and Hyprland rounding (from the skill template)
 src/translator.{h,cpp}  Omarchy language, JSON catalogs (from the skill template)
 src/Main.qml            window, shortcuts, layout
-src/StatusPanel.qml     headline, details, progress, warning chips
+src/StatusPanel.qml     headline, details, the resolver's notices, progress, warning chips
 src/RunsPage.qml        run list; RunDetail.qml shows the picked run
 src/ConflictsPage.qml   conflict copies
 src/HelpOverlay.qml     "?" overlay
@@ -125,7 +135,7 @@ plugin/                 Omarchy bar widget (id drive-sync), installed to /usr/sh
 site/                   project page on GitHub Pages (cateim.github.io/drivesync): index.html, privacy.html, terms.html, style.css, i18n.js (pt-BR and the EN/PT switch)
 .github/workflows/pages.yml  publishes site/, copying the icon and window-runs.png in from assets/
 docs/superpowers/       git-ignored, local only: design (specs/) and step plans (plans/)
-pkgbuild/               PKGBUILD, .desktop, units/ (drive-sync, drive-sync-watchdog and drive-sync-fix user units, /usr/lib/systemd/user)
+pkgbuild/               PKGBUILD, .desktop, units/ (/usr/lib/systemd/user: the plain drive-sync, drive-sync-watchdog and drive-sync-fix user units, and the templates drive-sync@.service, drive-sync@.timer and drive-sync-fix@.service, one instance per account)
 assets/icons/           launcher icon, installed by the PKGBUILD, and the logo of the Google Cloud consent screen (no tile, dark outline; `google-cloud-logo-120.png` beside it is the 120 px upload, rendered with `rsvg-convert -w 120 -h 120 assets/icons/drive-sync.svg -o assets/icons/google-cloud-logo-120.png`, so redo it whenever the SVG changes)
 assets/images/          README pictures: window-*.png from bin/harness over a made-up log; bar-*.png are real screens with no file names
 ```
@@ -134,13 +144,15 @@ assets/images/          README pictures: window-*.png from bin/harness over a ma
 
 ```sh
 bin/build            # about 30 s from clean
-bin/test             # 304 cases, about 24 s (twelve run real rclone on temp folders)
+bin/test             # 388 cases, about 34 s (twelve run real rclone on temp folders)
 bin/install          # needs sudo (pacman -U); run it in a real terminal
 bin/harness --scenario running --clock "h:mm AP" --out build/shot.png   # the window offscreen, made-up data; options atop tools/harness/harness.cpp
 makepkg -f           # from pkgbuild/, with BUILDDIR and PKGDEST set as in bin/install, to check packaging without sudo
 build/drive-sync status --json   # the state as the bar sees it (0.13 s with a fresh conflict cache)
-(cd plugin && node --test tests/*.test.mjs)   # bar widget, 26 cases; the glob is required on Node 22
+build/drive-sync status --account account1 --json   # one account; --account <id> comes first, on every command but setup, takeover, watchdog, accounts
+(cd plugin && node --test tests/*.test.mjs)   # bar widget, 29 cases; the glob is required on Node 22
 build/drive-sync takeover --check              # read-only: what a takeover would move, or what blocks it
+drive-sync accounts [--json]                   # read-only: mode, accounts, and whether the move to account1 can go (installed binary only; --migrate moves)
 bin/harness --scenario setup-offer --keys o --out build/shot.png   # first setup; also setup-signing-in, setup-folder, signin-needed
 bin/harness --managed --keys ",w^2w>w" --out build/shot.png   # Settings, Cloud folders page; ^3 Filters, ~X types an X
 omarchy plugin validate plugin                # needs the folder path, not the plugin id
@@ -148,20 +160,109 @@ omarchy plugin validate plugin                # needs the folder path, not the p
 
 ## How the state is decided
 
+Which drive-sync is read comes first: `resolveAccounts()` (`src/accounts.cpp`)
+is the only place that builds an account's paths or unit names (spec 12, step
+5.1). Legacy mode (neither `~/.config/drive-sync/accounts/` nor `disconnected/`
+exists, and `config.json` does) has one account, `account1`, with exactly the
+old paths and the plain units. Accounts mode (everything else) lists the
+`accounts/<id>/` folders named by a valid id (`account1` to `account99`) that
+hold a `config.json`, each with its state in
+`~/.local/state/drive-sync-app/accounts/<id>/`, no drive-sync.sh state folder
+and the units `drive-sync@<id>.service`, `.timer` and `drive-sync-fix@<id>.service`;
+there may be none, and an old `config.json` is then ignored and reported
+(`staleConfig`), never moved. A config that does not load keeps its account.
+`BackendPaths::defaults()` is the first account, else `noAccountPaths` (no
+config, plain units, not managed). The takeover lock and the move's
+`migration.json` live in the state root (`BackendPaths::globalState()`).
+
 `buildSnapshot()` (`src/snapshot.cpp`, pure, tested) is the only place: the
 window's `Backend`, `drive-sync status` and, through its JSON, the bar widget
 all show what it decides. It finds the running run, the last success, the
-last run, `failingSince`, `canSyncNow` and the `tone` (`ok`, `busy`,
-`warning`, `error`), and calls `Backend::summarize`, which picks one
+last run, `failingSince`, `canSyncNow` (false while `migration.json`
+exists, `SnapshotSources::moving`, since `run-condition` skips every tick
+then) and the `tone` (`ok`, `busy`, `warning`, `error`), and calls `Backend::summarize`, which picks one
 headline, most urgent first:
-`unavailable` (systemctl failed), `notLoaded`, `fixing`, `fixWaiting`, `fixFailed`,
+`unavailable` (systemctl failed), `configError` (an account whose config
+does not load, detail the loader's reason; never for a missing config, which a
+takeover undone leaves), `notLoaded`, `fixing`, `fixWaiting`, `fixFailed`,
 `running`, `resync`, `paused`, `noLog`,
-`failed`, `interrupted`, `skipped` (ExecCondition: emergency home), `timerOff`,
+`failed`, `interrupted`, `skipped` (ExecCondition: emergency home; `causeKind`
+`oldDriveSync` when an old drive-sync holds the account), `timerOff`,
 `stale` (no success for three intervals, 45 min at the default 15; the
 interval comes from the config through `BackendPaths::intervalSeconds`), `noDrive`, `noRuns` (a log with no run:
 new or rotated), `conflicts`, `ok`. What the
 headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
-`conflicts`.
+`conflicts`, `oldDriveSync`.
+
+An old drive-sync next to accounts (spec 12; accounts mode only, since
+before the move it is what a takeover moves aside): `findOldDriveSync`
+(`src/takeover.cpp`) lists drive-sync.sh's units, scripts and the filters
+its unit names, and a plain `drive-sync.service` or `.timer` systemd loads
+from outside `/usr/lib/systemd/user`; `oldDriveSyncHolds` holds the account
+whose folder the old unit names (equal, inside or containing,
+`foldersOverlap`), and every account when an old `drive-sync.service` names
+no folder it can read. Readers never look by themselves: `main` hands
+`status` and the window an `OldDriveSyncCheck` over the real home, and the
+plain units ride in their one `show` call; tests and the harness give none.
+The hold skips in `run-condition` (after the move and fix checks), shows as
+`skipped` with `causeKind` `oldDriveSync` (the detail lists what was found)
+and the warning `oldDriveSync` (chip in the window, a line in the bar's
+panel); the watchdog sends one card per new list, kept in
+`~/.local/state/drive-sync-app/notify-accounts.json`. DriveSync never stops
+or edits the old units.
+
+The watchdog (`runWatchdogCommand(roots, takeover, notifier, now)`,
+`drive-sync-watchdog.timer`, hourly) runs `moveToAccounts` first (the move,
+or the rollback of an orphan journal), then resolves, then runs the machine
+guard once (silent when it says no). With no journal it watches each
+account (`watchAccount`: config error, an unreadable `machine.json`, or
+`timerProblem` over the account's own units; the pause and fix reminders),
+each with its `notify-watchdog.json` in the account's state folder, written
+and removed under `AccountWriteLock`. While `migration.json` exists (a live
+move, or one stuck) it checks no account and writes no account file: a
+"timer off" card would be wrong, and a file at the old place would make the
+rollback stuck. Cards about every account live in `notify-accounts.json`
+by kind: `moveStuck` and `staleConfig` repeat hourly like any problem (the
+latter is left alone while a journal exists, since the old config is then a
+step of the move) and go silently once fixed; `oldDriveSync` stays one card
+per list. The `moveStuck` card says to clear what the journal's
+`stuckReason` names (it adds the reason, `migrationStuckReason`) and run
+`drive-sync accounts --migrate`, which rolls back from the journal again;
+the window's notice and `status`'s stderr say the same. `moveRolledBack`
+comes from the outcome of the watchdog's own `moveToAccounts`: hourly
+while it keeps ending in `rolledBack` (with the reason, an orphan journal's
+rollback included), gone silently on `moved` or `notNeeded`, left alone on
+`deferred` or `stuck`; the window's `startMove` child shows nothing, since
+the next watchdog round tries again. `configGone`: with no account, no
+journal and `singleConfigGone` (no `accounts/`, no `disconnected/`, no
+`config.json`), a plain `drive-sync.timer` loaded from the package and
+enabled or active means the single config vanished (the card pre-5.1
+watchdogs gave, "config cannot be read"); a timer that is off (a new
+machine) or a user unit of that name (an undone takeover) says nothing.
+Titles carry no account label in 5.1.
+
+The window follows the resolver (`windowAccount(roots)`: the first account,
+else `noAccountPaths`, and the notices). `main` gives the `Backend` a
+resolver (`setResolver`), which `reloadConfig` asks first: another id,
+config, state folder or unit means the window drops every watch (log,
+state folder, config folder) and adopts the new paths, so a first setup, a
+takeover, a cancelled first setup and the move need no restart. Besides the
+config's folder it watches the config root (`~/.config/drive-sync`), where
+`accounts/` appears and the old `config.json` leaves; each recompute (the
+30 s poll) looks for one that appeared since (a setup or a takeover run from
+a terminal on a home with no `~/.config/drive-sync`) and asks the resolver
+once when it adds a watch. While a move is live
+(`migration.json` and no `moveStuck` notice) it keeps what it shows and
+asks again each second: between `mkdir accounts/account1` and the config's
+rename the resolver sees no account at all. A systemd answer, or a `find`,
+started for the paths it left is dropped and asked again. `notices`
+(`{kind, path}`) are lines in `StatusPanel`. When the layout is legacy or a
+journal exists, `main` calls `startMove()`: a child `drive-sync accounts
+--migrate --json` with no parent, no timeout and its output to
+`/dev/null`, since a move killed halfway waits for the next trigger to
+roll back; then `reloadConfig`. Its exit code is never shown: a stuck move
+shows through the notice. The window's own commands still carry no
+`--account` (5.2 adds it).
 
 - A run is "running" when systemd says the service is active, when the resync
   pause mark holds a live `drive-sync.sh` pid, or when the open run wrote to
@@ -179,10 +280,26 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
 - The JSON (`snapshotToJson`, version 2) always has the same 20 keys (version
   1 plus `managed`, `paused`, `pausedUntil`); times are Unix seconds, `0` when
   unknown. The widget rejects any other version, so a change to the keys means
-  a new version and a widget that reads it, installed together.
+  a new version and a widget that reads it, installed together. With several
+  accounts, `status` reads them all with one `show` and one `list-timers`
+  (`gatherAccounts`), `--json` prints the worst one (`worstAccount`: error,
+  warning, busy, ok, the first on a tie), and the text prints
+  `<id>: <status>` per account (one account: the old single line). The
+  resolver's notices (`staleConfig`, `moveStuck`) go to stderr only, so the
+  bar never reads them.
 - A pause is a mark file, not a stopped timer: `run-condition` skips each tick
   while it holds and clears it at the first tick after its end, so "paused"
   lasts until a run really starts and survives a reboot.
+- `runOnlyWhen` guards the machine, not an account (`src/machineguard.cpp`).
+  Legacy mode reads the config's; accounts mode, and the view with no
+  account (setup, a first sign-in), read `~/.config/drive-sync/machine.json`,
+  `{"version": 1, "runOnlyWhen": "<shell command>"}`, and ignore any left in
+  a config (Settings drops it at its next save there). A missing file or an
+  empty command is no guard; a file that cannot be read holds (`run-condition`
+  255, the others refuse naming it, the watchdog reports it). It runs as
+  systemd reads an ExecCondition (0 passes, 255 or a crash fails, else no)
+  and holds `run-condition`, `fix --start`, every `fix-run` step, `signin`
+  (not `--abandon`) and `setup`; the watchdog says nothing while it says no.
 - A fix is a mark file too: `fix.json` is written before anything else and
   `run-condition` skips every tick while it exists, so the timer, `S`, `U` and
   the bar's sync wait for the whole fix (spec section 5). Its steps:
@@ -191,21 +308,43 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   user), `finishing` (answers, then a normal run through `runCommandPlan`),
   or `failed`. `fix-run` loops until a step waits for the user, fails or ends,
   and sends a card at once when it does (the watchdog repeats it hourly). It
-  checks the config's `runOnlyWhen` before every step, `fix --start` also
+  checks the machine's `runOnlyWhen` before every step, `fix --start` also
   refuses after a run that `--max-delete` stopped (`causeKind` `maxDelete`,
   spec 5b), and a final run that failed and took the listings with it sends
   the retry back to `base`.
 - A fix shows as `fixing` (busy; the JSON's `resync` is true), `fixWaiting`
-  (confirm or questions) or `fixFailed`. A working step with
-  `drive-sync-fix.service` inactive is interrupted (`causeKind`
+  (confirm or questions) or `fixFailed`. A working step with the account's
+  fix unit inactive is interrupted (`causeKind`
   `fixInterrupted`), but only 60 s after `stepStarted`: `fix` writes the step
-  before systemd starts the unit. The `systemctl show` call describes three
-  units (service, timer, fix unit), and every reader requires all three.
+  before systemd starts the unit. The `systemctl show` call names the
+  account's three units (`accountUnits`: service, timer, fix unit, from the
+  resolver) with `-p Id,...`, and every reader maps the blocks by `Id`
+  (`Backend::parseShowById`), never by position, and requires all three: a
+  missing one is `unavailable`. `list-timers` names the account's timer and
+  is read by its `unit`. No command, card or window line hardcodes a unit
+  name; the texts take it as an argument (`Backend.serviceUnit`,
+  `timerUnit`, `fixUnit`), and the interval drop-in is
+  `intervalDropInPath(userUnits, timerUnit)`. The takeover keeps the plain
+  names of the old units it reads.
 - Every writer of `fix.json` (the `fix` command, `fix-run`, the watchdog's
   reminder) takes `FixLock` (an flock on `fix.lock`) around its read and
   write, never across a long step. The fix and the takeover find the bisync
   listings by `bisyncSessionName(remote, local)`, the name rclone gives them
   (checked against rclone 1.75.2), never "the only pair in the work dir".
+- The writers of an account's state that run outside a unit (`fix`,
+  `setup`, `settings`, `deletes --allow`, `pause`, `resume`, and the
+  watchdog's reminders and its `notify-watchdog.json` for their write) take
+  `AccountWriteLock`
+  (`src/accounts.h`): the account's `FixLock` first, then, with it held, a
+  refusal while `migration.json` exists ("DriveSync is moving to accounts;
+  try again in a minute"), then `accountPathsCurrent`: when the paths it
+  resolved before waiting are no longer the account's, it exits 75
+  (`kAccountPathsMoved`) before printing anything, and `dispatchToAccounts`
+  resolves again and runs it once more. Paths with no `configRoot` or
+  `stateRoot` (built by hand, as in many tests) are always current. Never
+  take one while holding a `FixLock` in the same process. `status`, the
+  window's conflict scan and its answers file write nothing while the
+  journal exists.
 - Runs refused for the filters' md5 have `causeKind` `filtersChanged` (the
   refusal text ends in `kFiltersChangedReason`): a normal card says "press F"
   instead of the critical "stopped syncing" one.
@@ -225,7 +364,20 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   `<appState>/first-setup.json` (what it wrote); `fix --cancel` with that
   mark and no base undoes the setup (timers off, its config and filters
   removed, its empty folders removed) and the window offers setup again. The
-  base step removes the mark.
+  base step removes the mark. Since step 5.1 setup writes `account1` in the
+  accounts layout (`setupAccountPaths`: with no account listed, main hands
+  it `newAccountPaths(roots, "account1")`): config and filters in
+  `~/.config/drive-sync/accounts/account1/`, work dir and log in its state
+  folder, `drive-sync-fix@account1.service` started and
+  `drive-sync@account1.timer` turned on. It refuses when any account is
+  listed (`DriveSync already runs drive-sync (<ids>)`), in legacy mode by the
+  single config's name, and while `~/.config/drive-sync/filters.txt`
+  exists. Those paths name an id the resolver does not list yet, so
+  `accountPathsCurrent` takes a new account's paths (accounts layout, not
+  managed) as current while the layout lists no account and no journal
+  exists: an account that appears while setup waits on the lock sends it
+  round again (75), where it refuses. The cancel leaves the state folder
+  (it holds `fix.lock` and the dry run's log).
 - A run `--max-delete` stopped is `causeKind` `maxDelete` (spec 5b). Its
   deletions come from its own log lines (`blockedDeletes`, only when it is
   the newest run), so the headline, the card and `D` count both sides.
@@ -313,7 +465,14 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   never do it while the installed binary is still the old `drivesync`, which
   would then lose its config (test in a copied HOME instead: copy the three
   folders into a temp dir, rewrite the home in the copied JSON, run with
-  `HOME=<dir>`). `PluginSetup` swaps the `drivesync` widget for `drive-sync`
+  `HOME=<dir>`). Since step 5.1 a copied HOME is not enough for `watchdog`
+  and `accounts --migrate`: they change user units, and `systemctl --user`
+  reaches the real user manager whatever HOME says. The move takes
+  `systemctl` from its paths, which the tests fake; by hand it is tried
+  only through the installed package. Opening the window counts too:
+  `build/drive-sync` with no argument starts `accounts --migrate` on a
+  legacy home (or one with a journal), run by itself (`build/drive-sync`);
+  look at the window with `bin/harness` instead. `PluginSetup` swaps the `drivesync` widget for `drive-sync`
   on the bar by itself (`enable drive-sync --after drivesync`, then `disable
   drivesync`, then it removes the dangling link). The PKGBUILD
   `conflicts`/`replaces` `syncwatch` only: `drivesync` was dropped on
@@ -327,7 +486,12 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
 - **"drive-sync" is a substring of the legacy script names** (`drive-sync.sh`,
   `drive-sync-aviso`, the units' command lines). Never match the app by
   `contains("drive-sync")`: `takeoverLockHeld` reads the exact name of
-  `argv[0]`, and the legacy checks match by exact file name.
+  `argv[0]`, and the legacy checks match by exact file name. The same holds
+  for units since step 5.1: `drive-sync@account1.service`,
+  `drive-sync@.timer` and `drive-sync-fix@account1.service` all contain
+  `drive-sync`, as do the plain units and `drive-sync-watchdog.timer`. Name
+  a unit exactly (`accountUnits(paths)`,
+  `plainDriveSyncUnits()`), and map `systemctl show` answers by `Id`.
 
 - **A bisync run with the filters' `.md5` missing or stale destroys its base.**
   Tried with rclone 1.75 on 2026-11-08: the run stops with a critical error and
@@ -437,7 +601,15 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   `managed`; `--takeover none` (and the `setup-*` scenarios) is a machine
   with no drive-sync at all, which shows the setup banner. A new context property in
   `main.cpp` needs the same line in `tools/harness/harness.cpp`, and a new
-  source file the window uses needs `tools/harness/harness.pro`.
+  source file the window uses needs `tools/harness/harness.pro`. Like
+  `main`, it gives the `Backend` a resolver, over made-up roots in its temp
+  folder (`config/`, `app/`, `units/`, the fake paths as the base): an
+  account the roots hold wins (`config-error`, `stale-config`,
+  `move-stuck`), and with none the fake paths stand in, so the older
+  scenarios (a managed drive-sync with no config file) look as they did.
+  It calls `startMove()` as `main` does, and the fake `drive-sync` answers
+  `accounts --migrate --json` (`stuck` for `move-stuck`, else
+  `notNeeded`); never with `--real`, where `self` would move this machine.
 - The Material `Button` background (an elevation effect) does not render in
   the offscreen harness; `BarBanner.qml` draws its button's background itself.
 
@@ -449,7 +621,7 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   changes), "fix" (fix.json's start; a mark serves that fix only, and
   `fix --start` clears one left behind) and "applied". The fix's preparing
   step writes the new bytes (`applySettingsChange`) only after its loop that
-  waits for drive-sync.service to be idle: a run that passed run-condition
+  waits for the account's service to be idle: a run that passed run-condition
   before the mark would otherwise read new filters against the old `.md5`,
   abort and take the base with it. `fix --cancel` at `preparing`, `confirm`,
   or `failed` from `preparing` writes the old bytes back when "applied",
@@ -464,8 +636,74 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
 - **Option values are taken as they are** in `settings`, `setup` and
   `folders` (a cloud folder may be called `--json`); `folders` takes its path
   after `--`, and the window always passes it so.
-- **The interval drop-in.** `~/.config/systemd/user/drive-sync.timer.d/drive-sync-interval.conf`
-  resets the timer list with an empty `OnUnitActiveSec=` (systemd.timer(5):
+- **`--account <id>` is taken only as the first two arguments** after the
+  command (`takeAccountOption`), so a cloud folder named `--account` stays a
+  value. `main` resolves once and hands everything to `dispatchToAccounts`:
+  `run-condition` skips (1) while `migration.json` exists, before any config
+  is read; then `chooseAccounts` decides. `status`, `sync`, `pause` and
+  `resume` act on every account (their `--json` keeps `ok` and `error`, the
+  first account's that failed, and adds `accounts`; `resume` with several
+  leaves an account that is not paused alone); `fix`, `deletes`,
+  `settings`, `folders` and `signin` act on the only one. What the units call
+  (`run-condition`, `run`, `notify`, `fix-run`) takes no `--account` in
+  legacy mode and needs one in accounts mode, the mode checked before the
+  id: legacy mode lists `account1` too, and an instance must never run the
+  account the plain units run. One exception keeps the pre-5.1 rule: a
+  plain `run-condition` with no account at all and `singleConfigGone`
+  exits 255 with the loader's error, a failure systemd records, not a skip
+  (`configGone` is its card). An instance whose account is not listed
+  still skips (1). The window's children pass no `--account` in 5.1.
+- **The move to accounts (step 5.1, `src/accountmove.cpp`).** `accounts/`
+  under `~/.config/drive-sync` decides the mode, so `config.json` moves last
+  and `<configRoot>/accounts/account1` is made just before it: until then
+  the resolver stays in legacy mode. The order: every check with nothing
+  touched (`moveBlocker`: legacy, guard, takeover lock, FixLock probed
+  without creating the file, no target already there, `machine.json`
+  absent, the three `account1` instances packaged with no drop-in, no
+  foreign drop-in, no old drive-sync, plain service and fix unit idle);
+  the takeover lock, then the FixLock (no wait), held to the end; the
+  journal `<stateRoot>/migration.json` (every planned move, what was made,
+  the plain timer's enabled and active); `disable --now drive-sync.timer`;
+  the plain service and fix unit idle again (a tick in between defers);
+  the renames (`renameat2` with `RENAME_NOREPLACE`, so nothing is ever
+  overwritten); the moved JSON files rewritten through an exact map
+  (each moved path and the config, never `<stateRoot>` as a prefix, so
+  `<stateRoot>/bisync` stays), keeping their compact or indented layout;
+  `machine.json`; the config; `daemon-reload` and `checkPackagedUnits` with
+  the moved interval file allowed; the instance timer enabled and started
+  as the plain one was; the old `conflicts.json` deleted only then; the
+  journal removed. Each folder or file it makes goes into the journal
+  before it is made. Any failure, and any journal found by a later trigger
+  with no live drive-sync holding the takeover lock, goes through one
+  rollback that reads only the journal: the instance timer off, each move
+  back in reverse, the inverse rewrite, what it made removed (folders while
+  empty), `daemon-reload` (a failure tolerated), the plain timer as
+  recorded, the journal removed. It counts as done only when the resolver
+  reads legacy mode again; otherwise (two copies of a file, a file gone)
+  the journal stays with `"stuck": true`, no timer comes back, and the
+  resolver reports `moveStuck`. The rollback of an orphan journal takes the
+  takeover lock and then holds the FixLock as the move does, on `fix.lock`
+  wherever it is now (the new place, else the old one), opened without
+  creating anything (`OrphanFixLock`); a held one defers. `fix.lock` carries no data: one at both
+  ends (a writer that waited on the old path made it again) loses the
+  source copy, and an empty one already at the target is replaced. A
+  plain timer that will not come back still ends the rollback (legacy
+  mode, timer off, which the watchdog reports) rather than holding every
+  tick behind a journal; what the timer was goes to
+  `<stateRoot>/plain-timer.json` (outside the moved entries), which the
+  next move ORs into its journal, so `drive-sync@account1.timer` comes on
+  as `drive-sync.timer` was, and which a move that holds or a rollback that
+  puts the timer back removes. `takeTakeoverLock` makes its check, the
+  removal of a stale pid file and the new one a single step under an
+  flock on the state root folder (no file of its own); the pid file is
+  still the lock every reader and an older drive-sync check. Task 1 (2026-11-19) found that a started timer
+  whose `OnBootSec` passed fires at once, and that a start `ExecCondition`
+  skips still gives `OnUnitActiveSec` its base, so the move starts no
+  extra run.
+- **The interval drop-in.** `intervalDropInPath(userUnits, timerUnit)`:
+  `~/.config/systemd/user/drive-sync@<id>.timer.d/drive-sync-interval.conf`
+  for an account in accounts mode (the move carries it there), and
+  `drive-sync.timer.d/` for the single config of legacy mode. It resets the timer list with an empty `OnUnitActiveSec=` (systemd.timer(5):
   that resets every timer, so it repeats `OnBootSec=5min`), then sets the new
   value. At 15 minutes there is no drop-in at all, because the takeover
   refuses any drop-in on the units (`dropIn` blocker, `checkPackagedUnits`),
@@ -474,7 +712,7 @@ headline leaves out goes to `warnings`: `timerOff`, `timerDisabled`,
   keeps `intervalMinutes` (optional in config version 1, 15 when absent);
   "late" reads it from there, never from systemd. Not verified on a live
   timer: whether daemon-reload alone re-arms it (the command also runs
-  `try-restart drive-sync.timer`).
+  `try-restart` on the account's timer).
 - **Selective sync rules** (tried with rclone 1.75.2): the block sits at the
   top because filter rules are first-match; each line is
   `- /<folder>/**` with `\ * ? [ ] { }` escaped by a backslash; a name with a
@@ -563,6 +801,14 @@ place, so it shows up in the Omarchy launcher. The DIY repository records it in
 `docs/omarchy.md` (packages built from a local repository). Bump `pkgver` in
 `pkgbuild/PKGBUILD` and `app.setApplicationVersion` in `src/main.cpp`
 together, after closing the changelog.
+
+The first install of step 5.1 moves the maintainer's single drive-sync to
+`account1` (the watchdog, the window at start, or `drive-sync accounts
+--migrate`): it turns `drive-sync.timer` off and `drive-sync@account1.timer`
+on, and moves the interval drop-in. That is a notebook customization, so
+the DIY repository follows in the same session (its `docs/omarchy.md`
+drive-sync row and Parte 5, its `[Unreleased]`); the plan of step 5.1 keeps
+the drafts and the checks to run by hand (its Task 16).
 
 The project page publishes itself: a push to `master` that touches `site/`,
 `assets/icons/`, `assets/images/` or the workflow runs `pages.yml` (the repo's

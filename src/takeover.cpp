@@ -16,9 +16,12 @@
 #include <QThread>
 #include <functional>
 
+#include "accounts.h"
 #include "controlcommands.h"
+#include "firstsetup.h"
 #include "fixstate.h"
 #include "listingdiff.h"
+#include "machineguard.h"
 #include "pausestate.h"
 #include "statuscommand.h"
 
@@ -135,6 +138,19 @@ bool hasListings(const SyncConfig &config) {
     return !currentListings(config.workDir, bisyncSessionName(config.remote, config.localPath)).first.isEmpty();
 }
 
+// The account a takeover makes, account1 of the accounts layout, as the
+// resolver names its paths and units.
+BackendPaths takenOverAccount(const TakeoverPaths &paths) {
+    AccountRoots roots;
+    roots.configRoot = paths.appConfigDir;
+    roots.stateRoot = paths.appState;
+    roots.userUnits = paths.userUnits;
+    return newAccountPaths(roots, "account1");
+}
+
+// The account's filters sit beside its config, with their .md5.
+QString accountFilters(const BackendPaths &account) { return QFileInfo(account.config).path() + "/filters.txt"; }
+
 bool remoteExists(const QString &rclone, const QString &remote) {
     QByteArray output;
     if (!runProcess(rclone, {"listremotes"}, kToolTimeoutMs, &output, nullptr))
@@ -163,7 +179,8 @@ TakeoverPaths TakeoverPaths::defaults() {
 
 TakeoverPlan detectTakeover(const TakeoverPaths &paths, const Snapshot &snapshot) {
     TakeoverPlan plan;
-    if (loadSyncConfig(paths.appConfigDir + "/config.json", nullptr)) {
+    // Any account at all, legacy or not: a takeover only ever makes the first.
+    if (!readAccountLayout(paths.appConfigDir).ids.isEmpty()) {
         plan.state = "managed";
         return plan;
     }
@@ -256,6 +273,10 @@ TakeoverPlan detectTakeover(const TakeoverPaths &paths, const Snapshot &snapshot
         for (const QString &unitName : {QString("drive-sync.service"), QString("drive-sync.timer")})
             if (QFileInfo(dir + "/" + unitName + ".d").isDir())
                 plan.blockers << "dropIn";
+    // The takeover turns on account1's instance units, which a drop-in on
+    // their templates, their prefixes or the instances reaches too.
+    if (!foreignDropIns(paths, "account1").isEmpty())
+        plan.blockers << "dropIn";
 
     if (fixPresent(paths.appState))
         plan.blockers.prepend("fixActive");
@@ -269,7 +290,8 @@ TakeoverPlan detectTakeover(const TakeoverPaths &paths, const Snapshot &snapshot
         plan.blockers.removeDuplicates();
         return plan;
     }
-    plan.config.filtersFile = paths.appConfigDir + "/filters.txt";
+    // account1's own filters, beside its config in the accounts layout.
+    plan.config.filtersFile = accountFilters(takenOverAccount(paths));
     // The old units, scripts and state move first, while the old unit may
     // still run: what it reads must not move with them.
     for (const QString &path : {plan.oldFiltersFile, plan.config.workDir, plan.config.logFile})
@@ -284,6 +306,15 @@ TakeoverPlan detectTakeover(const TakeoverPaths &paths, const Snapshot &snapshot
         plan.blockers << "remoteMissing";
     if (QFile::exists(plan.config.filtersFile) || QFile::exists(plan.config.filtersFile + ".md5"))
         plan.blockers << "targetExists";
+    // The old ExecCondition becomes the machine's guard. One that guards
+    // with another command (or cannot be read) would hold, or let through,
+    // what the old unit did not.
+    const QString machine = machineGuardPath(paths.appConfigDir);
+    if (QFileInfo::exists(machine)) {
+        const std::optional<QString> guard = readMachineGuard(machine, nullptr);
+        if (!guard || *guard != plan.config.runOnlyWhen)
+            plan.blockers << "targetExists";
+    }
     plan.blockers.removeDuplicates();
 
     for (const QString &name : {QString("drive-sync.service"), QString("drive-sync.timer"),
@@ -301,6 +332,8 @@ TakeoverPlan detectTakeover(const TakeoverPaths &paths, const Snapshot &snapshot
 
 namespace {
 
+// DriveSync's timers in the single layout before accounts, which is what a
+// legacy undo turns off. A takeover now turns on account1's instance timer.
 const QStringList kNewTimers{"drive-sync.timer", "drive-sync-watchdog.timer"};
 
 // One step done, and how to take it back. A fatal undo stops the rollback:
@@ -424,58 +457,130 @@ QString restoreOldTimers(const TakeoverPaths &paths, const QStringList &enabled,
     return problems.join("; ");
 }
 
-// Takes the takeover lock, shared by apply and undo, so they never run at
-// once. A lock whose process is gone is replaced.
-bool takeLock(const QString &appState, QString *error) {
-    const QString path = takeoverLockPath(appState);
-    QDir().mkpath(appState);
-    if (QFileInfo::exists(path)) {
-        if (takeoverLockHeld(appState, "/proc")) {
-            *error = "another takeover or undo is running";
-            return false;
-        }
-        QFile::remove(path);
-    }
-    QFile lock(path);
-    if (!lock.open(QIODevice::WriteOnly | QIODevice::NewOnly)
-        || lock.write(QByteArray::number(QCoreApplication::applicationPid()) + "\n") <= 0) {
-        *error = "cannot take the takeover lock " + path;
-        return false;
-    }
-    return true;
-}
+}  // namespace
 
-// Removes the lock only when it is still ours.
-void releaseLock(const QString &appState) {
-    QFile lock(takeoverLockPath(appState));
-    if (lock.open(QIODevice::ReadOnly) && lock.readAll().trimmed() == QByteArray::number(QCoreApplication::applicationPid())) {
-        lock.close();
-        lock.remove();
-    }
-}
-
-// The packaged units must be the ones systemd uses, with no drop-in on top.
-QString checkPackagedUnits(const TakeoverPaths &paths) {
+QString checkPackagedUnits(const TakeoverPaths &paths, const QStringList &units, const QString &allowedDropIn) {
     QByteArray output;
     QString error;
-    if (!runProcess(paths.systemctl,
-                    {"--user", "show", "-p", "FragmentPath,DropInPaths", "drive-sync.service", "drive-sync.timer"},
+    if (!runProcess(paths.systemctl, QStringList{"--user", "show", "-p", "Id,LoadState,FragmentPath,DropInPaths"} + units,
                     kToolTimeoutMs, &output, &error))
         return "systemctl show failed: " + error;
-    const auto units = Backend::parseShow(output);
-    if (units.size() != 2)
-        return "systemctl show did not describe both units";
-    for (const auto &unit : units) {
+    const auto byId = Backend::parseShowById(output);
+    for (const QString &name : units) {
+        if (!byId.contains(name))
+            return QString("systemctl show did not describe %1").arg(name);
+        const QHash<QString, QString> &unit = byId.value(name);
+        if (unit.value("LoadState") != "loaded")
+            return QString("%1 does not load (%2)").arg(name, unit.value("LoadState"));
         const QString fragment = unit.value("FragmentPath");
         if (!fragment.startsWith(paths.packagedUnits + "/"))
             return QString("systemd still uses %1, not DriveSync's unit").arg(fragment.isEmpty() ? "?" : fragment);
-        if (!unit.value("DropInPaths").isEmpty())
-            return "a drop-in still applies: " + unit.value("DropInPaths");
+        // A drop-in can carry its own ExecStart and bypass "drive-sync run"
+        // and its md5 check: only DriveSync's own interval file may apply.
+        for (const QString &dropIn : unit.value("DropInPaths").split(' ', Qt::SkipEmptyParts))
+            if (dropIn != allowedDropIn)
+                return "a drop-in still applies: " + dropIn;
     }
     return {};
 }
 
-}  // namespace
+OldDriveSync findOldDriveSync(const TakeoverPaths &paths, const QHash<QString, QHash<QString, QString>> &plainUnits) {
+    OldDriveSync old;
+    for (const QString &name : {QString("drive-sync.service"), QString("drive-sync.timer"),
+                                QString("drive-sync-vigia.service"), QString("drive-sync-vigia.timer")})
+        if (QFile::exists(paths.userUnits + "/" + name))
+            old.found << paths.userUnits + "/" + name;
+    for (const QString &name : {QString("drive-sync.sh"), QString("drive-sync-aviso")})
+        if (QFile::exists(paths.binDir + "/" + name))
+            old.found << paths.binDir + "/" + name;
+    // A plain unit systemd loads from anywhere but the package: one in
+    // /etc/systemd/user, say, or the user's own, which wins over the package.
+    QString serviceFile = QFile::exists(paths.userUnits + "/drive-sync.service")
+                              ? paths.userUnits + "/drive-sync.service"
+                              : QString();
+    for (const QString &name : plainDriveSyncUnits()) {
+        const QString fragment = plainUnits.value(name).value("FragmentPath");
+        if (fragment.isEmpty() || fragment.startsWith(paths.packagedUnits + "/"))
+            continue;
+        old.found << fragment;
+        if (name == "drive-sync.service" && serviceFile.isEmpty())
+            serviceFile = fragment;
+    }
+    // Its folder and filters, from its ExecStart.
+    if (!serviceFile.isEmpty()) {
+        bool ok = false;
+        const UnitFile unit = readUnit(serviceFile, &ok);
+        QStringList starts;
+        for (const auto &[key, value] : unit.value("Service"))
+            if (key == "ExecStart")
+                starts << value;
+        SyncConfig config;
+        QString filters;
+        if (ok && starts.size() == 1 && readExecStart(starts.first(), &config, &filters)) {
+            old.folder = config.localPath;
+            if (QFile::exists(filters))
+                old.found << filters;
+        }
+    }
+    old.found.removeDuplicates();
+    return old;
+}
+
+bool oldDriveSyncHolds(const OldDriveSync &old, const QString &accountFolder) {
+    if (old.found.isEmpty())
+        return false;
+    if (!old.folder.isEmpty())
+        return foldersOverlap(old.folder, accountFolder);
+    for (const QString &file : old.found)
+        if (QFileInfo(file).fileName() == "drive-sync.service")
+            return true;
+    return false;
+}
+
+OldDriveSyncCheck oldDriveSyncCheck(const TakeoverPaths &paths) {
+    return [paths](const QHash<QString, QHash<QString, QString>> &plainUnits, const QString &folder, bool *hold) {
+        const OldDriveSync old = findOldDriveSync(paths, plainUnits);
+        if (hold)
+            *hold = oldDriveSyncHolds(old, folder);
+        return old.found;
+    };
+}
+
+OldDriveSync readOldDriveSync(const TakeoverPaths &paths) {
+    QByteArray output;
+    // A show that fails leaves the files to go by: a fragment outside the
+    // package is the rarer case, and never a reason to fail a run.
+    runProcess(paths.systemctl, QStringList{"--user", "show", "-p", "Id,FragmentPath"} + plainDriveSyncUnits(),
+               kToolTimeoutMs, &output, nullptr);
+    return findOldDriveSync(paths, Backend::parseShowById(output));
+}
+
+QStringList foreignDropIns(const TakeoverPaths &paths, const QString &id) {
+    // The instance names come from the resolver, the one place that names an
+    // account's units; no config is read for them.
+    const BackendPaths account = newAccountPaths(AccountRoots(), id);
+    // Every folder whose drop-ins reach an account's units: the templates'
+    // (they reach every account), the prefix ones systemd also reads for a
+    // dashed name (systemd.unit(5)), the plain units' and this account's
+    // instances'.
+    QStringList folders{"drive-sync@.service.d", "drive-sync@.timer.d", "drive-sync-fix@.service.d",
+                        "drive-sync-.service.d", "drive-.service.d",    "drive-.timer.d",
+                        "drive-sync.service.d",  "drive-sync.timer.d",  "drive-sync-fix.service.d"};
+    for (const QString &unit : accountUnits(account))
+        folders << unit + ".d";
+    const QStringList ours{intervalDropInPath(paths.userUnits, "drive-sync.timer"),
+                           intervalDropInPath(paths.userUnits, account.timerUnit)};
+    QStringList found;
+    for (const QString &root : {paths.userUnits, paths.systemUserUnits})
+        for (const QString &folder : folders) {
+            const QDir dir(root + "/" + folder);
+            for (const QString &entry : dir.entryList(QDir::AllEntries | QDir::Hidden | QDir::System | QDir::NoDotAndDotDot,
+                                                      QDir::Name))
+                if (!ours.contains(dir.filePath(entry)))
+                    found << dir.filePath(entry);
+        }
+    return found;
+}
 
 bool copyFiltersWithMd5(const QString &from, const QString &to, QString *error) {
     QDir().mkpath(QFileInfo(to).absolutePath());
@@ -502,9 +607,9 @@ bool applyTakeover(const TakeoverPaths &paths, const TakeoverPlan &plan, const Q
         return false;
     }
     // "drive-sync sync" and an undo refuse while this lock is held.
-    if (!takeLock(paths.appState, error))
+    if (!takeTakeoverLock(paths.appState, error))
         return false;
-    const auto unlock = qScopeGuard([&] { releaseLock(paths.appState); });
+    const auto unlock = qScopeGuard([&] { releaseTakeoverLock(paths.appState); });
 
     QList<Done> done;
     // Takes back every step done so far, newest first, and stops at a fatal
@@ -562,6 +667,22 @@ bool applyTakeover(const TakeoverPaths &paths, const TakeoverPlan &plan, const Q
     if (!hasListings(plan.config))
         return rollBack("the bisync listings are gone");
 
+    // account1 in the accounts layout. Its folders go again when the
+    // takeover is undone halfway, while they are empty: an empty accounts/
+    // left behind would be the accounts layout with no account.
+    const BackendPaths account = takenOverAccount(paths);
+    QStringList madeFolders;
+    for (QString folder = QFileInfo(account.config).path(); !QFileInfo::exists(folder);
+         folder = QFileInfo(folder).path()) {
+        madeFolders.prepend(folder);
+        if (folder == QFileInfo(folder).path())
+            break;
+    }
+    done.append({[madeFolders](bool *) {
+        for (auto it = madeFolders.crbegin(); it != madeFolders.crend(); ++it)
+            QDir().rmdir(*it);  // never recursive: a folder that holds anything stays
+        return QString();
+    }, true});
     if (!copyFiltersWithMd5(plan.oldFiltersFile, plan.config.filtersFile, &why))
         return rollBack(why);
     done.append({[&](bool *) {
@@ -570,8 +691,20 @@ bool applyTakeover(const TakeoverPaths &paths, const TakeoverPlan &plan, const Q
         return QString();
     }, true});
 
-    const QString configFile = paths.appConfigDir + "/config.json";
-    if (!saveSyncConfig(configFile, plan.config, &why))
+    // The old ExecCondition guards the machine now (machine.json), not the
+    // account; one already there with the same command stays as it is.
+    const QString machine = machineGuardPath(paths.appConfigDir);
+    if (!plan.config.runOnlyWhen.isEmpty() && !QFileInfo::exists(machine)) {
+        if (!writeMachineGuard(machine, plan.config.runOnlyWhen, &why))
+            return rollBack(why);
+        done.append({[machine](bool *) { return QFile::remove(machine) ? QString() : "could not remove " + machine; },
+                     true});
+    }
+
+    const QString configFile = account.config;
+    SyncConfig config = plan.config;
+    config.runOnlyWhen.clear();
+    if (!saveSyncConfig(configFile, config, &why))
         return rollBack(why);
     done.append({[&](bool *) { return QFile::remove(configFile) ? QString() : "could not remove " + configFile; },
                  true});
@@ -638,7 +771,7 @@ bool applyTakeover(const TakeoverPaths &paths, const TakeoverPlan &plan, const Q
 
     if (!systemctl(paths, {"daemon-reload"}, &why))
         return rollBack("systemd did not reload: " + why);
-    if (const QString problem = checkPackagedUnits(paths); !problem.isEmpty())
+    if (const QString problem = checkPackagedUnits(paths, accountUnits(account), QString()); !problem.isEmpty())
         return rollBack(problem);
     // A run started by hand before the reload used the old unit; let it end
     // before its filters move.
@@ -652,25 +785,44 @@ bool applyTakeover(const TakeoverPaths &paths, const TakeoverPlan &plan, const Q
         movedSoFar.append(move);
     }
 
+    // account1's instance timer, never the plain one: a takeover writes the
+    // accounts layout, where the plain units run no account.
+    const QStringList newTimers{account.timerUnit, "drive-sync-watchdog.timer"};
     done.append({[&](bool *) {
         QString e;
-        return systemctl(paths, QStringList{"disable", "--now"} + kNewTimers, &e) ? QString() : e;
+        return systemctl(paths, QStringList{"disable", "--now"} + newTimers, &e) ? QString() : e;
     }});
-    if (!systemctl(paths, QStringList{"enable", "--now"} + kNewTimers, &why))
+    if (!systemctl(paths, QStringList{"enable", "--now"} + newTimers, &why))
         return rollBack("could not enable DriveSync's timers: " + why);
     return true;
 }
 
 bool undoTakeover(const TakeoverPaths &paths, QString *error) {
+    // With accounts, drive-sync@account1.timer runs the folder: bringing the
+    // old units back next to it would make two schedulers on one work dir.
+    // An undo that understands accounts may come later; until then it is
+    // done by hand, and this touches nothing. A home with no config at all
+    // is not the accounts layout here: it goes on to the legacy refusal of a
+    // config that cannot be read, which names the real reason.
+    const QDir configRoot(paths.appConfigDir);
+    if (QFileInfo::exists(configRoot.filePath("accounts")) || QFileInfo::exists(configRoot.filePath("disconnected"))) {
+        QJsonObject manifest;
+        const QString backup = newestBackup(paths, &manifest);
+        *error = backup.isEmpty() ? QString("there is no takeover to undo")
+                                  : QString("DriveSync now runs drive-sync per account (drive-sync@account1); going back "
+                                            "to drive-sync.sh is done by hand, following %1/manifest.json")
+                                        .arg(backup);
+        return false;
+    }
     // The old units know nothing of a fix: going back halfway would leave
     // its base run or its questions to a drive-sync that cannot finish them.
     if (fixPresent(paths.appState)) {
         *error = "a fix is under way; finish it or cancel it (drive-sync fix --cancel) first";
         return false;
     }
-    if (!takeLock(paths.appState, error))
+    if (!takeTakeoverLock(paths.appState, error))
         return false;
-    const auto unlock = qScopeGuard([&] { releaseLock(paths.appState); });
+    const auto unlock = qScopeGuard([&] { releaseTakeoverLock(paths.appState); });
     QJsonObject manifest;
     const QString backup = newestBackup(paths, &manifest);
     if (backup.isEmpty()) {
@@ -679,6 +831,15 @@ bool undoTakeover(const TakeoverPaths &paths, QString *error) {
     }
     if (manifest.value("stuck").toBool()) {
         *error = QString("the last takeover stopped halfway; finish it by hand, following %1/manifest.json").arg(backup);
+        return false;
+    }
+    // The folder check below needs the config: without it an undo after a
+    // folder change in Settings would bring the old units back to listings
+    // that no longer match.
+    const QString configFile = paths.appConfigDir + "/config.json";
+    const auto config = loadSyncConfig(configFile, nullptr);
+    if (!config) {
+        *error = QString("cannot read %1, so the folder check cannot be made; nothing was undone").arg(configFile);
         return false;
     }
     QList<QPair<QString, QString>> moves;
@@ -714,8 +875,7 @@ bool undoTakeover(const TakeoverPaths &paths, QString *error) {
                     oldFolder = old.localPath;
             }
         }
-    const auto config = loadSyncConfig(paths.appConfigDir + "/config.json", nullptr);
-    if (config && !oldFolder.isEmpty() && QDir::cleanPath(config->localPath) != QDir::cleanPath(oldFolder)) {
+    if (!oldFolder.isEmpty() && QDir::cleanPath(config->localPath) != QDir::cleanPath(oldFolder)) {
         *error = QString("the folder changed since the takeover (%1 now, %2 before), so the old setup would need a "
                          "resync; set the folder back to %2 in Settings first")
                      .arg(config->localPath, oldFolder);
@@ -751,7 +911,7 @@ bool undoTakeover(const TakeoverPaths &paths, QString *error) {
     // DriveSync's interval drop-in would retime the old timer, which comes
     // back to the same folder, and a later takeover would find it in the way:
     // it goes before anything moves, and one that cannot go stops the undo.
-    const QString dropIn = intervalDropInPath(paths.userUnits);
+    const QString dropIn = intervalDropInPath(paths.userUnits, "drive-sync.timer");
     QFile dropInFile(dropIn);
     const QByteArray dropInBytes = dropInFile.open(QIODevice::ReadOnly) ? dropInFile.readAll() : QByteArray();
     dropInFile.close();

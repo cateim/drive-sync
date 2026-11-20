@@ -12,6 +12,7 @@
 #include <QTimeZone>
 #include <limits>
 
+#include "accounts.h"
 #include "controlcommands.h"
 #include "fixcommand.h"
 #include "fixstate.h"
@@ -245,10 +246,10 @@ void printList(const std::optional<BlockedDeletes> &blocked, QTextStream &out) {
 }
 
 // The checks, the mark, then the run that uses it.
-QString allowDeletes(const BackendPaths &paths, const std::optional<BlockedDeletes> &blocked, int count) {
+QString allowDeletes(const BackendPaths &paths, const std::optional<BlockedDeletes> &blocked, int count, bool *stale) {
     if (!paths.managed)
         return "letting deletions through needs DriveSync to run drive-sync; take it over first";
-    if (takeoverLockHeld(paths.appState, paths.proc))
+    if (takeoverLockHeld(paths.globalState(), paths.proc))
         return "a takeover is running; try again when it ends";
     const QDateTime now = QDateTime::currentDateTimeUtc();
     const PauseMark pause = readPause(pauseFilePath(paths.appState));
@@ -270,8 +271,13 @@ QString allowDeletes(const BackendPaths &paths, const std::optional<BlockedDelet
     allow.at = now;
     allow.runStart = blocked->runStart;
 
-    // Under the fix's lock: a fix starting meanwhile would hold the run.
-    const FixLock lock(paths.appState);
+    // Under the fix's lock: a fix starting meanwhile would hold the run. None
+    // while the move to account1 runs, and none at a place it just left.
+    const AccountWriteLock lock(paths);
+    if (!lock.refusal().isEmpty())
+        return lock.refusal();
+    if ((*stale = lock.stale()))
+        return QString();
     const bool fixing = fixPresent(paths.appState);
     const FixState fix = fixing ? readFix(paths.appState) : FixState();
     // Only a fix whose final step failed with the guard stop still the
@@ -300,8 +306,13 @@ int runDeletesCommand(const QStringList &arguments, const BackendPaths &paths, Q
     // The window shows 500 paths; printed here, every one of them is.
     const auto blocked = blockedDeletes(SyncLog::readRecent(paths.log, kTailBytes),
                                         list && !json ? std::numeric_limits<int>::max() : kListLimit);
-    if (!list)
-        return commandAnswer(json, allowDeletes(paths, blocked, count), out, err);
+    if (!list) {
+        bool stale = false;
+        const QString error = allowDeletes(paths, blocked, count, &stale);
+        if (stale)
+            return kAccountPathsMoved;  // nothing printed: main runs it again
+        return commandAnswer(json, error, out, err);
+    }
     if (json)
         out << QJsonDocument(listJson(blocked)).toJson(QJsonDocument::Compact) << "\n";
     else

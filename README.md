@@ -32,7 +32,8 @@ and a bar widget, driven from the keyboard.
   browser, takes the folder you pick and starts the sync after a dry run you
   confirm; when Google later drops the sign-in, `I` signs in again.
 - **Takeover**: runs an existing drive-sync from DriveSync's own units with
-  the same rclone command, so no resync is needed, and can go back.
+  the same rclone command, so no resync is needed (going back is by hand
+  once DriveSync keeps its accounts under `accounts/`).
 - **Fix**: rebuilds the base of both sides after lost listings, listings out
   of sync or edited filters, with `~/Drive` still in use, asking you about
   every file that changed in the cloud meanwhile.
@@ -44,11 +45,29 @@ It starts a resync only as a fix you confirmed, and touches no synced file
 otherwise. It writes its own state in `~/.local/state/drive-sync-app/`, the link
 to its bar widget and, when you accept, the bar layout through
 `omarchy plugin`. After a takeover or a first setup it also owns
-`~/.config/drive-sync/` and the `drive-sync` user timers, and a first setup
-adds the `drive-sync` remote to `rclone.conf` through rclone itself. A sync
-interval other than 15 minutes, set in Settings, is written as
-`~/.config/systemd/user/drive-sync.timer.d/drive-sync-interval.conf`, which
-an interval of 15 minutes or undoing the takeover removes.
+`~/.config/drive-sync/` and the account's user timer
+(`drive-sync@account1.timer`), and a first setup adds the `drive-sync` remote
+to `rclone.conf` through rclone itself. A sync interval other than 15
+minutes, set in Settings, is written as
+`~/.config/systemd/user/drive-sync@account1.timer.d/drive-sync-interval.conf`
+(`drive-sync.timer.d/` for the single config of older versions, until the
+move below), which an interval of 15 minutes removes.
+
+DriveSync keeps everything per account: each one has its config in
+`~/.config/drive-sync/accounts/<id>/` (`account1` for now), its state in
+`~/.local/state/drive-sync-app/accounts/<id>/` and its own units
+(`drive-sync@<id>.service`, `.timer` and `drive-sync-fix@<id>.service`).
+A drive-sync set up by an older version, with its single
+`~/.config/drive-sync/config.json`, becomes `account1` with no resync: the
+window when it opens, the hourly watchdog or `drive-sync accounts --migrate`
+move the config byte for byte, the pause, fix and card state, the interval
+drop-in and the `runOnlyWhen` check (to `~/.config/drive-sync/machine.json`,
+which holds every account's runs), then swap `drive-sync.timer` for
+`drive-sync@account1.timer`. The folder, remote, work dir, filters and log
+stay where they are. The move waits, touching nothing, while a run, a fix
+step or a takeover is going, and any failure is undone from its journal
+(`~/.local/state/drive-sync-app/migration.json`). Nothing looks different
+afterwards.
 
 ## Screens
 
@@ -100,13 +119,14 @@ button names its key when the pointer rests on it.
 
 | Source                                                      | For                                                          |
 | ----------------------------------------------------------- | ------------------------------------------------------------ |
-| `~/.local/state/drive-sync.log`                             | Runs, changes, errors (the last 3 MB)                        |
-| `systemctl --user show drive-sync.service drive-sync.timer` | Running, last result, timer on and enabled                   |
-| `systemctl --user list-timers drive-sync.timer`             | Next run                                                     |
+| The log the config names (`~/.local/state/drive-sync.log` after a takeover) | Runs, changes, errors (the last 3 MB)            |
+| `systemctl --user show drive-sync@account1.service drive-sync@account1.timer drive-sync-fix@account1.service` | Running, last result, timer on and enabled, the fix's unit |
+| `systemctl --user list-timers drive-sync@account1.timer`    | Next run                                                     |
 | `~/.local/state/drive-sync/pausado`                         | A resync from `drive-sync.sh` that paused the timer          |
-| `~/.config/drive-sync/config.json`                           | The rclone command, once DriveSync runs drive-sync           |
-| `~/.local/state/drive-sync-app/paused.json`                      | A pause, and when it ends                                    |
-| `~/.local/state/drive-sync-app/fix.json`                         | A fix: its step, the dry run's count and its questions       |
+| `~/.config/drive-sync/accounts/<id>/config.json`            | The rclone command of each account DriveSync runs            |
+| `~/.config/drive-sync/machine.json`                         | The `runOnlyWhen` check that holds every account's runs on the wrong home |
+| `~/.local/state/drive-sync-app/accounts/<id>/paused.json`   | A pause, and when it ends                                    |
+| `~/.local/state/drive-sync-app/accounts/<id>/fix.json`      | A fix: its step, the dry run's count and its questions       |
 | `find ~/Drive -name '*.conflict[0-9]*'`                     | Conflict copies (`.git`, `node_modules` and `.venv` skipped) |
 | `rclone listremotes`, `rclone config dump`                  | Sign-in only: whether the `drive-sync` remote exists and holds a token, read in memory and never shown |
 | `rclone lsjson <remote>:<folder> --dirs-only`               | Settings and first setup only: one level of the cloud's folders, nothing copied |
@@ -114,7 +134,7 @@ button names its key when the pointer rests on it.
 The log is watched, systemd is polled every 30 seconds (5 while a run is
 going), and conflict copies are looked for again every 2 minutes and after
 each run. The count of conflict copies is kept in
-`~/.local/state/drive-sync-app/conflicts.json`, so the bar does not walk `~/Drive`
+`~/.local/state/drive-sync-app/accounts/<id>/conflicts.json`, so the bar does not walk `~/Drive`
 every few seconds.
 
 ## Bar widget
@@ -134,6 +154,12 @@ offer does not come back; delete `~/.local/state/drive-sync-app/bar-declined` to
 be asked again. After a package upgrade, `omarchy restart shell` loads the new
 widget. In its panel, `S` syncs now, `P` pauses for an hour or resumes, and
 `?` lists every key; hovering an icon says what it does.
+
+The widget reads `drive-sync status --json` (version 2), so it shows what
+the window shows, for the account that needs you most: an account whose
+`config.json` cannot be read is an error of its own ("This account's
+DriveSync config cannot be read", `configError`), and an old drive-sync
+found next to DriveSync's accounts is a line in the panel.
 
 ## First setup
 
@@ -160,21 +186,27 @@ dialog goes through five steps, and nothing is copied before the last one:
    holds builds, virtual environments or links needs its rules before the
    first base run. rclone checks every rule when you start, before anything
    is written.
-5. **Start.** DriveSync writes the filters (the defaults or the imported ones)
-   to `~/.config/drive-sync/filters.txt` (the defaults: `.git`, `node_modules`, `.venv`,
-   Python caches, Google Docs shortcuts and system junk) and its config, and
-   starts a fix (see below): a dry run lists every copy in both directions,
-   and the base run waits for your confirmation. The timers come on at the
-   same time, but every tick waits until the fix ends.
+5. **Start.** The new drive-sync is DriveSync's first account, `account1`.
+   DriveSync writes the filters (the defaults or the imported ones) to
+   `~/.config/drive-sync/accounts/account1/filters.txt` (the defaults: `.git`,
+   `node_modules`, `.venv`, Python caches, Google Docs shortcuts and system
+   junk) and its config beside them, keeps the work dir and the log in
+   `~/.local/state/drive-sync-app/accounts/account1/`, and starts a fix (see
+   below): a dry run lists every copy in both directions, and the base run
+   waits for your confirmation. `drive-sync@account1.timer` and the watchdog
+   come on at the same time, but every tick waits until the fix ends.
 
 Setup needs rclone 1.66 or newer, and refuses when a drive-sync already
-exists (take it over instead), when the folder is the home folder or holds or
-sits inside `~/.config`, `~/.local/state` or the folders of DriveSync and
-rclone, or when `~/.config/drive-sync/filters.txt` already exists.
+exists (take it over instead), when DriveSync already has an account, when
+the folder is the home folder or holds or sits inside `~/.config`,
+`~/.local/state` or the folders of DriveSync and rclone, or when
+`~/.config/drive-sync/filters.txt` (the single filters file of older
+versions) already exists.
 
 Cancelling that first fix (`X`) before its base run undoes the setup: the
-timers go off, the config and the filters it wrote go, and the window offers
-setup again, so another folder can be picked. A run refused because no first
+timers go off, the config and the filters it wrote go with the account's
+config folder, and the window offers setup again, so another folder can be
+picked. A run refused because no first
 sync was ever confirmed says so ("press F"), never that the filters changed.
 
 The Google client DriveSync signs in with is compiled in from
@@ -202,9 +234,10 @@ change goes through `drive-sync settings`, so the window writes nothing itself.
 
 - **Sync interval**, from 5 minutes to 4 hours in the window (5 to 1440 on
   the command line), applies at once: DriveSync keeps it in its config and
-  writes it into a drop-in for the packaged timer,
-  `~/.config/systemd/user/drive-sync.timer.d/drive-sync-interval.conf`
-  (none at the usual 15 minutes). "Late" follows it: three intervals with no
+  writes it into a drop-in for the account's packaged timer,
+  `~/.config/systemd/user/drive-sync@account1.timer.d/drive-sync-interval.conf`
+  (none at the usual 15 minutes; `drive-sync.timer.d/` for the single config
+  of older versions until it moves to `account1`). "Late" follows it: three intervals with no
   successful run.
 - **Max-delete guard**, 1% to 50%, applies at once. After a run stopped at
   the guard it can only go down: those deletions go through `D`.
@@ -261,32 +294,41 @@ run ends (`T` again cancels). A run that starts while the dialog is open does
 not undo the confirmation: the takeover waits for it and then happens by
 itself, and `T` cancels the wait.
 
-- The packaged `drive-sync.service` and `.timer` replace the old ones, and
-  `drive-sync-watchdog.timer` replaces `drive-sync-vigia.timer`. A unit in
-  `~/.config/systemd/user` wins over a packaged one, so installing the package
-  changes nothing until a takeover.
+- The drive-sync becomes DriveSync's first account, `account1`: the packaged
+  `drive-sync@account1.service` and `.timer` run it instead of the old units,
+  and `drive-sync-watchdog.timer` replaces `drive-sync-vigia.timer`.
 - The same remote, folder, work dir, log and rclone flags go to
-  `~/.config/drive-sync/config.json`. The filters move with their `.md5` to
-  `~/.config/drive-sync/filters.txt`, byte for byte, so bisync keeps its base.
+  `~/.config/drive-sync/accounts/account1/config.json`. The filters move with
+  their `.md5` to `~/.config/drive-sync/accounts/account1/filters.txt`, byte for
+  byte, so bisync keeps its base. The old unit's `ExecCondition` (run only on
+  the right home) goes to `~/.config/drive-sync/machine.json`, which guards
+  every account on the machine.
 - The old units, `drive-sync.sh`, `drive-sync-aviso`, the filters and the old
   state move to `~/.local/share/drive-sync/taken-over/<date>/`, with a manifest.
   Nothing is deleted. If any step fails, every step done so far is undone,
   except when an old file cannot move back: then every drive-sync timer is
   left off, the error names the file, and the manifest says where each one is.
-- `drive-sync takeover --undo` goes back, unless a fix is under way.
+- `drive-sync takeover --undo` goes back only from a takeover made before
+  accounts (the single `~/.config/drive-sync/config.json`), unless a fix is
+  under way. Once DriveSync keeps its accounts under `accounts/`, it refuses
+  and touches nothing: going back to `drive-sync.sh` is done by hand, following
+  the backup's `manifest.json`.
 
 `drive-sync run` refuses to start rclone when the filters' `.md5` is missing or
 stale: a single bisync run in that state throws away its base, and only a
-resync brings it back. So filters change in two steps: edit
-`~/.config/drive-sync/filters.txt`, then press `F`; or edit them in Settings,
-which does both.
+resync brings it back. So filters change in two steps: edit the filters file
+the config names (`filtersFile`: `~/.config/drive-sync/accounts/account1/filters.txt`
+after a takeover or a first setup, `~/.config/drive-sync/filters.txt` for a
+drive-sync taken over by an older version, which the move to `account1`
+leaves where it is), then press `F`; or edit them in Settings, which does
+both.
 
 ## Fixing a broken sync
 
 When bisync loses its listings, finds them out of sync, or the filters
 changed, every run fails until the base of both sides is rebuilt. Once
 DriveSync runs drive-sync, the window offers the fix (`F`, or any time from
-`F`), and it runs in its own unit, `drive-sync-fix.service`, so closing the
+`F`), and it runs in its own unit, `drive-sync-fix@account1.service`, so closing the
 window or logging out does not stop it halfway:
 
 1. Every run waits from the first step to the last: timer ticks, `S`, `U`
@@ -310,8 +352,8 @@ retried with `F`; a lock the stopped run left expires after 2 minutes, and the
 retry waits it out. Once the base ran, `X` asks twice: cancelling throws that
 run away, and every run fails until another fix.
 
-No fix is offered where the config's `runOnlyWhen` says no (another home
-mounted), nor after `--max-delete` stopped a run: a resync would bring the
+No fix is offered where the `runOnlyWhen` check (`~/.config/drive-sync/machine.json`)
+says no (another home mounted), nor after `--max-delete` stopped a run: a resync would bring the
 deleted files back. That holds when the filters were edited after the stop
 too: undo the edit first, so the next run shows the deletions under `D`.
 
@@ -327,7 +369,7 @@ that list instead of a fix:
 2. `D` opens the list, split by side. A file gone from the cloud would be
    deleted on the notebook: those come first, marked `↓`, and the run you
    let through moves them to
-   `~/.local/state/drive-sync-app/allowed-backup/<time of the stop>` instead
+   `~/.local/state/drive-sync-app/accounts/account1/allowed-backup/<time of the stop>` instead
    (with any notebook file it overwrites). A file gone from the notebook
    would go to the Drive trash (`↑`). The window shows the first 500;
    `drive-sync deletes --list` prints all of them. That folder is never
@@ -370,7 +412,23 @@ drive-sync folders [--remote <remote:>] [[--] <cloud folder>]   # one level of t
 drive-sync takeover --check | --apply | --undo
 drive-sync fix --start | --confirm | --answers <file.json> | --cancel | --retry
 drive-sync deletes --list | --allow <count>   # after a max-delete stop
+drive-sync accounts [--json]                  # the mode, the accounts, and whether the move to account1 can go
+drive-sync accounts --migrate                 # make that move now (the window and the watchdog also do)
 ```
+
+Every command but `setup`, `takeover`, `watchdog` and `accounts` takes
+`--account <id>` (`account1`...) as its first two arguments:
+`drive-sync settings --account account1 --interval 30`. Without it,
+`status`, `sync`, `pause` and `resume` act on every account, and the others
+on the only one (with several they ask for `--account`). With one account,
+`status` prints the same line as before; with several, one
+`<id>: <status>` line each. `status --json` describes the account that needs
+you most, and `sync`, `pause` and `resume --json` add `accounts`, one
+`{"id", "ok", "error"}` each. `accounts --json` answers `{"ok", "error",
+"mode", "accounts": [{"id", "label", "folder", "configError"}],
+"moveBlocker", "notices"}`, plus `move` (`{"result", "reason"}`, the result
+`moved`, `notNeeded`, `deferred`, `rolledBack` or `stuck`) with `--migrate`,
+which exits 1 unless the move went or was not needed.
 
 `sync`, `pause`, `resume`, `signin`, `setup`, `takeover`, `fix`, `deletes`,
 `settings` and `folders` take `--json` and answer `{"ok": ..., "error": ...}`.
@@ -384,7 +442,8 @@ prints `{"link": ...}` once rclone has its local sign-in address, and refuses a
 --list --json` adds `count`, `cloudCount`, `notebookCount`, `guardCount`,
 `guardTotal`, `runStart` and `list` (at most 500 `{path, deletedInCloud}`);
 `deletes --allow` takes the number of files in that list. The units call
-`run-condition`, `run`, `notify`, `watchdog` and `fix-run`.
+`run-condition`, `run`, `notify` and `fix-run` (with `--account %i` in the
+template units) and `watchdog`.
 
 The JSON is version 2 of a fixed contract: `version`, `now`, `status`,
 `tone` (`ok`, `busy`, `warning`, `error`), `causeKind`, `causeDetail`,
@@ -392,6 +451,38 @@ The JSON is version 2 of a fixed contract: `version`, `now`, `status`,
 (`start`, `end`, `outcome`), `currentRun` (`start`, `phase`), `nextRun`,
 `failingSince`, `typicalSeconds`, `conflicts`, `managed`, `paused` and
 `pausedUntil`. Times are Unix seconds, `0` when unknown.
+
+## When the move to accounts stops
+
+Before it touches anything, the move to `account1` writes its journal,
+`~/.local/state/drive-sync-app/migration.json`: every rename it plans,
+every folder and file it makes, and whether `drive-sync.timer` was on.
+While the journal is there no run starts. Any failure is undone from it,
+and so is a crash halfway, at the next watchdog round or when the window
+opens; a move that had to be undone says so in a card, with its reason,
+and is tried again every hour. A rollback that cannot turn
+`drive-sync.timer` back on still ends (the watchdog says the timer is
+off), and the next move turns `drive-sync@account1.timer` on as
+`drive-sync.timer` was before it.
+
+When the rollback itself cannot go on, for example with two copies of the
+same file, a file at neither place, or a folder under `accounts/` that
+holds something else, it stops where it is: the journal stays with
+`"stuck": true` and the cause in `stuckReason`, every drive-sync timer stays
+off, the window says so, and the watchdog sends a card every hour. To
+finish:
+
+1. Read `stuckReason` in `migration.json` (the card shows it too).
+2. Clear what it names: for two copies of a file, keep the right one and
+   remove the other.
+3. Run `drive-sync accounts --migrate`. It runs the rollback from the
+   journal again; once that gets through, everything is back as before the
+   move (`rolledBack`) and the journal is gone. The next
+   `drive-sync accounts --migrate`, or the next watchdog round, makes the
+   move again.
+
+Leave a `migration.json` that has a `stuckReason` where it is: the rollback
+reads it, and removes it itself once everything is back.
 
 ## Install
 
@@ -408,14 +499,17 @@ of the Google Drive mirror.
 
 ```sh
 bin/build            # build/drive-sync
-build/drive-sync      # run it
+bin/harness --scenario running --out build/shot.png   # look at the window over made-up data
 bin/test             # Qt Test, offscreen
 cp src/oauthclient.local.h.example src/oauthclient.local.h   # then fill in the Google client, to sign in
 (cd plugin && node --test tests/*.test.mjs)   # the bar widget's logic
 ```
 
 Needs `qmake6`, `make`, a C++17 compiler and Qt 6 (base, declarative,
-wayland), all part of Omarchy.
+wayland), all part of Omarchy. Running `build/drive-sync` acts on your real
+home like the installed one: opening its window on the single config of an
+older version starts the move to `account1`. Try the move only through the
+installed package, and look at the window with `bin/harness`.
 
 ## Language
 

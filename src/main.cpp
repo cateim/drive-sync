@@ -11,6 +11,8 @@
 #include <QTextStream>
 #include <QUrl>
 
+#include "accountmove.h"
+#include "accounts.h"
 #include "backend.h"
 #include "blockeddeletes.h"
 #include "clockformat.h"
@@ -46,63 +48,85 @@ int main(int argc, char *argv[]) {
     // Commands that need no display run without a GUI application, so the
     // bar and the units can call them without touching Wayland.
     static const QStringList headless{"status", "sync", "pause", "resume", "run-condition", "run", "notify",
-                                      "watchdog", "takeover", "fix", "fix-run", "deletes", "signin", "setup", "settings", "folders"};
+                                      "watchdog", "takeover", "fix", "fix-run", "deletes", "signin", "setup", "settings", "folders",
+                                      "accounts"};
     if (headless.contains(command)) {
         QCoreApplication app(argc, argv);
         app.setApplicationName("drive-sync");
         app.setApplicationVersion("0.1.0");
         QTextStream out(stdout);
         QTextStream err(stderr);
-        const QStringList rest = app.arguments().mid(2);
-        const BackendPaths paths = BackendPaths::defaults();
-        if (command == "status")
-            return runStatusCommand(rest, paths, out, err);
-        if (command == "sync")
-            return runSyncCommand(rest, paths, out, err);
-        if (command == "pause")
-            return runPauseCommand(rest, paths, QDateTime::currentDateTimeUtc(), out, err);
-        if (command == "resume")
-            return runResumeCommand(rest, paths, out, err);
-        if (command == "run")
-            return runRunCommand(paths, err);
-        if (command == "takeover")
-            return runTakeoverCommand(rest, TakeoverPaths::defaults(), paths, out, err);
-        if (command == "fix")
-            return runFixCommand(rest, paths, out, err);
-        if (command == "deletes")
-            return runDeletesCommand(rest, paths, out, err);
-        if (command == "signin")
-            return runSignInCommand(rest, paths, SignInTools::defaults(), out, err);
-        if (command == "setup")
-            return runSetupCommand(rest, paths, TakeoverPaths::defaults(), out, err);
-        if (command == "folders")
-            return runFoldersCommand(rest, paths, QStandardPaths::findExecutable("rclone"), out, err);
-        if (command == "settings")
-            return runSettingsCommand(rest, paths, TakeoverPaths::defaults(), out, err);
-        if (command == "notify" || command == "watchdog" || command == "fix-run") {
-            // The cards are read by a person, in the Omarchy language.
-            Translator translator;
-            app.installTranslator(&translator);
-            const NotifierPaths tools = NotifierPaths::defaults(Translator::formatLocale(translator.language()));
-            const QDateTime now = QDateTime::currentDateTimeUtc();
-            if (command == "notify")
-                return runNotifyCommand(qEnvironmentVariable("SERVICE_RESULT"), paths, tools, now);
-            QString error;
-            const auto config = loadSyncConfig(paths.config, &error);
-            if (command == "fix-run")
-                return runFixUnit(paths, config.value_or(SyncConfig()), FixTools::defaults(), tools,
-                                  config ? QString() : error);
-            return runWatchdogCommand(paths, config.value_or(SyncConfig()), tools, now, config ? QString() : error);
-        }
-        // run-condition: 255 is not a skip for systemd but a failure, which
-        // is what a missing or broken config is.
-        QString error;
-        const auto config = loadSyncConfig(paths.config, &error);
-        if (!config) {
-            err << "drive-sync: " << error << "\n";
-            return 255;
-        }
-        return runConditionCommand(paths, *config, QDateTime::currentDateTimeUtc());
+        const QStringList arguments = app.arguments().mid(2);
+        // Resolved once; every command then takes "--account <id>" as its
+        // first two arguments and acts on the accounts chooseAccounts gives.
+        const AccountRoots roots = AccountRoots::defaults();
+        const AccountSet set = resolveAccounts(roots);
+        return dispatchToAccounts(
+            command, arguments, set, roots, out, err,
+            [&](const QStringList &rest, const QList<BackendPaths> &accounts) -> int {
+                // Every command but status, sync, pause and resume gets one account.
+                const BackendPaths &paths = accounts.first();
+                // An old drive-sync next to accounts is looked for in the
+                // real home here, never by a reader on its own.
+                if (command == "status")
+                    return runStatusCommand(rest, accounts, set.notices, out, err, 5000,
+                                            oldDriveSyncCheck(TakeoverPaths::defaults()));
+                if (command == "sync")
+                    return runSyncCommand(rest, accounts, out, err);
+                if (command == "pause")
+                    return runPauseCommand(rest, accounts, QDateTime::currentDateTimeUtc(), out, err);
+                if (command == "resume")
+                    return runResumeCommand(rest, accounts, out, err);
+                if (command == "run")
+                    return runRunCommand(paths, err);
+                // The move to account1 by hand; the window runs it as a child too.
+                if (command == "accounts")
+                    return runAccountsCommand(rest, roots, TakeoverPaths::defaults(), out, err);
+                if (command == "takeover")
+                    return runTakeoverCommand(rest, TakeoverPaths::defaults(), paths, out, err);
+                if (command == "fix")
+                    return runFixCommand(rest, paths, out, err);
+                if (command == "deletes")
+                    return runDeletesCommand(rest, paths, out, err);
+                if (command == "signin")
+                    return runSignInCommand(rest, paths, SignInTools::defaults(), out, err);
+                // With nothing configured, setup writes account1 in the
+                // accounts layout.
+                if (command == "setup")
+                    return runSetupCommand(rest, setupAccountPaths(roots, paths), TakeoverPaths::defaults(), out, err);
+                if (command == "folders")
+                    return runFoldersCommand(rest, paths, QStandardPaths::findExecutable("rclone"), out, err);
+                if (command == "settings")
+                    return runSettingsCommand(rest, paths, TakeoverPaths::defaults(), out, err);
+                if (command == "notify" || command == "watchdog" || command == "fix-run") {
+                    // The cards are read by a person, in the Omarchy language.
+                    Translator translator;
+                    app.installTranslator(&translator);
+                    const NotifierPaths tools = NotifierPaths::defaults(Translator::formatLocale(translator.language()));
+                    const QDateTime now = QDateTime::currentDateTimeUtc();
+                    if (command == "notify")
+                        return runNotifyCommand(qEnvironmentVariable("SERVICE_RESULT"), paths, tools, now);
+                    // The watchdog makes the move first, then resolves every
+                    // account itself.
+                    if (command == "watchdog")
+                        return runWatchdogCommand(roots, TakeoverPaths::defaults(), tools, now);
+                    QString error;
+                    const auto config = loadSyncConfig(paths.config, &error);
+                    return runFixUnit(paths, config.value_or(SyncConfig()), FixTools::defaults(), tools,
+                                      config ? QString() : error);
+                }
+                // run-condition: 255 is not a skip for systemd but a failure,
+                // which is what a missing or broken config is.
+                QString error;
+                const auto config = loadSyncConfig(paths.config, &error);
+                if (!config) {
+                    err << "drive-sync: " << error << "\n";
+                    return 255;
+                }
+                const bool oldDriveSyncHold =
+                    paths.accountsMode && oldDriveSyncHolds(readOldDriveSync(TakeoverPaths::defaults()), config->localPath);
+                return runConditionCommand(paths, *config, QDateTime::currentDateTimeUtc(), oldDriveSyncHold);
+            });
     }
     // Asked for, the usage goes to stdout and is not an error. Checked before
     // the dash rule below, which would open the window instead.
@@ -136,7 +160,18 @@ int main(int argc, char *argv[]) {
     Theme theme;
     // Clock times show 12 or 24 hours like the clock on the Omarchy bar.
     ClockFormat clockFormat;
-    Backend backend;
+    // The window shows the account the resolver gives and follows it: a first
+    // setup, a takeover or the move to account1 needs no restart.
+    const AccountRoots roots = AccountRoots::defaults();
+    Backend backend(windowAccount(roots).paths);
+    backend.setResolver([roots] { return windowAccount(roots); });
+    // The window looks for an old drive-sync next to accounts in this home.
+    backend.setOldDriveSyncCheck(oldDriveSyncCheck(TakeoverPaths::defaults()));
+    // The move to account1, in a child, when there is something to move or a
+    // journal to roll back; the watchdog and "drive-sync accounts --migrate"
+    // start it too.
+    if (readAccountLayout(roots.configRoot).mode == "legacy" || moveInProgress(roots.stateRoot))
+        backend.startMove();
     // Links the bar widget shipped in the package; enabling it waits for the user.
     PluginSetup pluginSetup;
     pluginSetup.check();

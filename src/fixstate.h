@@ -58,10 +58,12 @@ bool clearFix(const QString &appState);
 // watchdog's reminder): each read, change and write happens under an
 // exclusive flock on <appState>/fix.lock, held until this goes out of scope.
 // Never hold one across a long step, and never take a second one in the
-// same process: flock would wait for the first.
+// same process: flock would wait for the first. With wait false it gives up
+// at once when another holds it (held() is then false): the move to
+// account1 defers instead of waiting.
 class FixLock {
 public:
-    explicit FixLock(const QString &appState);
+    explicit FixLock(const QString &appState, bool wait = true);
     ~FixLock();
     FixLock(const FixLock &) = delete;
     FixLock &operator=(const FixLock &) = delete;

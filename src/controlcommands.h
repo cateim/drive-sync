@@ -30,22 +30,39 @@ bool runProcess(const QString &program, const QStringList &arguments, int timeou
 QString takeoverLockPath(const QString &appState);
 bool takeoverLockHeld(const QString &appState, const QString &proc);
 
+// Takes the takeover lock in stateRoot (the state root, where it is global):
+// the lock for every change to the set of accounts (takeover, undo, the move
+// to account1), so two of them never run at once. A lock whose process is
+// gone is replaced. releaseTakeoverLock removes it only while it is ours.
+bool takeTakeoverLock(const QString &stateRoot, QString *error);
+void releaseTakeoverLock(const QString &stateRoot);
+
+// sync, pause and resume act on each account given, in order, and exit 0
+// only when every one of them is ok. Their JSON keeps {"ok", "error"} at the
+// top (the first error) and adds "accounts": [{"id", "ok", "error"}].
+
 // "drive-sync sync": one normal run now, queued without waiting for it.
-int runSyncCommand(const QStringList &arguments, const BackendPaths &paths, QTextStream &out, QTextStream &err);
+int runSyncCommand(const QStringList &arguments, const QList<BackendPaths> &accounts, QTextStream &out,
+                   QTextStream &err);
 
 // "drive-sync pause [--minutes N | --until-tomorrow]": no flag pauses until
 // "drive-sync resume". Refused unless DriveSync runs drive-sync, because the
 // old units never look at the mark.
-int runPauseCommand(const QStringList &arguments, const BackendPaths &paths, const QDateTime &now, QTextStream &out,
-                    QTextStream &err);
+int runPauseCommand(const QStringList &arguments, const QList<BackendPaths> &accounts, const QDateTime &now,
+                    QTextStream &out, QTextStream &err);
 
-// "drive-sync resume": clears the mark and starts one run.
-int runResumeCommand(const QStringList &arguments, const BackendPaths &paths, QTextStream &out, QTextStream &err);
+// "drive-sync resume": clears the mark and starts one run. With several
+// accounts, only the paused ones.
+int runResumeCommand(const QStringList &arguments, const QList<BackendPaths> &accounts, QTextStream &out,
+                     QTextStream &err);
 
 // "drive-sync run-condition", the ExecCondition of drive-sync.service: 0 runs,
-// 1 skips (always while a fix is under way), 255 fails (runOnlyWhen crashed or exited 255, as systemd reads it). runOnlyWhen goes first, so a tick that could not run anyway does
+// 1 skips (always while the move to account1 or a fix is under way), 255 fails (runOnlyWhen crashed or exited 255, as systemd reads it). runOnlyWhen goes first, so a tick that could not run anyway does
 // not use up the end of a pause; then a pause that ended is cleared and runs.
-int runConditionCommand(const BackendPaths &paths, const SyncConfig &config, const QDateTime &now);
+// In accounts mode, oldDriveSyncHold (an old drive-sync on this account's
+// folder, oldDriveSyncHolds in takeover.h) skips after the fix check.
+int runConditionCommand(const BackendPaths &paths, const SyncConfig &config, const QDateTime &now,
+                        bool oldDriveSyncHold = false);
 
 // What "drive-sync run" hands to rclone, or nothing with a refusal when the
 // filters check fails (see filtersUsable). With a confirmation of blocked
@@ -68,7 +85,7 @@ QStringList runPlanTakingMark(const SyncConfig &config, const QString &appState,
 QString allowedRunLogLine(const AllowDeletes &allow, int percent);
 // One line in rclone's format ("2026/11/12 18:41:19 INFO  : message", local time).
 void appendToLog(const QString &logFile, const QString &level, const QString &message);
-// systemctl --user start --no-block drive-sync.service; systemctl's error, or empty.
+// systemctl --user start --no-block <the account's service>; systemctl's error, or empty.
 QString startOneRun(const BackendPaths &paths);
 
 // "drive-sync run", the ExecStart of drive-sync.service. On success it never

@@ -13,7 +13,7 @@ vm.runInNewContext(source.replace(/^\.pragma library\s*$/m, ""), model)
 
 const STATUSES = ["ok", "running", "resync", "paused", "failed", "interrupted", "skipped", "timerOff",
                   "stale", "noDrive", "noRuns", "noLog", "notLoaded", "unavailable", "conflicts",
-                  "fixing", "fixWaiting", "fixFailed"]
+                  "fixing", "fixWaiting", "fixFailed", "configError"]
 
 // What `drive-sync status --json` prints with drive-sync in sync (contract version 2).
 const HEALTHY = {
@@ -85,13 +85,13 @@ test("barState maps every status", () => {
     ok: "ok", running: "syncing", resync: "resync", paused: "paused", failed: "failing",
     interrupted: "warning", skipped: "warning", stale: "warning", noRuns: "warning", conflicts: "warning",
     timerOff: "timerOff", noDrive: "broken", noLog: "broken", notLoaded: "broken", unavailable: "broken",
-    fixing: "resync", fixWaiting: "warning", fixFailed: "broken"
+    fixing: "resync", fixWaiting: "warning", fixFailed: "broken", configError: "broken"
   }
   const tones = {
     ok: "ok", running: "busy", resync: "busy", paused: "warning", failed: "error", interrupted: "warning",
     skipped: "warning", stale: "warning", noRuns: "warning", conflicts: "warning", timerOff: "error",
     noDrive: "error", noLog: "error", notLoaded: "error", unavailable: "error",
-    fixing: "busy", fixWaiting: "warning", fixFailed: "error"
+    fixing: "busy", fixWaiting: "warning", fixFailed: "error", configError: "error"
   }
   for (const status of STATUSES) {
     assert.equal(model.barState(snapshot({ status, tone: tones[status] })), expected[status], status)
@@ -316,5 +316,42 @@ test("every status the app prints has a headline in both catalogs", () => {
   for (const lang of ["en", "pt-BR"]) {
     const catalog = JSON.parse(readFileSync(new URL(`../i18n/${lang}.json`, import.meta.url), "utf8"))
     for (const status of STATUSES) assert.ok(`status.${status}` in catalog, `${lang}: status.${status}`)
+  }
+})
+
+test("configError is a status the bar knows", () => {
+  const broken = snapshot({ status: "configError", tone: "error", causeDetail: "config.json is not a JSON object" })
+  assert.equal(broken.status, "configError")
+  assert.equal(model.barState(broken), "broken")
+  for (const lang of ["en", "pt-BR"]) {
+    const catalog = JSON.parse(readFileSync(new URL(`../i18n/${lang}.json`, import.meta.url), "utf8"))
+    assert.ok("status.configError" in catalog, lang)
+    // The JSON names no unit, so the headline cannot either.
+    assert.doesNotMatch(catalog["status.notLoaded"], /drive-sync\.service/, lang)
+  }
+})
+
+test("the new causes have a text in both languages", () => {
+  const qml = readFileSync(new URL("../DriveSync.qml", import.meta.url), "utf8")
+  for (const kind of ["oldDriveSync", "otherAccount", "unchecked"]) {
+    assert.match(qml, new RegExp(`case "${kind}": return strings\\.t\\("cause\\.${kind}"\\)`), kind)
+    for (const lang of ["en", "pt-BR"]) {
+      const catalog = JSON.parse(readFileSync(new URL(`../i18n/${lang}.json`, import.meta.url), "utf8"))
+      assert.ok(`cause.${kind}` in catalog, `${lang}: cause.${kind}`)
+    }
+  }
+})
+
+test("oldDriveSync warning shows in the panel", () => {
+  assert.equal(model.hasWarning(snapshot({ warnings: ["conflicts", "oldDriveSync"] }), "oldDriveSync"), true)
+  assert.equal(model.hasWarning(snapshot({ warnings: ["conflicts"] }), "oldDriveSync"), false)
+  assert.equal(model.hasWarning(model.parseSnapshot("not json"), "oldDriveSync"), false)
+  assert.equal(model.hasWarning(null, "oldDriveSync"), false)
+  const qml = readFileSync(new URL("../DriveSync.qml", import.meta.url), "utf8")
+  assert.match(qml, /Model\.hasWarning\(root\.status, "oldDriveSync"\)/)
+  assert.match(qml, /strings\.t\("warning\.oldDriveSync"\)/)
+  for (const lang of ["en", "pt-BR"]) {
+    const catalog = JSON.parse(readFileSync(new URL(`../i18n/${lang}.json`, import.meta.url), "utf8"))
+    assert.ok(typeof catalog["warning.oldDriveSync"] === "string" && catalog["warning.oldDriveSync"] !== "", lang)
   }
 })

@@ -33,15 +33,46 @@ struct BackendPaths {
     // The config's interval: "late" is three of them. Last, so the paths
     // listed in order above keep their places.
     int intervalSeconds = kDefaultIntervalMinutes * 60;
+    // The account these paths are (accounts.h): its id ("account1"...;
+    // empty is the view with no account) and its units. Their defaults are
+    // the plain units, so paths listed in order above mean legacy mode.
+    QString id{};
+    QString serviceUnit = "drive-sync.service";
+    QString timerUnit = "drive-sync.timer";
+    QString fixUnit = "drive-sync-fix.service";
+    QString configRoot{};  // ~/.config/drive-sync
+    QString stateRoot{};   // ~/.local/state/drive-sync-app
+    bool accountsMode = false;  // the accounts/<id>/ layout and the template units
 
-    // Today's paths, or the config's log and folder once DriveSync owns drive-sync.
+    // The state folder shared by every account: the takeover lock and the
+    // move's journal live there. Paths with no state root use appState.
+    QString globalState() const { return stateRoot.isEmpty() ? appState : stateRoot; }
 
+    // The first account resolveAccounts() finds, or the view with no account.
     static BackendPaths defaults();
 };
 
 // What a loaded config changes in the paths: its log, its folder, its
 // interval, and managed.
 void applySyncConfig(BackendPaths *paths, const SyncConfig &config);
+
+// Why an account's config does not load (the headline configError), or
+// empty: always empty with no account (no id) or no config file at all.
+QString accountConfigError(const BackendPaths &paths);
+
+// Looks for an old drive-sync next to accounts (spec 12): given the plain
+// drive-sync.service and .timer as systemctl show describes them, by Id, it
+// returns what it found and sets *hold when an account on folder must skip
+// its runs. main builds it from the real home (oldDriveSyncCheck in
+// takeover.h); tests and the harness give none, so a reader never looks at
+// this machine's units by itself. Asked in accounts mode only.
+using OldDriveSyncCheck = std::function<QStringList(const QHash<QString, QHash<QString, QString>> &plainUnits,
+                                                    const QString &folder, bool *hold)>;
+// The units it needs in a reader's one systemctl show call.
+QStringList plainDriveSyncUnits();
+
+// The account the window shows and the notices about the set (accounts.h).
+struct WindowAccount;
 
 class Backend : public QObject {
     Q_OBJECT
@@ -101,9 +132,19 @@ class Backend : public QObject {
     // sends back to that step; "drive-sync deletes --allow" follows the same
     // rule (fixWaitsForDeletes).
     Q_PROPERTY(bool deletesHeld READ deletesHeld NOTIFY deletesHeldChanged)
-    Q_PROPERTY(QString logPath READ logPath CONSTANT)
+    // Changes when the window adopts another account (a first setup, a
+    // takeover, the move to account1).
+    Q_PROPERTY(QString logPath READ logPath NOTIFY changed)
     // The config's folder: it changes with a folder change in Settings.
     Q_PROPERTY(QString drivePath READ drivePath NOTIFY changed)
+    // The account's units, for the lines that tell the user what to run.
+    Q_PROPERTY(QString serviceUnit READ serviceUnit NOTIFY changed)
+    Q_PROPERTY(QString timerUnit READ timerUnit NOTIFY changed)
+    Q_PROPERTY(QString fixUnit READ fixUnit NOTIFY changed)
+    // What the resolver says about the set of accounts, as {kind, path}:
+    // "staleConfig" (an old config.json that is ignored) and "moveStuck"
+    // (the move to accounts stopped halfway; path is its journal).
+    Q_PROPERTY(QVariantList notices READ notices NOTIFY changed)
 
 public:
     explicit Backend(const BackendPaths &paths = BackendPaths::defaults(), QObject *parent = nullptr);
@@ -149,6 +190,21 @@ public:
     bool deletesHeld() const;
     QString logPath() const { return m_paths.log; }
     QString drivePath() const { return m_paths.drive; }
+    QString serviceUnit() const { return m_paths.serviceUnit; }
+    QString timerUnit() const { return m_paths.timerUnit; }
+    QString fixUnit() const { return m_paths.fixUnit; }
+    QVariantList notices() const { return m_notices; }
+
+    // Gives the window the resolver: reloadConfig asks it first, and when it
+    // names another account (another id, config, state folder or unit), the
+    // window drops its watches on the old one and follows the new one. So
+    // a first setup, a takeover or the move to account1 needs no restart.
+    // Without one, reloadConfig only reads the config again.
+    void setResolver(std::function<WindowAccount()> resolve);
+
+    // Gives the window the check for an old drive-sync next to accounts;
+    // without it the window never looks for one.
+    void setOldDriveSyncCheck(const OldDriveSyncCheck &check);
 
     // Reads the log, asks systemd and looks for conflict copies again.
     Q_INVOKABLE void refresh();
@@ -178,12 +234,18 @@ public:
     // Reads the config again after a takeover or an undo, so the window
     // follows the log and the controls it now owns without a restart.
     Q_INVOKABLE void reloadConfig();
+    // "drive-sync accounts --migrate --json" in a child, then reloadConfig.
+    // Silent: a move that defers says nothing, and one that got stuck shows
+    // as the notice "moveStuck".
+    Q_INVOKABLE void startMove();
 
     static SyncSummary summarize(const SyncInputs &in);
     // "systemctl show" output for several units: one property map per unit.
     static QList<QHash<QString, QString>> parseShow(const QByteArray &output);
-    // The next elapse of the first timer in "systemctl list-timers -o json".
-    static QDateTime parseNextElapse(const QByteArray &json);
+    // The same, keyed by each block's Id; a block with no Id is dropped.
+    static QHash<QString, QHash<QString, QString>> parseShowById(const QByteArray &output);
+    // The next elapse of unit in "systemctl list-timers -o json".
+    static QDateTime parseNextElapse(const QByteArray &json, const QString &unit);
     // True when the pid in drive-sync's pause mark is still drive-sync.sh.
     static bool resyncRunning(const QString &stateDir, const QString &proc);
     static QVariantMap runToMap(const SyncRun &run, const QString &outcome);
@@ -205,6 +267,7 @@ private:
     void watchLog();
     void watchAppState();
     void watchConfig();
+    void adopt(const BackendPaths &paths);
     void updateFix(const FixState &fix);
     void updateBlocked(const QString &logText);
     void setMessage(const QString &message);
@@ -223,6 +286,12 @@ private:
     // reaches "drive-sync status", which reads the config on every call.
     QFileSystemWatcher m_configWatcher;
     QTimer m_configDebounce;
+    // Halfway through a live move the resolver can see no account at all
+    // (accounts/account1 made, the config not in it yet): the window keeps
+    // what it shows and asks again each second until the journal is gone.
+    QTimer m_moveWait;
+    std::function<WindowAccount()> m_resolve;
+    QVariantList m_notices;
     QTimer m_logDebounce;
     QTimer m_poll;
     QTimer m_conflictPoll;
@@ -236,7 +305,13 @@ private:
     QHash<QString, QString> m_service;
     QHash<QString, QString> m_timer;
     QHash<QString, QString> m_fixUnit;
+    OldDriveSyncCheck m_oldDriveSyncCheck;
+    QStringList m_oldDriveSync;
+    bool m_oldDriveSyncHold = false;
     QDateTime m_lastFinishedStart;
+    // Read when the window opens and when the config changes on disk, not on
+    // every recompute: it parses the config.
+    QString m_configError;
 
     Snapshot m_snapshot;
     SyncSummary m_summary;

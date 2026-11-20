@@ -33,6 +33,9 @@ Panel {
       case "maxDelete": return strings.t("cause.maxDelete")
       case "signIn": return strings.t("cause.signIn")
       case "firstSyncPending": return strings.t("cause.firstSyncPending")
+      case "oldDriveSync": return strings.t("cause.oldDriveSync")
+      case "otherAccount": return strings.t("cause.otherAccount")
+      case "unchecked": return strings.t("cause.unchecked")
     }
     return status.causeDetail !== "" ? status.causeDetail : strings.t("cause.unknown")
   }
@@ -246,6 +249,18 @@ Panel {
           width: parent.width
           text: sync.actionError !== "" ? sync.actionError : (root.syncState === "failing" || root.status.status === "fixFailed" ? root.causeText : "")
           color: root.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          wrapMode: Text.WordWrap
+        }
+
+        // An old drive-sync next to DriveSync: only removing it by hand helps.
+        Text {
+          textFormat: Text.PlainText
+          visible: Model.hasWarning(root.status, "oldDriveSync")
+          width: parent.width
+          text: strings.t("warning.oldDriveSync")
+          color: root.warning
           font.family: root.fontFamily
           font.pixelSize: Style.font.bodySmall
           wrapMode: Text.WordWrap

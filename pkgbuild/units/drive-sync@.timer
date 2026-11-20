@@ -1,0 +1,12 @@
+# Shipped by DriveSync. drive-sync@<id>.timer starts drive-sync@<id>.service;
+# DriveSync enables one per account. An interval other than 15 minutes is a
+# drop-in in ~/.config/systemd/user/drive-sync@<id>.timer.d/.
+[Unit]
+Description=drive-sync: one run of %i every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

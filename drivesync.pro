@@ -5,6 +5,8 @@ TARGET = drive-sync
 TEMPLATE = app
 
 HEADERS += \
+    src/accountmove.h \
+    src/accounts.h \
     src/backend.h \
     src/blockeddeletes.h \
     src/clockformat.h \
@@ -15,6 +17,7 @@ HEADERS += \
     src/fixstate.h \
     src/legacymigration.h \
     src/listingdiff.h \
+    src/machineguard.h \
     src/notifier.h \
     src/oauthclient.h \
     src/pausestate.h \
@@ -39,6 +42,8 @@ HEADERS += \
 
 SOURCES += \
     src/main.cpp \
+    src/accountmove.cpp \
+    src/accounts.cpp \
     src/backend.cpp \
     src/blockeddeletes.cpp \
     src/clockformat.cpp \
@@ -49,6 +54,7 @@ SOURCES += \
     src/fixstate.cpp \
     src/legacymigration.cpp \
     src/listingdiff.cpp \
+    src/machineguard.cpp \
     src/notifier.cpp \
     src/oauthclient.cpp \
     src/pausestate.cpp \

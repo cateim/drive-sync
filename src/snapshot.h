@@ -37,14 +37,15 @@ constexpr int kFixStartGraceSeconds = 60;
 // the rules can be tested without systemd or a log.
 struct SyncInputs {
     bool systemctlWorks = true;
+    QString configError;     // why the account's config does not load; empty when it does
     bool logFound = true;
     bool driveFound = true;
-    QString serviceLoad;     // drive-sync.service LoadState
+    QString serviceLoad;     // the account's service LoadState
     QString serviceActive;   // ActiveState
     QString serviceResult;   // Result of its latest run
     QDateTime serviceStart;  // ExecMainStartTimestamp of that run
     QDateTime serviceSkip;   // InactiveEnterTimestamp: a skip has no main start
-    QString timerActive;     // drive-sync.timer ActiveState
+    QString timerActive;     // the account's timer ActiveState
     QString timerFileState;  // UnitFileState: "enabled" starts it on boot
     bool resyncRunning = false;
     bool paused = false;     // a pause mark holds the runs
@@ -57,10 +58,12 @@ struct SyncInputs {
     QDateTime now;
     int conflicts = 0;
     QString fixStep;          // the fix's step (fixstate.h), empty when no fix
-    bool fixInterrupted = false;  // a working step with drive-sync-fix.service gone
+    bool fixInterrupted = false;  // a working step with the fix unit gone
     QString fixError;         // why the fix stopped
-    QString fixUnitResult;    // drive-sync-fix.service's Result, for an interrupted step
+    QString fixUnitResult;    // the fix unit's Result, for an interrupted step
     int intervalSeconds = 15 * 60;  // the timer's interval: "late" is three of them
+    QStringList oldDriveSync;       // an old drive-sync found next to accounts (findOldDriveSync)
+    bool oldDriveSyncHold = false;  // and it syncs this account's folder: run-condition skips
 };
 
 struct SyncSummary {
@@ -74,10 +77,11 @@ struct SyncSummary {
 // systemd, before any rule is applied.
 struct SnapshotSources {
     QList<SyncRun> runs;              // SyncLog::parse output, oldest first
+    QString configError;              // accountConfigError(): the account's config does not load
     bool logFound = false;
     bool systemctlWorks = true;
-    QHash<QString, QString> service;  // parseShow block of drive-sync.service
-    QHash<QString, QString> timer;    // parseShow block of drive-sync.timer
+    QHash<QString, QString> service;  // parseShowById block of the account's service
+    QHash<QString, QString> timer;    // parseShowById block of the account's timer
     bool resyncRunning = false;
     bool driveFound = true;
     int conflicts = 0;
@@ -85,10 +89,13 @@ struct SnapshotSources {
     PauseMark pause;
     FixState fix;                     // readFix, when fixPresent
     bool fixPresent = false;
-    bool fixUnitActive = false;       // drive-sync-fix.service is starting or running a step
+    bool fixUnitActive = false;       // the fix unit is starting or running a step
     QString fixUnitResult;            // its Result: "success", "signal", "exit-code"...
     QDateTime now;                    // UTC
     int intervalSeconds = 15 * 60;    // the config's interval
+    QStringList oldDriveSync;         // an old drive-sync found next to accounts, empty in legacy mode
+    bool oldDriveSyncHold = false;    // and it syncs this account's folder
+    bool moving = false;              // migration.json exists: run-condition skips every tick
 };
 
 struct Snapshot {
@@ -119,11 +126,13 @@ QJsonObject snapshotToJson(const Snapshot &s, const QDateTime &nextRun, const QD
 // "ok" | "busy" | "warning" | "error": how urgent a headline is.
 QString toneFor(const QString &status);
 // The two systemctl calls every reader makes, so they cannot drift apart.
-// The show call describes drive-sync.service, drive-sync.timer and
-// drive-sync-fix.service, in that order.
-QStringList systemdShowArguments();
-QStringList listTimersArguments();
-// drive-sync-fix.service's parseShow block says it is starting or running a step.
+// The show call describes the units given (accountUnits: each account's
+// service, timer and fix unit), with Id first, so each answer is mapped by
+// its Id (Backend::parseShowById), never by its position.
+QStringList systemdShowArguments(const QStringList &units);
+// list-timers for the timers given; each entry carries its "unit".
+QStringList listTimersArguments(const QStringList &timers);
+// The fix unit's show block says it is starting or running a step.
 bool fixUnitBusy(const QHash<QString, QString> &unit);
 // "systemctl show --timestamp=unix" prints "@1794076098", or nothing.
 QDateTime fromUnixStamp(const QString &value);

@@ -1,5 +1,6 @@
 #include "backend.h"
 
+#include "accounts.h"
 #include "conflictcache.h"
 #include "fixcommand.h"
 #include "syncconfig.h"
@@ -38,20 +39,21 @@ int total(const SyncCounts &counts) { return counts.added + counts.modified + co
 }  // namespace
 
 BackendPaths BackendPaths::defaults() {
-    const QString home = QDir::homePath();
-    BackendPaths paths{home + "/.local/state/drive-sync.log",
-                       home + "/Drive",
-                       home + "/.local/state/drive-sync",
-                       "/proc",
-                       QStandardPaths::findExecutable("systemctl"),
-                       QStandardPaths::findExecutable("find"),
-                       home + "/.local/state/drive-sync-app",
-                       defaultSyncConfigPath(),
-                       QCoreApplication::applicationFilePath()};
-    if (const auto config = loadSyncConfig(paths.config, nullptr))
-        applySyncConfig(&paths, *config);
-    return paths;
+    const AccountRoots roots = AccountRoots::defaults();
+    const AccountSet set = resolveAccounts(roots);
+    return set.accounts.isEmpty() ? noAccountPaths(roots) : set.accounts.first();
 }
+
+QString accountConfigError(const BackendPaths &paths) {
+    // A config that is gone is not an error of the config: a takeover undone
+    // removes it, and the view with no account has none.
+    if (paths.id.isEmpty() || !QFileInfo::exists(paths.config))
+        return {};
+    QString error;
+    return loadSyncConfig(paths.config, &error) ? QString() : error;
+}
+
+QStringList plainDriveSyncUnits() { return {"drive-sync.service", "drive-sync.timer"}; }
 
 void applySyncConfig(BackendPaths *paths, const SyncConfig &config) {
     paths->log = config.logFile;
@@ -61,6 +63,7 @@ void applySyncConfig(BackendPaths *paths, const SyncConfig &config) {
 }
 
 Backend::Backend(const BackendPaths &paths, QObject *parent) : QObject(parent), m_paths(paths) {
+    m_configError = accountConfigError(m_paths);
     // rclone appends a line at a time; one read after the burst is enough.
     m_logDebounce.setSingleShot(true);
     m_logDebounce.setInterval(1000);
@@ -84,6 +87,9 @@ Backend::Backend(const BackendPaths &paths, QObject *parent) : QObject(parent), 
     m_configDebounce.setInterval(300);
     connect(&m_configWatcher, &QFileSystemWatcher::directoryChanged, this, [this] { m_configDebounce.start(); });
     connect(&m_configDebounce, &QTimer::timeout, this, &Backend::reloadConfig);
+    m_moveWait.setSingleShot(true);
+    m_moveWait.setInterval(1000);
+    connect(&m_moveWait, &QTimer::timeout, this, &Backend::reloadConfig);
 
     // systemd has no change signal worth a D-Bus subscription here; polling
     // also moves the relative times and the stale check along.
@@ -153,10 +159,18 @@ void Backend::watchAppState() {
 }
 
 void Backend::watchConfig() {
-    // The folder appears with a takeover or a first setup.
+    // The folder appears with a takeover or a first setup. The config root
+    // too, where accounts/ appears or goes and the old config.json leaves:
+    // that is how a first setup, a takeover or the move reaches a window
+    // that shows another account, or none.
     const QString folder = m_paths.config.isEmpty() ? QString() : QFileInfo(m_paths.config).absolutePath();
-    if (!folder.isEmpty() && QFileInfo(folder).isDir() && !m_configWatcher.directories().contains(folder))
-        m_configWatcher.addPath(folder);
+    for (const QString &watched : {folder, m_paths.configRoot})
+        if (!watched.isEmpty() && QFileInfo(watched).isDir() && !m_configWatcher.directories().contains(watched)
+            && m_configWatcher.addPath(watched) && m_resolve)
+            // A folder that just appeared (a setup or a takeover run from a
+            // terminal made ~/.config/drive-sync) may already hold what the
+            // watch would have reported: ask the resolver once.
+            m_configDebounce.start();
 }
 
 void Backend::readLog() {
@@ -208,21 +222,53 @@ void Backend::run(const QString &program, const QStringList &arguments,
     process->start(program, arguments);
 }
 
+void Backend::setOldDriveSyncCheck(const OldDriveSyncCheck &check) {
+    m_oldDriveSyncCheck = check;
+    querySystemd();
+}
+
 void Backend::querySystemd() {
     if (m_systemdPending)
         return;
     m_systemdPending = true;
-    run(m_paths.systemctl, systemdShowArguments(),
-        [this](bool ok, const QByteArray &output) {
-            const auto units = parseShow(output);
-            m_systemctlWorks = ok && units.size() == 3;
-            m_service = m_systemctlWorks ? units.at(0) : QHash<QString, QString>();
-            m_timer = m_systemctlWorks ? units.at(1) : QHash<QString, QString>();
-            m_fixUnit = m_systemctlWorks ? units.at(2) : QHash<QString, QString>();
-            run(m_paths.systemctl, listTimersArguments(),
-                [this](bool ok, const QByteArray &output) {
+    const BackendPaths paths = m_paths;
+    // In accounts mode the plain units ride along, for an old drive-sync
+    // next to the accounts (read when the answer comes, so a check given
+    // after this call is still used).
+    const QStringList plain = paths.accountsMode ? plainDriveSyncUnits() : QStringList();
+    // An answer about the units of an account the window no longer shows
+    // (it adopted another meanwhile) is dropped and asked again: it would
+    // describe the plain units after the move to account1, say.
+    const auto stale = [this](const BackendPaths &asked) {
+        if (accountUnits(asked) == accountUnits(m_paths) && asked.accountsMode == m_paths.accountsMode)
+            return false;
+        m_systemdPending = false;
+        querySystemd();
+        return true;
+    };
+    run(m_paths.systemctl, systemdShowArguments(accountUnits(paths) + plain),
+        [this, paths, stale](bool ok, const QByteArray &output) {
+            if (stale(paths))
+                return;
+            const auto units = parseShowById(output);
+            m_oldDriveSync.clear();
+            m_oldDriveSyncHold = false;
+            if (paths.accountsMode && m_oldDriveSyncCheck)
+                m_oldDriveSync = m_oldDriveSyncCheck(units, paths.drive, &m_oldDriveSyncHold);
+            // Each of the three must answer: a unit missing from the answer
+            // is a systemd that cannot be read, not an idle one.
+            m_systemctlWorks = ok;
+            for (const QString &unit : accountUnits(paths))
+                m_systemctlWorks = m_systemctlWorks && units.contains(unit);
+            m_service = m_systemctlWorks ? units.value(paths.serviceUnit) : QHash<QString, QString>();
+            m_timer = m_systemctlWorks ? units.value(paths.timerUnit) : QHash<QString, QString>();
+            m_fixUnit = m_systemctlWorks ? units.value(paths.fixUnit) : QHash<QString, QString>();
+            run(m_paths.systemctl, listTimersArguments({paths.timerUnit}),
+                [this, paths, stale](bool ok, const QByteArray &output) {
+                    if (stale(paths))
+                        return;
                     m_systemdPending = false;
-                    m_nextRun = ok ? parseNextElapse(output) : QDateTime();
+                    m_nextRun = ok ? parseNextElapse(output, paths.timerUnit) : QDateTime();
                     recompute();
                 });
         });
@@ -241,9 +287,16 @@ void Backend::scanConflicts() {
         return;
     }
     m_scanPending = true;
+    const QString drive = m_paths.drive;
     run(m_paths.find, conflictFindArguments(m_paths.drive),
-        [this](bool ok, const QByteArray &output) {
+        [this, drive](bool ok, const QByteArray &output) {
             m_scanPending = false;
+            // The window followed another account while find ran: its
+            // copies are not this account's.
+            if (drive != m_paths.drive) {
+                scanConflicts();
+                return;
+            }
             // find exits 1 when one folder can't be read but still lists the
             // rest, so only an empty answer from a failed run is an error.
             QList<QPair<qint64, QVariantMap>> found;
@@ -269,7 +322,8 @@ void Backend::scanConflicts() {
             QVariantList conflicts;
             for (const auto &entry : found)
                 conflicts.append(entry.second);
-            if (!m_paths.appState.isEmpty())
+            // Never during the move to account1: it is leaving this place.
+            if (!m_paths.appState.isEmpty() && !moveInProgress(m_paths.globalState()))
                 writeConflictCache(m_paths.appState + "/conflicts.json",
                                    {int(conflicts.size()), error, QDateTime::currentDateTimeUtc()});
             if (conflicts != m_conflicts || error != m_conflictError) {
@@ -307,8 +361,10 @@ QVariantMap Backend::runToMap(const SyncRun &run, const QString &outcome) {
 
 void Backend::recompute() {
     // The state folder may appear after the window opened (the first
-    // conflict cache on a new machine): watch it from then on.
+    // conflict cache on a new machine): watch it from then on. So may the
+    // config root, made by a setup or a takeover run from a terminal.
     watchAppState();
+    watchConfig();
     SnapshotSources src;
     src.runs = m_parsed;
     src.logFound = m_logFound;
@@ -320,6 +376,10 @@ void Backend::recompute() {
     src.conflicts = int(m_conflicts.size());
     src.managed = m_paths.managed;
     src.intervalSeconds = m_paths.intervalSeconds;
+    src.configError = m_configError;
+    src.oldDriveSync = m_oldDriveSync;
+    src.oldDriveSyncHold = m_oldDriveSyncHold;
+    src.moving = moveInProgress(m_paths.globalState());
     if (!m_paths.appState.isEmpty()) {
         src.pause = readPause(pauseFilePath(m_paths.appState));
         src.fixPresent = fixPresent(m_paths.appState);
@@ -350,10 +410,10 @@ void Backend::recompute() {
     emit changed();
 }
 
-// The headline, most urgent first. Statuses: "unavailable", "notLoaded",
+// The headline, most urgent first. Statuses: "unavailable", "configError", "notLoaded",
 // "fixing", "fixWaiting", "fixFailed", "running", "resync", "paused", "noLog", "failed", "interrupted", "skipped",
 // "timerOff", "stale", "noDrive", "noRuns", "conflicts", "ok". Warnings carry what the
-// headline leaves out: "timerOff", "timerDisabled", "conflicts".
+// headline leaves out: "timerOff", "timerDisabled", "conflicts", "oldDriveSync".
 SyncSummary Backend::summarize(const SyncInputs &in) {
     SyncSummary s;
     const bool timerOff = in.timerActive != "active";
@@ -367,6 +427,11 @@ SyncSummary Backend::summarize(const SyncInputs &in) {
 
     if (!in.systemctlWorks) {
         s.status = "unavailable";
+    } else if (!in.configError.isEmpty()) {
+        // An account whose config does not load runs nothing DriveSync can
+        // describe: say so, with the loader's reason, before anything else.
+        s.status = "configError";
+        s.causeDetail = in.configError;
     } else if (in.serviceLoad != "loaded") {
         s.status = "notLoaded";
         s.causeDetail = in.serviceLoad;
@@ -422,6 +487,12 @@ SyncSummary Backend::summarize(const SyncInputs &in) {
         // A run in the log after the skip (the fix's final run, which runs
         // outside the unit) is newer news than the skip.
         s.status = "skipped";
+        // run-condition holds this account for an old drive-sync on its
+        // folder: the detail names what was found, to remove by hand.
+        if (in.oldDriveSyncHold) {
+            s.causeKind = "oldDriveSync";
+            s.causeDetail = in.oldDriveSync.join(", ");
+        }
     } else if (timerOff) {
         s.status = "timerOff";
     } else if (stale) {
@@ -446,6 +517,8 @@ SyncSummary Backend::summarize(const SyncInputs &in) {
         s.warnings << "timerDisabled";
     if (in.conflicts > 0 && s.status != "conflicts")
         s.warnings << "conflicts";
+    if (!in.oldDriveSync.isEmpty())
+        s.warnings << "oldDriveSync";
     return s;
 }
 
@@ -469,16 +542,31 @@ QList<QHash<QString, QString>> Backend::parseShow(const QByteArray &output) {
     return units;
 }
 
-QDateTime Backend::parseNextElapse(const QByteArray &json) {
-    const QJsonArray timers = QJsonDocument::fromJson(json).array();
-    if (timers.isEmpty())
-        return {};
-    // Microseconds since the epoch; 0 or null when nothing is scheduled.
-    const double next = timers.first().toObject().value("next").toDouble(0);
-    return next > 0 ? QDateTime::fromMSecsSinceEpoch(qint64(next / 1000.0), QTimeZone::UTC) : QDateTime();
+QHash<QString, QHash<QString, QString>> Backend::parseShowById(const QByteArray &output) {
+    QHash<QString, QHash<QString, QString>> byId;
+    for (const auto &unit : parseShow(output))
+        if (!unit.value("Id").isEmpty())
+            byId.insert(unit.value("Id"), unit);
+    return byId;
+}
+
+QDateTime Backend::parseNextElapse(const QByteArray &json, const QString &unit) {
+    for (const QJsonValue &entry : QJsonDocument::fromJson(json).array()) {
+        const QJsonObject timer = entry.toObject();
+        if (timer.value("unit").toString() != unit)
+            continue;
+        // Microseconds since the epoch; 0 or null when nothing is scheduled.
+        const double next = timer.value("next").toDouble(0);
+        return next > 0 ? QDateTime::fromMSecsSinceEpoch(qint64(next / 1000.0), QTimeZone::UTC) : QDateTime();
+    }
+    return {};
 }
 
 bool Backend::resyncRunning(const QString &stateDir, const QString &proc) {
+    // An account in the accounts layout has no drive-sync.sh state folder:
+    // an empty one would read "/pausado" at the root.
+    if (stateDir.isEmpty())
+        return false;
     QFile mark(stateDir + "/pausado");
     if (!mark.open(QIODevice::ReadOnly))
         return false;
@@ -493,12 +581,52 @@ bool Backend::resyncRunning(const QString &stateDir, const QString &proc) {
     return cmdline.open(QIODevice::ReadOnly) && cmdline.readAll().contains("drive-sync.sh");
 }
 
+void Backend::setResolver(std::function<WindowAccount()> resolve) {
+    m_resolve = std::move(resolve);
+    reloadConfig();
+}
+
+namespace {
+
+bool sameAccount(const BackendPaths &a, const BackendPaths &b) {
+    return a.id == b.id && a.config == b.config && a.appState == b.appState && accountUnits(a) == accountUnits(b);
+}
+
+bool hasNotice(const QList<AccountNotice> &notices, const QString &kind) {
+    return std::any_of(notices.cbegin(), notices.cend(), [&](const AccountNotice &n) { return n.kind == kind; });
+}
+
+}  // namespace
+
 void Backend::reloadConfig() {
+    if (m_resolve) {
+        const WindowAccount next = m_resolve();
+        // A move under way (its journal, and no notice that it stopped) can
+        // be caught between two renames: keep what is shown until it ends.
+        if (moveInProgress(next.paths.globalState()) && !hasNotice(next.notices, "moveStuck")) {
+            m_moveWait.start();
+            return;
+        }
+        QVariantList notices;
+        for (const AccountNotice &notice : next.notices)
+            notices.append(QVariantMap{{"kind", notice.kind}, {"path", notice.path}});
+        if (notices != m_notices) {
+            m_notices = notices;
+            emit changed();
+        }
+        if (!sameAccount(next.paths, m_paths)) {
+            adopt(next.paths);
+            return;
+        }
+    }
     if (m_paths.config.isEmpty())
         return;
     const auto config = loadSyncConfig(m_paths.config, nullptr);
     const QString log = config ? config->logFile : m_paths.log;
-    m_paths.managed = config.has_value();
+    m_configError = accountConfigError(m_paths);
+    // An account whose config broke stays managed, as the resolver lists
+    // it; one whose config is gone (a takeover undone) is not.
+    m_paths.managed = config.has_value() || !m_configError.isEmpty();
     // Without a config the packaged timer's interval is the one that runs.
     m_paths.intervalSeconds = (config ? config->intervalMinutes : kDefaultIntervalMinutes) * 60;
     if (config)
@@ -509,6 +637,40 @@ void Backend::reloadConfig() {
         readLog();
     }
     refresh();
+}
+
+void Backend::adopt(const BackendPaths &paths) {
+    // Every watch named the old account's files: its log, its state folder
+    // (the whole state root in legacy mode) and its config's folder.
+    for (QFileSystemWatcher *watcher : {&m_watcher, &m_stateWatcher, &m_configWatcher}) {
+        const QStringList watched = watcher->files() + watcher->directories();
+        if (!watched.isEmpty())
+            watcher->removePaths(watched);
+    }
+    m_paths = paths;
+    m_configError = accountConfigError(m_paths);
+    refresh();
+}
+
+void Backend::startMove() {
+    if (m_paths.self.isEmpty())
+        return;
+    // Never killed: no timeout, no parent that kills it at quit (~Backend
+    // stops its children). A move stopped by a signal leaves its journal for
+    // the next trigger to roll back, which can be an hour away. Nothing is
+    // read from it either, so a window that quits leaves no pipe to break.
+    auto *process = new QProcess;
+    process->setStandardOutputFile(QProcess::nullDevice());
+    process->setStandardErrorFile(QProcess::nullDevice());
+    connect(process, &QProcess::finished, this, [this, process] {
+        process->deleteLater();
+        reloadConfig();
+    });
+    connect(process, &QProcess::errorOccurred, this, [process](QProcess::ProcessError error) {
+        if (error == QProcess::FailedToStart)
+            process->deleteLater();
+    });
+    process->start(m_paths.self, {"accounts", "--migrate", "--json"});
 }
 
 namespace {
@@ -624,6 +786,12 @@ void Backend::answerFix(const QStringList &answers) {
     QJsonObject byPath;
     for (qsizetype i = 0; i < answers.size(); ++i)
         byPath.insert(m_fix.questions.at(i).path, answers.at(i));
+    // The answers are the account's state: none written while the move to
+    // account1 takes it to its new place.
+    if (moveInProgress(m_paths.globalState())) {
+        setMessage(tr("DriveSync is moving to accounts; try again in a minute."));
+        return;
+    }
     const QString file = m_paths.appState + "/fix-answers.json";
     QSaveFile out(file);
     if (!QDir().mkpath(m_paths.appState) || !out.open(QIODevice::WriteOnly)

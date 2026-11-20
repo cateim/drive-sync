@@ -16,9 +16,11 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 
+#include "accounts.h"
 #include "controlcommands.h"
 #include "fixstate.h"
 #include "listingdiff.h"
+#include "machineguard.h"
 #include "snapshot.h"
 #include "synclog.h"
 
@@ -120,7 +122,6 @@ QString fixConfigRefusal(const SyncConfig &config) {
 
 namespace {
 
-const QString kFixUnit = "drive-sync-fix.service";
 constexpr int kSystemctlTimeoutMs = 15000;
 // One file in the cloud: touch or delete. Generous, for a slow network.
 constexpr int kRcloneFileTimeoutMs = 5 * 60 * 1000;
@@ -211,7 +212,7 @@ QString applySettingsChange(const BackendPaths &paths, const FixState &state, Sy
 QString startFixUnit(const BackendPaths &paths) {
     QString error;
     // --no-block: the step takes minutes; the state file says where it is.
-    runProcess(paths.systemctl, {"--user", "start", "--no-block", kFixUnit}, kSystemctlTimeoutMs, nullptr, &error);
+    runProcess(paths.systemctl, {"--user", "start", "--no-block", paths.fixUnit}, kSystemctlTimeoutMs, nullptr, &error);
     return error;
 }
 
@@ -228,21 +229,7 @@ QString advance(const BackendPaths &paths, const FixState &state, const QString 
     if (error.isEmpty())
         return QString();
     writeFix(paths.appState, state);
-    return QString("could not start %1: %2").arg(kFixUnit, error);
-}
-
-// The config's runOnlyWhen (the old unit's ExecCondition): where it says no,
-// as on the emergency home, ~/Drive is not the one to sync, and a resync
-// would push it over the cloud.
-QString runOnlyWhenRefusal(const SyncConfig &config) {
-    if (config.runOnlyWhen.isEmpty())
-        return QString();
-    QString error;
-    if (runProcess(QStandardPaths::findExecutable("sh"), {"-c", config.runOnlyWhen}, kSystemctlTimeoutMs, nullptr,
-                   &error))
-        return QString();
-    return QString("the config's runOnlyWhen check says no (%1), so this is not the home drive-sync runs on")
-        .arg(config.runOnlyWhen);
+    return QString("could not start %1: %2").arg(paths.fixUnit, error);
 }
 
 // Spec 5b: after --max-delete stopped a run, a resync would bring the
@@ -288,13 +275,14 @@ QString startFix(const BackendPaths &paths, const std::function<QString()> &appl
         return "a fix needs DriveSync to run drive-sync; take it over first";
     if (fixPresent(paths.appState))
         return "a fix is already under way; open DriveSync to follow it";
-    if (takeoverLockHeld(paths.appState, paths.proc))
+    if (takeoverLockHeld(paths.globalState(), paths.proc))
         return "a takeover is running; fix when it ends";
     QString error;
     const auto config = loadSyncConfig(paths.config, &error);
     if (!config)
         return error;
-    for (const QString &refusal : {fixConfigRefusal(*config), runOnlyWhenRefusal(*config), maxDeleteRefusal(*config)})
+    for (const QString &refusal :
+         {fixConfigRefusal(*config), machineGuardRefusal(paths, *config), maxDeleteRefusal(*config)})
         if (!refusal.isEmpty())
             return refusal;
     FixState state;
@@ -320,7 +308,7 @@ QString startFix(const BackendPaths &paths, const std::function<QString()> &appl
     if (undo)
         undo();
     clearFix(paths.appState);
-    return QString("could not start %1: %2").arg(kFixUnit, error);
+    return QString("could not start %1: %2").arg(paths.fixUnit, error);
 }
 
 namespace {
@@ -366,9 +354,9 @@ QString undoFirstSetup(const BackendPaths &paths) {
         return QString();
     QString error;
     if (!runProcess(paths.systemctl,
-                    {"--user", "disable", "--now", "drive-sync.timer", "drive-sync-watchdog.timer"},
+                    {"--user", "disable", "--now", paths.timerUnit, "drive-sync-watchdog.timer"},
                     kSystemctlTimeoutMs, nullptr, &error))
-        return QString("could not turn off drive-sync.timer and drive-sync-watchdog.timer: %1").arg(error);
+        return QString("could not turn off %1 and drive-sync-watchdog.timer: %2").arg(paths.timerUnit, error);
     QFile::remove(paths.config);
     if (const QString filters = mark.value("filters").toString(); filters == config->filtersFile)
         QFile::remove(filters);
@@ -407,7 +395,7 @@ QString undoSettingsChange(const BackendPaths &paths, const FixState &state) {
 
 QString cancelFix(const BackendPaths &paths, const FixState &state) {
     QString error;
-    const QString unit = unitState(paths, kFixUnit, &error);
+    const QString unit = unitState(paths, paths.fixUnit, &error);
     if (unit.isEmpty())
         return QString("cannot ask systemd whether the fix is running: %1").arg(error);
     if (unitBusy(unit))
@@ -423,7 +411,7 @@ QString cancelFix(const BackendPaths &paths, const FixState &state) {
 
 QString retryFix(const BackendPaths &paths, const FixState &state) {
     QString error;
-    const QString unit = unitState(paths, kFixUnit, &error);
+    const QString unit = unitState(paths, paths.fixUnit, &error);
     if (unit.isEmpty())
         return QString("cannot ask systemd whether the fix is running: %1").arg(error);
     if (unitBusy(unit))
@@ -508,7 +496,7 @@ int runRcloneFile(const FixTools &tools, const QStringList &arguments, QString *
 QString prepareStep(const BackendPaths &paths, SyncConfig *config, const FixTools &tools, FixState *state) {
     for (;;) {
         QString error;
-        const QString service = unitState(paths, "drive-sync.service", &error);
+        const QString service = unitState(paths, paths.serviceUnit, &error);
         if (service.isEmpty())
             return QString("cannot ask systemd whether drive-sync is running: %1").arg(error);
         if (!unitBusy(service))
@@ -642,7 +630,12 @@ int runFixCommand(const QStringList &arguments, const BackendPaths &paths, QText
             json, "usage: drive-sync fix --start | --confirm | --answers <file.json> | --cancel | --retry [--json]", out,
             err);
     // One writer at a time: the unit and the watchdog's reminder take it too.
-    const FixLock lock(paths.appState);
+    // None while the move to account1 runs, and none at a place it just left.
+    const AccountWriteLock lock(paths);
+    if (!lock.refusal().isEmpty())
+        return commandAnswer(json, lock.refusal(), out, err);
+    if (lock.stale())
+        return kAccountPathsMoved;
     if (action == "--start")
         return commandAnswer(json, startFix(paths), out, err);
     if (!fixPresent(paths.appState))
@@ -687,7 +680,7 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
         QString error = configError;
         // Checked before every step: a reboot can change the home in between.
         if (error.isEmpty())
-            error = runOnlyWhenRefusal(config);
+            error = machineGuardRefusal(paths, config);
         if (error.isEmpty()) {
             if (step == "preparing")
                 error = prepareStep(paths, &current, tools, &state);

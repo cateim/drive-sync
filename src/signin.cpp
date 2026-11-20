@@ -12,6 +12,7 @@
 
 #include "controlcommands.h"
 #include "fixstate.h"
+#include "machineguard.h"
 #include "syncconfig.h"
 
 namespace {
@@ -327,8 +328,13 @@ int runSignInCommand(const QStringList &arguments, const BackendPaths &paths, co
     // or stopped (on this very token, say), lets it through.
     if (fixPresent(paths.appState) && fixWorking(readFix(paths.appState).step))
         return answer(json, "a fix is under way; sign in when it ends", {}, out, err);
-    if (takeoverLockHeld(paths.appState, paths.proc))
+    if (takeoverLockHeld(paths.globalState(), paths.proc))
         return answer(json, "a takeover is running; sign in when it ends", {}, out, err);
+    // On a machine whose check says no (the emergency home), a sign-in would
+    // set up or change the remote of a folder that is not the one to sync.
+    const auto current = QFile::exists(paths.config) ? loadSyncConfig(paths.config, nullptr) : std::nullopt;
+    if (const QString refusal = machineGuardRefusal(paths, current.value_or(SyncConfig())); !refusal.isEmpty())
+        return answer(json, refusal, {}, out, err);
     // The link goes out as soon as rclone prints it, before the final answer:
     // the window shows it, so a browser that did not open is no dead wait.
     const LineSink onLine = [&](const QString &line) {
