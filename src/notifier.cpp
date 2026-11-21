@@ -348,7 +348,7 @@ void remindOfFix(const BackendPaths &paths, const NotifierPaths &tools, const QD
     const QDateTime last = state.lastReminder.isValid() ? state.lastReminder : since;
     if (last.secsTo(now) < kRepeatSeconds)
         return;
-    notifyFixNeedsYou(tools, state, stopped);
+    notifyFixNeedsYou(paths, tools, state, stopped);
     // notify-send can take seconds: a step that moved on in the meantime wins,
     // and the lock keeps a confirm from landing between this read and write.
     // While the move to account1 runs, or once it moved the fix, the
@@ -372,7 +372,7 @@ void remindOfPause(const BackendPaths &paths, const NotifierPaths &tools, const 
     const QDateTime last = mark.lastReminder.isValid() ? mark.lastReminder : since;
     if (last.secsTo(now) < kPauseReminderSeconds)
         return;
-    notify(tools, "normal", "dialog-information", tr("DriveSync is still paused"),
+    notify(tools, "normal", "dialog-information", accountCardTitle(tr("DriveSync is still paused"), paths),
            tr("Drive has been paused since %1. Resume it in DriveSync or with: drive-sync resume")
                .arg(at(tools, since)));
     // notify-send can take seconds: a resume or a new pause in the meantime
@@ -395,22 +395,63 @@ NotifierPaths NotifierPaths::defaults(const QLocale &locale) {
             QStandardPaths::findExecutable("omarchy"), locale, currentClockTimeFormat()};
 }
 
+QString accountCardTitle(const QString &title, const BackendPaths &account) {
+    const QString label =
+        account.label.isEmpty() ? QFileInfo(QDir::cleanPath(account.drive)).fileName() : account.label;
+    if (label.isEmpty())
+        return title;
+    return tr("%1 (%2)").arg(title, label);
+}
+
+QStringList accountCardBareTitles() {
+    return {tr("Drive stopped syncing"),
+            tr("Drive is still stopped"),
+            tr("Drive filters changed"),
+            tr("Drive filters still changed"),
+            tr("Drive's first sync waits for you"),
+            tr("Drive's first sync still waits for you"),
+            tr("Drive is syncing again"),
+            tr("Drive will not sync"),
+            tr("Drive is still not syncing"),
+            tr("Drive timer is back"),
+            tr("DriveSync is still paused"),
+            tr("The Drive fix is waiting for you"),
+            tr("The Drive fix stopped"),
+            tr("Drive deleted files you did not confirm")};
+}
+
+void dismissBareTitlesOnce(const NotifierPaths &tools, const QString &globalState) {
+    if (tools.bareTitlesMark.isEmpty() || QFileInfo::exists(tools.bareTitlesMark) || moveInProgress(globalState))
+        return;
+    // The mark first: a mark that cannot be written means the titles would
+    // be dismissed again on every card, closing the account's own.
+    QDir().mkpath(QFileInfo(tools.bareTitlesMark).absolutePath());
+    QSaveFile mark(tools.bareTitlesMark);
+    if (!mark.open(QIODevice::WriteOnly))
+        return;
+    mark.write(QJsonDocument(QJsonObject{{"version", 1}}).toJson(QJsonDocument::Compact));
+    if (!mark.commit())
+        return;
+    close(tools, 0, accountCardBareTitles());
+}
+
 int runNotifyCommand(const QString &serviceResult, const BackendPaths &paths, const NotifierPaths &tools,
                      const QDateTime &now) {
     const QString file = paths.appState + "/notify-run.json";
-    const QString stopped = tr("Drive stopped syncing");
-    const QString stillStopped = tr("Drive is still stopped");
-    const QString filters = tr("Drive filters changed");
-    const QString stillFilters = tr("Drive filters still changed");
-    const QString firstSync = tr("Drive's first sync waits for you");
-    const QString stillFirstSync = tr("Drive's first sync still waits for you");
+    const QString stopped = accountCardTitle(tr("Drive stopped syncing"), paths);
+    const QString stillStopped = accountCardTitle(tr("Drive is still stopped"), paths);
+    const QString filters = accountCardTitle(tr("Drive filters changed"), paths);
+    const QString stillFilters = accountCardTitle(tr("Drive filters still changed"), paths);
+    const QString firstSync = accountCardTitle(tr("Drive's first sync waits for you"), paths);
+    const QString stillFirstSync = accountCardTitle(tr("Drive's first sync still waits for you"), paths);
     if (serviceResult == "exec-condition")
         return 0;  // skipped on purpose: paused, a fix under way, or runOnlyWhen said no
+    dismissBareTitlesOnce(tools, paths.globalState());
     // drive-sync run became rclone, so the run let through is checked here,
     // after it, whatever it ended with.
-    notifyUnconfirmedDeletes(tools, checkConfirmedRun(paths.appState, paths.log));
+    notifyUnconfirmedDeletes(paths, tools, checkConfirmedRun(paths.appState, paths.log));
     if (serviceResult == "success") {
-        reportSolved(tools, file, tr("Drive is syncing again"), tr("It had stopped at %1."),
+        reportSolved(tools, file, accountCardTitle(tr("Drive is syncing again"), paths), tr("It had stopped at %1."),
                      {stopped, stillStopped, filters, stillFilters, firstSync, stillFirstSync});
         return 0;
     }
@@ -436,12 +477,13 @@ namespace {
 // fix. The bookkeeping is in the account's own state folder.
 void watchAccount(const BackendPaths &paths, const NotifierPaths &tools, const QDateTime &now,
                   const QString &guardError) {
+    dismissBareTitlesOnce(tools, paths.globalState());
     QString configError;
     if (loadSyncConfig(paths.config, &configError))
         configError.clear();
     const QString file = paths.appState + "/notify-watchdog.json";
-    const QString noSync = tr("Drive will not sync");
-    const QString stillNoSync = tr("Drive is still not syncing");
+    const QString noSync = accountCardTitle(tr("Drive will not sync"), paths);
+    const QString stillNoSync = accountCardTitle(tr("Drive is still not syncing"), paths);
     const QString problem = !configError.isEmpty()
         ? tr("DriveSync's config cannot be read, so no run happens: %1").arg(configError)
         : !guardError.isEmpty() ? tr("No run happens: %1").arg(guardError) : timerProblem(paths);
@@ -449,8 +491,8 @@ void watchAccount(const BackendPaths &paths, const NotifierPaths &tools, const Q
         reportProblem(tools, file, noSync, stillNoSync, problem, tr("Noticed at %1."), now, "critical", QString(),
                       false, &paths);
     else
-        reportSolved(tools, file, tr("Drive timer is back"), tr("The problem was noticed at %1."), {noSync, stillNoSync},
-                     &paths);
+        reportSolved(tools, file, accountCardTitle(tr("Drive timer is back"), paths), tr("The problem was noticed at %1."),
+                     {noSync, stillNoSync}, &paths);
     remindOfPause(paths, tools, now);
     remindOfFix(paths, tools, now);
 }
@@ -551,6 +593,11 @@ int runWatchdogCommand(const AccountRoots &roots, const TakeoverPaths &takeover,
     // a card (reportAccountNotices).
     const MoveOutcome move = moveToAccounts(roots, takeover);
     const AccountSet set = resolveAccounts(roots);
+    // The bare 5.1 titles go once, and only with one account: each is part
+    // of every account's labelled title, so with two it would close both.
+    NotifierPaths accountTools = tools;
+    accountTools.bareTitlesMark =
+        set.accounts.size() == 1 ? roots.stateRoot + "/notify-bare-titles.done" : QString();
     // Where the runs are skipped on purpose (another home mounted, say), the
     // watchdog has nothing to say either. The check is the machine's, so it
     // runs once: legacy mode reads it from the only config, accounts mode
@@ -569,7 +616,7 @@ int runWatchdogCommand(const AccountRoots &roots, const TakeoverPaths &takeover,
     const bool moving = moveInProgress(roots.stateRoot);
     if (!moving) {
         for (const BackendPaths &account : set.accounts)
-            watchAccount(account, tools, now, guardError);
+            watchAccount(account, accountTools, now, guardError);
         // Next to accounts only: with none, an old drive-sync is what a
         // takeover offers to move aside.
         if (set.mode == "accounts" && !set.accounts.isEmpty())
@@ -581,9 +628,10 @@ int runWatchdogCommand(const AccountRoots &roots, const TakeoverPaths &takeover,
     return 0;
 }
 
-void notifyFixNeedsYou(const NotifierPaths &tools, const FixState &state, bool stopped) {
-    const QString waiting = tr("The Drive fix is waiting for you");
-    const QString halted = tr("The Drive fix stopped");
+void notifyFixNeedsYou(const BackendPaths &paths, const NotifierPaths &tools, const FixState &state, bool stopped) {
+    dismissBareTitlesOnce(tools, paths.globalState());
+    const QString waiting = accountCardTitle(tr("The Drive fix is waiting for you"), paths);
+    const QString halted = accountCardTitle(tr("The Drive fix stopped"), paths);
     close(tools, 0, {waiting, halted});
     if (stopped)
         notify(tools, "critical", "dialog-warning", halted,
@@ -598,23 +646,27 @@ void notifyFixNeedsYou(const NotifierPaths &tools, const FixState &state, bool s
 }
 
 void notifyFixEnded(const BackendPaths &paths, const NotifierPaths &tools) {
+    dismissBareTitlesOnce(tools, paths.globalState());
     const QString file = paths.appState + "/notify-run.json";
     close(tools, readProblem(file).id,
-          {tr("Drive stopped syncing"), tr("Drive is still stopped"), tr("Drive filters changed"),
-           tr("Drive filters still changed")});
+          {accountCardTitle(tr("Drive stopped syncing"), paths), accountCardTitle(tr("Drive is still stopped"), paths),
+           accountCardTitle(tr("Drive filters changed"), paths),
+           accountCardTitle(tr("Drive filters still changed"), paths)});
     QFile::remove(file);
-    notify(tools, "normal", "dialog-information", tr("Drive is syncing again"),
+    notify(tools, "normal", "dialog-information", accountCardTitle(tr("Drive is syncing again"), paths),
            tr("The fix rebuilt the base of both sides."));
 }
 
-void notifyUnconfirmedDeletes(const NotifierPaths &tools, const UnconfirmedDeletes &extra) {
+void notifyUnconfirmedDeletes(const BackendPaths &paths, const NotifierPaths &tools, const UnconfirmedDeletes &extra) {
     const int count = extra.cloudCount + extra.notebookCount;
     if (count == 0)
         return;
+    dismissBareTitlesOnce(tools, paths.globalState());
     QString text = tr("The run you let through deleted %Ln files that were not in the list you confirmed.", count);
     if (extra.cloudCount > 0)
         text += " " + tr("The ones deleted on the notebook are kept in %1.").arg(extra.backupDir);
     if (extra.notebookCount > 0)
         text += " " + tr("The ones deleted in the cloud are in the Drive trash.");
-    notify(tools, "critical", "dialog-warning", tr("Drive deleted files you did not confirm"), text);
+    notify(tools, "critical", "dialog-warning", accountCardTitle(tr("Drive deleted files you did not confirm"), paths),
+           text);
 }

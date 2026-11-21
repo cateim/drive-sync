@@ -52,6 +52,12 @@ ApplicationWindow {
     }
     property string lastFixStep: ""
     Component.onCompleted: win.lastFixStep = backend.fixStep
+    // Another account shown ("backend" already points at it): a fix waiting
+    // there shows its banner, and its dialog never opens by itself.
+    Connections {
+        target: accountList
+        function onSelectedChanged() { win.lastFixStep = backend.fixStep }
+    }
 
     function openFix() {
         if (backend.fixStep === "questions")
@@ -147,6 +153,21 @@ ApplicationWindow {
     Shortcut { sequence: "Q"; context: Qt.ApplicationShortcut; onActivated: Qt.quit() }
     Shortcut { sequence: "Space"; context: Qt.ApplicationShortcut; onActivated: backend.refresh() }
     Shortcut { sequence: "O"; context: Qt.ApplicationShortcut; enabled: !win.dialogOpen; onActivated: backend.openDriveFolder() }
+    // The account shown, from two accounts on; both wrap around. Never while
+    // a dialog or the help is open: a typed count, a fix confirmation or a
+    // Settings save must stay with the account it was opened for.
+    Shortcut {
+        sequence: "["
+        context: Qt.ApplicationShortcut
+        enabled: !win.dialogOpen && !win.helpVisible && accountList.several
+        onActivated: accountList.selectPrevious()
+    }
+    Shortcut {
+        sequence: "]"
+        context: Qt.ApplicationShortcut
+        enabled: !win.dialogOpen && !win.helpVisible && accountList.several
+        onActivated: accountList.selectNext()
+    }
     Shortcut {
         sequence: "B"
         context: Qt.ApplicationShortcut
@@ -297,6 +318,11 @@ ApplicationWindow {
             anchors.fill: parent
             anchors.margins: 20
             spacing: 14
+
+            AccountSelector {
+                Layout.fillWidth: true
+                locked: win.dialogOpen || win.helpVisible
+            }
 
             StatusPanel {
                 Layout.fillWidth: true

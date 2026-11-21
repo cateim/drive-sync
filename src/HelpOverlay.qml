@@ -19,6 +19,7 @@ Rectangle {
         { keys: "Enter", what: qsTr("Show the picked conflict copy in the file manager") },
         { keys: "S", what: qsTr("Sync now") },
         { keys: "O", what: qsTr("Open the Drive folder") },
+        { keys: "[   ]", what: qsTr("Show the previous or the next account, with two or more") },
         { keys: "P   U", what: qsTr("Pause, and resume, once DriveSync runs drive-sync") },
         { keys: "T", what: qsTr("Set up or take over drive-sync, when offered") },
         { keys: "I", what: qsTr("Sign in to Google again, when asked") },

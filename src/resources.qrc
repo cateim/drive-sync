@@ -1,6 +1,7 @@
 <RCC>
     <qresource prefix="/">
         <file alias="Main.qml">Main.qml</file>
+        <file alias="AccountSelector.qml">AccountSelector.qml</file>
         <file alias="StatusPanel.qml">StatusPanel.qml</file>
         <file alias="RunsPage.qml">RunsPage.qml</file>
         <file alias="RunDetail.qml">RunDetail.qml</file>

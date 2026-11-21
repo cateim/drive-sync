@@ -22,10 +22,18 @@ inline constexpr char kNewRemoteName[] = "drive-sync";
 
 // "gdrive:" and "gdrive:sub/dir" give "gdrive".
 QString remoteName(const QString &remote);
-// The arguments after "rclone" that create the remote and open the browser.
-QStringList createRemoteArguments(const QString &name, const OAuthClient &client);
+// The arguments after "rclone" that create the remote and open the browser;
+// page, when given, is the file rclone shows when the browser comes back.
+QStringList createRemoteArguments(const QString &name, const OAuthClient &client, const QString &page = QString());
 // The arguments after "rclone" that sign an existing remote in again.
-QStringList refreshTokenArguments(const QString &name);
+QStringList refreshTokenArguments(const QString &name, const QString &page = QString());
+
+// The page rclone shows when Google sends the browser back: the template
+// compiled in (signin-page.html), its text translated by the installed
+// translator and HTML-escaped, braces included, so no translation can add a
+// Go template action; the logo inline; language as its lang attribute.
+// Empty when the resources are missing.
+QByteArray signInPage(const QString &language);
 
 struct SignInTools {
     QString rclone;
@@ -35,6 +43,9 @@ struct SignInTools {
     // The client a new remote signs in with; tests pass a fake one so the
     // shipped values never reach a fake rclone's call log.
     std::optional<OAuthClient> client;
+    // The language of the page rclone shows after Google, the one the
+    // installed translator follows.
+    QString language = "en";
 
     static SignInTools defaults();
 };

@@ -31,6 +31,9 @@ class FolderTree : public QObject {
     // not listed yet): the base is a union, so that copy goes back up, files
     // deleted in the cloud meanwhile included.
     Q_PROPERTY(QStringList reticked READ reticked NOTIFY changed)
+    // The account Settings lists for ("--account <id>" right after
+    // "folders"); empty for first setup, which names its remote instead.
+    Q_PROPERTY(QString account READ account WRITE setAccount NOTIFY changed)
 
 public:
     explicit FolderTree(const QString &program, QObject *parent = nullptr);
@@ -43,6 +46,8 @@ public:
     bool dirty() const;
     QStringList newlySkippedLocal() const;
     QStringList reticked() const;
+    QString account() const { return m_account; }
+    void setAccount(const QString &account);
 
     // Starts over from the cloud's root with these folders left out. An
     // empty remote is the config's.
@@ -67,6 +72,7 @@ private:
     void stopChildren();
 
     QString m_program;
+    QString m_account;
     QString m_remote;
     QStringList m_initial;
     QStringList m_skipped;

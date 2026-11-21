@@ -7,6 +7,31 @@
 #include <QProcess>
 #include <algorithm>
 
+namespace {
+
+// "settings" with "--account <id>" right after it when id is set, then rest.
+QStringList settingsCommand(const QString &account, const QStringList &rest) {
+    QStringList arguments{"settings"};
+    if (!account.isEmpty())
+        arguments << "--account" << account;
+    return arguments + rest;
+}
+
+// The account a command names, empty when it names none.
+QString accountOf(const QStringList &arguments) {
+    return arguments.value(1) == "--account" ? arguments.value(2) : QString();
+}
+
+// The read is "settings --json", whichever account it names.
+bool isRead(const QStringList &arguments) {
+    QStringList rest = arguments;
+    if (rest.value(1) == "--account")
+        rest.remove(1, 2);
+    return rest == QStringList{"settings", "--json"};
+}
+
+}  // namespace
+
 SettingsController::SettingsController(const QString &program, QObject *parent)
     : QObject(parent), m_program(program) {}
 
@@ -25,31 +50,48 @@ SettingsController::~SettingsController() {
         m_child->kill();
 }
 
-void SettingsController::load() { enqueue({"settings", "--json"}); }
+void SettingsController::setAccount(const QString &account) {
+    if (account == m_account)
+        return;
+    m_account = account;
+    // What was read is the other account's: nothing shows, and no field is
+    // saved from it, until this account is read.
+    m_loaded = false;
+    m_folder.clear();
+    m_remote.clear();
+    m_filters.clear();
+    m_skipError.clear();
+    m_skipped.clear();
+    m_intervalMinutes = 0;
+    m_maxDelete = 0;
+    emit changed();
+}
+
+void SettingsController::load() { enqueue(settingsCommand(m_account, {"--json"})); }
 
 void SettingsController::setInterval(int minutes) {
-    enqueue({"settings", "--interval", QString::number(minutes), "--json"});
+    enqueue(settingsCommand(m_account, {"--interval", QString::number(minutes), "--json"}));
 }
 
 void SettingsController::setMaxDelete(int percent) {
-    enqueue({"settings", "--max-delete", QString::number(percent), "--json"});
+    enqueue(settingsCommand(m_account, {"--max-delete", QString::number(percent), "--json"}));
 }
 
 void SettingsController::setFolder(const QString &folder) {
     QString path = folder.trimmed();
     if (path == "~" || path.startsWith("~/"))
         path = QDir::homePath() + path.mid(1);
-    enqueue({"settings", "--folder", path, "--json"});
+    enqueue(settingsCommand(m_account, {"--folder", path, "--json"}));
 }
 
 void SettingsController::setFilters(const QString &text) {
     // On stdin: the child needs nothing of the window's once it started,
     // even when the window closes before it read the text.
-    enqueue({"settings", "--filters", "-", "--json"}, text.toUtf8());
+    enqueue(settingsCommand(m_account, {"--filters", "-", "--json"}), text.toUtf8());
 }
 
 void SettingsController::setSkipped(const QStringList &folders) {
-    QStringList arguments{"settings"};
+    QStringList arguments = settingsCommand(m_account, {});
     for (const QString &folder : folders)
         arguments << "--skip" << folder;
     if (folders.isEmpty())
@@ -58,8 +100,8 @@ void SettingsController::setSkipped(const QStringList &folders) {
 }
 
 void SettingsController::enqueue(const QStringList &arguments, const QByteArray &input) {
-    // A read already waiting covers another one.
-    if (arguments == QStringList{"settings", "--json"}
+    // A read already waiting covers another one of the same account.
+    if (isRead(arguments)
         && std::any_of(m_queue.cbegin(), m_queue.cend(), [&](const Pending &p) { return p.arguments == arguments; }))
         return;
     m_queue << Pending{arguments, input};
@@ -72,7 +114,7 @@ void SettingsController::runNext() {
         return;
     const Pending next = m_queue.takeFirst();
     const QStringList arguments = next.arguments;
-    const bool read = arguments == QStringList{"settings", "--json"};
+    const bool read = isRead(arguments);
     m_state = read ? "loading" : "saving";
     if (!read) {
         m_error.clear();
@@ -108,7 +150,7 @@ void SettingsController::finished(const QStringList &arguments, const QByteArray
     const QJsonDocument document = QJsonDocument::fromJson(output.trimmed().split('\n').last());
     const QJsonObject answer = document.object();
     const bool ok = document.isObject() && answer.value("ok").toBool();
-    const bool read = arguments == QStringList{"settings", "--json"};
+    const bool read = isRead(arguments);
     bool fixNow = false;
     if (!ok) {
         m_error = answer.value("error").toString();
@@ -116,7 +158,10 @@ void SettingsController::finished(const QStringList &arguments, const QByteArray
             m_error = read ? tr("DriveSync could not read its settings.") : tr("DriveSync could not change the setting.");
         // What was queued after a refused change was meant to follow it.
         m_queue.clear();
-        m_fixStarted = false;
+        m_fixStarted.clear();
+    } else if (read && accountOf(arguments) != m_account) {
+        // Another account's read (the account changed while it ran): its
+        // values are not the ones shown now.
     } else if (read) {
         m_loaded = true;
         m_folder = answer.value("folder").toString();
@@ -129,14 +174,31 @@ void SettingsController::finished(const QStringList &arguments, const QByteArray
             m_skipped << folder.toString();
         m_skipError = answer.value("skipError").toString();
     } else {
-        m_fixStarted = m_fixStarted || answer.value("fixStarted").toBool();
-        if (m_queue.isEmpty()) {
-            // The last change of this save: read the settings back, and say
-            // how the change took effect.
-            fixNow = m_fixStarted;
-            m_fixStarted = false;
-            m_saved = !fixNow;
-            m_queue << Pending{{"settings", "--json"}, {}};
+        // A change keeps the account it was queued with, and so does the fix
+        // it started: another account's commands queued meanwhile (a read
+        // after "]") neither hold it nor take it.
+        const QString account = accountOf(arguments);
+        if (answer.value("fixStarted").toBool())
+            m_fixStarted.insert(account);
+        const bool moreChanges = std::any_of(m_queue.cbegin(), m_queue.cend(), [&](const Pending &p) {
+            return !isRead(p.arguments) && accountOf(p.arguments) == account;
+        });
+        if (!moreChanges) {
+            // The last change of this account's save: read its settings
+            // back, and say how the change took effect. Only the account
+            // shown hears how: the signal closes Settings, and "saved" makes
+            // it take its fields again. For another account "saved" stays
+            // false, as runNext() left it.
+            const bool fixed = m_fixStarted.remove(account);
+            if (account == m_account) {
+                fixNow = fixed;
+                m_saved = !fixed;
+            }
+            // The read names the account the change did, which the
+            // account shown may no longer be.
+            const QStringList readBack = settingsCommand(account, {"--json"});
+            if (std::none_of(m_queue.cbegin(), m_queue.cend(), [&](const Pending &p) { return p.arguments == readBack; }))
+                m_queue << Pending{readBack, {}};
         }
     }
     m_state = "idle";

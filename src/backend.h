@@ -43,6 +43,9 @@ struct BackendPaths {
     QString configRoot{};  // ~/.config/drive-sync
     QString stateRoot{};   // ~/.local/state/drive-sync-app
     bool accountsMode = false;  // the accounts/<id>/ layout and the template units
+    // What the window, the bar and the cards call the account (accountLabel,
+    // set by the resolver over the whole set); empty in paths built by hand.
+    QString label{};
 
     // The state folder shared by every account: the takeover lock and the
     // move's journal live there. Paths with no state root use appState.
@@ -145,6 +148,9 @@ class Backend : public QObject {
     // "staleConfig" (an old config.json that is ignored) and "moveStuck"
     // (the move to accounts stopped halfway; path is its journal).
     Q_PROPERTY(QVariantList notices READ notices NOTIFY changed)
+    // The account shown ("account1"...; empty is the view with no account):
+    // every command the window runs names it.
+    Q_PROPERTY(QString accountId READ accountId NOTIFY changed)
 
 public:
     explicit Backend(const BackendPaths &paths = BackendPaths::defaults(), QObject *parent = nullptr);
@@ -194,6 +200,8 @@ public:
     QString timerUnit() const { return m_paths.timerUnit; }
     QString fixUnit() const { return m_paths.fixUnit; }
     QVariantList notices() const { return m_notices; }
+    QString accountId() const { return m_paths.id; }
+    const BackendPaths &paths() const { return m_paths; }
 
     // Gives the window the resolver: reloadConfig asks it first, and when it
     // names another account (another id, config, state folder or unit), the

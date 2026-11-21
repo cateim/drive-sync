@@ -1,8 +1,9 @@
 .pragma library
 
 // Pure logic of the DriveSync bar widget. The state itself is decided by the
-// app (`drive-sync status --json`); this file only checks what the app printed
-// and turns it into what the bar shows. No QML here, so node:test covers it.
+// app (`drive-sync status --json --all`, version 3); this file only checks
+// what the app printed and turns it into what the bar shows, and builds every
+// command the widget runs. No QML here, so node:test covers it.
 
 var MAX_ERROR_LENGTH = 200
 var EPOCH_MAX = 99999999999
@@ -60,17 +61,17 @@ function cleanText(value) {
   return text
 }
 
-// What `drive-sync status --json` printed, checked field by field. Output that
-// is not version 2 of the contract, or has no clock, is not a snapshot.
-function parseSnapshot(raw) {
-  var data = null
+function parseJson(raw) {
   try {
-    data = JSON.parse(String(raw === undefined || raw === null ? "" : raw))
+    return JSON.parse(String(raw === undefined || raw === null ? "" : raw))
   } catch (e) {
-    data = null
+    return null
   }
-  var ok = isObject(data) && data.version === 2 && toEpoch(data.now) > 0
-  var d = ok ? data : {}
+}
+
+// The keys version 2 and each account of version 3 share, checked one by one
+// against what the app prints; anything else becomes empty, false or 0.
+function readFields(d) {
   var lastRun = isObject(d.lastRun) ? d.lastRun : {}
   var currentRun = isObject(d.currentRun) ? d.currentRun : {}
   var warnings = []
@@ -81,8 +82,6 @@ function parseSnapshot(raw) {
     }
   }
   return {
-    ok: ok,
-    now: toEpoch(d.now),
     status: oneOf(d.status, STATUSES, "unknown"),
     tone: oneOf(d.tone, TONES, "unknown"),
     causeKind: toKey(d.causeKind),
@@ -99,12 +98,238 @@ function parseSnapshot(raw) {
     phase: toKey(currentRun.phase),
     nextRun: toEpoch(d.nextRun),
     failingSince: toEpoch(d.failingSince),
-    conflicts: typeof d.conflicts === "number" && isFinite(d.conflicts) && d.conflicts > 0
-               ? Math.min(Math.floor(d.conflicts), 999999) : 0,
+    typicalSeconds: count(d.typicalSeconds),
+    conflicts: count(d.conflicts),
     managed: d.managed === true,
     paused: d.paused === true,
     pausedUntil: toEpoch(d.pausedUntil)
   }
+}
+
+function count(value) {
+  return typeof value === "number" && isFinite(value) && value > 0 ? Math.min(Math.floor(value), 999999) : 0
+}
+
+// ---- Version 3: every account (`drive-sync status --json --all`) ----
+
+// Ids as the app writes them (account1 to account99). Only an id that passes
+// this ever goes into a command line; the view with no account has "".
+var ACCOUNT_ID = /^account([1-9][0-9]?)$/
+// A panel with more rows than this would not fit on a screen; the app's own
+// limit is lower than the regex allows.
+var MAX_ACCOUNTS = 8
+var MAX_LABEL_LENGTH = 64
+// The keys each account of version 3 has, every time.
+var ACCOUNT_KEYS = ["status", "tone", "causeKind", "causeDetail", "warnings", "running", "resync", "canSyncNow",
+                    "lastSuccess", "lastRun", "currentRun", "nextRun", "failingSince", "typicalSeconds",
+                    "conflicts", "managed", "paused", "pausedUntil", "id", "label", "folder"]
+
+function isAccountId(id) {
+  return typeof id === "string" && ACCOUNT_ID.test(id)
+}
+
+// "" (the view with no account) or an account id; anything else is no id at all.
+function isIdOrView(id) {
+  return id === "" || isAccountId(id)
+}
+
+// A folder the panel may open: absolute, with no control character, so it
+// can never be read as an option or break a line.
+function toFolder(value) {
+  return typeof value === "string" && value.charAt(0) === "/" && !/[\u0000-\u001f\u007f]/.test(value) ? value : ""
+}
+
+function toLabel(value) {
+  var text = cleanText(value)
+  return text.length > MAX_LABEL_LENGTH ? text.substring(0, MAX_LABEL_LENGTH - 1) + "…" : text
+}
+
+// One account of version 3, or null when its id is not one the app writes:
+// such an entry is dropped whole, so its id can never reach a command.
+function parseAccount(value) {
+  if (!isObject(value) || !isIdOrView(value.id)) return null
+  var fields = readFields(value)
+  fields.id = value.id
+  fields.label = toLabel(value.label)
+  fields.folder = toFolder(value.folder)
+  return fields
+}
+
+// What `drive-sync status --json --all` printed. Only version 3 with a clock
+// and a list is a status; each account carries `ok` and the clock, so the
+// one-snapshot helpers (barState, canSyncNow, canPause...) work on it.
+function parseStatus(raw) {
+  var data = parseJson(raw)
+  var ok = isObject(data) && data.version === 3 && toEpoch(data.now) > 0 && Array.isArray(data.accounts)
+  var now = ok ? toEpoch(data.now) : 0
+  var accounts = []
+  var seen = {}
+  if (ok) {
+    for (var i = 0; i < data.accounts.length && accounts.length < MAX_ACCOUNTS; i++) {
+      var entry = parseAccount(data.accounts[i])
+      // One id twice would be one account shown twice, acting as one.
+      if (!entry || seen["id:" + entry.id]) continue
+      seen["id:" + entry.id] = true
+      entry.ok = true
+      entry.now = now
+      accounts.push(entry)
+    }
+  }
+  var worst = -1
+  for (var j = 0; ok && j < accounts.length; j++) {
+    if (accounts[j].id === data.worst) { worst = j; break }
+  }
+  if (worst < 0 && accounts.length > 0) worst = 0
+  return {
+    ok: ok,
+    now: now,
+    tone: oneOf(ok ? data.tone : "", TONES, "unknown"),
+    worst: worst,
+    canSyncNow: ok && data.canSyncNow === true,
+    accounts: accounts
+  }
+}
+
+// What the icon shows: the account the app named worst; with nothing at all,
+// "drive-sync has not run yet", as version 2 said; with no answer, unknown.
+function shownAccount(status) {
+  if (!status || !status.ok) {
+    var unknown = readFields({})
+    unknown.ok = false
+    unknown.now = 0
+    unknown.id = ""
+    unknown.label = ""
+    unknown.folder = ""
+    return unknown
+  }
+  if (status.worst >= 0 && status.worst < status.accounts.length) return status.accounts[status.worst]
+  var none = readFields({ status: "noLog", tone: "error" })
+  none.ok = true
+  none.now = status.now
+  none.id = ""
+  none.label = ""
+  none.folder = ""
+  return none
+}
+
+function accountsOf(status) {
+  return status && status.ok && Array.isArray(status.accounts) ? status.accounts : []
+}
+
+function some(status, test) {
+  var accounts = accountsOf(status)
+  for (var i = 0; i < accounts.length; i++) if (test(accounts[i])) return true
+  return false
+}
+
+function anyCanSync(status) { return some(status, canSyncNow) }
+function anyPaused(status) { return some(status, canResume) }
+function anyCanPause(status) { return some(status, canPause) }
+function anyBusy(status) { return some(status, function(a) { return a.running || a.resync }) }
+
+// The commands the widget runs. Each puts `--account <id>` right after the
+// command word (the app reads it only there) and returns null for an id that
+// is neither "" nor an account id, so nothing else reaches argv.
+function accountArgs(id) {
+  return isAccountId(id) ? ["--account", id] : []
+}
+
+function syncCommand(id) {
+  return isIdOrView(id) ? ["drive-sync", "sync"].concat(accountArgs(id)) : null
+}
+
+// One hour from the bar: a pause with no end is never one key away.
+function pauseCommand(id) {
+  return isIdOrView(id) ? ["drive-sync", "pause"].concat(accountArgs(id), ["--minutes", "60"]) : null
+}
+
+function resumeCommand(id) {
+  return isIdOrView(id) ? ["drive-sync", "resume"].concat(accountArgs(id)) : null
+}
+
+function pauseAllCommand() {
+  return ["drive-sync", "pause", "--minutes", "60"]
+}
+
+function resumeAllCommand() {
+  return ["drive-sync", "resume"]
+}
+
+// One `sync` per account that can: the plain `drive-sync sync` stops at the
+// first account that refuses (a paused one), even when another one started.
+function syncCommands(status) {
+  var commands = []
+  var accounts = accountsOf(status)
+  for (var i = 0; i < accounts.length; i++) {
+    var command = canSyncNow(accounts[i]) ? syncCommand(accounts[i].id) : null
+    if (command) commands.push(command)
+  }
+  return commands
+}
+
+// open-history.sh, with the account to open the window on.
+function openArgs(script, id) {
+  return isIdOrView(id) ? ["bash", String(script)].concat(isAccountId(id) ? [id] : []) : null
+}
+
+// The folder the folder button opens: the account's own, which the app
+// printed. ~/Drive only when no account is known at all (none, or no
+// answer), as 5.1 did; an account whose folder was refused opens nothing,
+// never another folder.
+function folderToOpen(status, folder, home) {
+  var own = toFolder(folder)
+  if (own !== "") return own
+  if (accountsOf(status).length > 0) return ""
+  var base = String(home === undefined || home === null ? "" : home).replace(/\/+$/, "")
+  return toFolder(base) !== "" ? base + "/Drive" : ""
+}
+
+// A translated text with its %1, %2... filled in one pass. QML's arg() fills
+// the lowest placeholder left, so a label (a folder name) holding "%2" would
+// get the next value put inside it.
+function fillText(template, values) {
+  return String(template === undefined || template === null ? "" : template).replace(/%([1-9])/g, function(match, n) {
+    var value = values[Number(n) - 1]
+    return value === undefined ? match : String(value)
+  })
+}
+
+// A folder as the panel names it: the home as "~".
+function displayFolder(folder, home) {
+  var text = String(folder === undefined || folder === null ? "" : folder)
+  var base = String(home === undefined || home === null ? "" : home).replace(/\/+$/, "")
+  if (base === "") return text
+  if (text === base) return "~"
+  return text.indexOf(base + "/") === 0 ? "~" + text.substring(base.length) : text
+}
+
+// What the panel's cursor walks over. With one account (or none) it is 5.1's
+// row of icons; from two on, each account's row (its header, which opens the
+// window on it, then sync, pause and folder), then the general row.
+function panelTargets(status) {
+  var targets = []
+  var accounts = accountsOf(status)
+  if (accounts.length < 2) {
+    for (var a = 0; a < ACTIONS.length; a++) targets.push({ account: -1, action: ACTIONS[a] })
+    return targets
+  }
+  var perAccount = ["open", "sync", "pause", "folder"]
+  for (var i = 0; i < accounts.length; i++)
+    for (var k = 0; k < perAccount.length; k++) targets.push({ account: i, action: perAccount[k] })
+  var general = ["sync", "pause", "log"]
+  for (var g = 0; g < general.length; g++) targets.push({ account: -1, action: general[g] })
+  return targets
+}
+
+function stepTarget(index, delta, count) {
+  if (count <= 0) return 0
+  return ((index + delta) % count + count) % count
+}
+
+// The account under the cursor, or -1 (no cursor, or a general target).
+function cursorAccount(targets, cursorActive, index) {
+  if (!cursorActive || !targets || index < 0 || index >= targets.length) return -1
+  return targets[index].account
 }
 
 // The icon state on the bar, from the app's status and tone.
@@ -122,7 +347,7 @@ function barState(snapshot) {
   return "unknown"
 }
 
-// Whether the app named this warning (parseSnapshot keeps at most 8).
+// Whether the app named this warning (readFields keeps at most 8).
 function hasWarning(snapshot, key) {
   return !!snapshot && snapshot.ok && Array.isArray(snapshot.warnings) && snapshot.warnings.indexOf(key) !== -1
 }

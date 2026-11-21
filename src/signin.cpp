@@ -1,11 +1,15 @@
 #include "signin.h"
 
+#include <QCoreApplication>
+#include <QDir>
 #include <QElapsedTimer>
 #include <QFile>
 #include <QJsonDocument>
 #include <QJsonObject>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
+#include <QTemporaryFile>
 #include <functional>
 #include <signal.h>
 #include <unistd.h>
@@ -218,8 +222,9 @@ QString signInFailure(const Ran &ran, const SignInTools &tools) {
 }
 
 // The browser flow on an existing remote, with the client it was made with.
-QString signInAgain(const SignInTools &tools, const QString &name, const QStringList &flags, const LineSink &onLine) {
-    const Ran ran = runRclone(tools.rclone, refreshTokenArguments(name) + flags, tools.timeoutMs, true, onLine);
+QString signInAgain(const SignInTools &tools, const QString &name, const QStringList &flags, const QString &page,
+                    const LineSink &onLine) {
+    const Ran ran = runRclone(tools.rclone, refreshTokenArguments(name, page) + flags, tools.timeoutMs, true, onLine);
     if (!succeeded(ran) || stopped())
         return signInFailure(ran, tools);
     return checkToken(tools, name, flags);
@@ -236,7 +241,7 @@ QString deleteRemote(const SignInTools &tools, const QString &name) {
 // starts clean. A remote of that name DriveSync made before is used when its
 // token works, signed in again when it does not, and made again when it has
 // no token at all (a sign-in cut short by SIGKILL).
-QString create(const SignInTools &tools, QJsonObject *extra, const LineSink &onLine) {
+QString create(const SignInTools &tools, const QString &page, QJsonObject *extra, const LineSink &onLine) {
     if (!tools.client)
         return "this build has no Google client, so it cannot sign in; DriveSync has to be built with "
                "src/oauthclient.local.h (see src/oauthclient.local.h.example)";
@@ -256,11 +261,11 @@ QString create(const SignInTools &tools, QJsonObject *extra, const LineSink &onL
                 .arg(name);
         }
         if (!section.value("token").toString().isEmpty())
-            return checkToken(tools, name).isEmpty() ? QString() : signInAgain(tools, name, {}, onLine);
+            return checkToken(tools, name).isEmpty() ? QString() : signInAgain(tools, name, {}, page, onLine);
         if (const QString cleanup = deleteRemote(tools, name); !cleanup.isEmpty())
             return cleanup;
     }
-    const Ran ran = runRclone(tools.rclone, createRemoteArguments(name, *tools.client), tools.timeoutMs, true, onLine);
+    const Ran ran = runRclone(tools.rclone, createRemoteArguments(name, *tools.client, page), tools.timeoutMs, true, onLine);
     QString error = succeeded(ran) && !stopped() ? checkToken(tools, name) : signInFailure(ran, tools);
     if (error.isEmpty())
         return QString();
@@ -285,6 +290,28 @@ QString abandon(const BackendPaths &paths, const SignInTools &tools) {
     return deleteRemote(tools, name);
 }
 
+QString tr(const char *text) { return QCoreApplication::translate("SignIn", text); }
+
+// The page for one sign-in, in a private file (0600) that lives as long as
+// the command: rclone reads it when the browser comes back. When it cannot
+// be written, path() is empty and rclone shows its own page; a missing file
+// would stop rclone before the browser opens.
+class SignInPageFile {
+public:
+    explicit SignInPageFile(const QString &language)
+        : m_file(QDir::tempPath() + "/drive-sync-signin-XXXXXX.html") {
+        const QByteArray page = signInPage(language);
+        if (page.isEmpty() || !m_file.open() || m_file.write(page) != page.size() || !m_file.flush())
+            return;
+        m_path = m_file.fileName();
+    }
+    QString path() const { return m_path; }
+
+private:
+    QTemporaryFile m_file;
+    QString m_path;
+};
+
 // rclone's "go to the following link: http://127.0.0.1:53682/auth?state=..."
 // line, for a browser xdg-open could not open.
 QString browserLink(const QString &line) {
@@ -297,12 +324,43 @@ QString browserLink(const QString &line) {
 
 QString remoteName(const QString &remote) { return remote.section(':', 0, 0); }
 
-QStringList createRemoteArguments(const QString &name, const OAuthClient &client) {
-    return {"config", "create", name, "drive", "client_id", client.id, "client_secret", client.secret, "scope", "drive"};
+QStringList createRemoteArguments(const QString &name, const OAuthClient &client, const QString &page) {
+    QStringList arguments{"config", "create", name, "drive", "client_id", client.id, "client_secret", client.secret, "scope", "drive"};
+    if (!page.isEmpty())
+        arguments << "config_template_file" << page;
+    return arguments;
 }
 
-QStringList refreshTokenArguments(const QString &name) {
-    return {"config", "update", name, "config_refresh_token", "true"};
+QStringList refreshTokenArguments(const QString &name, const QString &page) {
+    QStringList arguments{"config", "update", name, "config_refresh_token", "true"};
+    if (!page.isEmpty())
+        arguments << "config_template_file" << page;
+    return arguments;
+}
+
+QByteArray signInPage(const QString &language) {
+    QFile templateFile(":/signin-page.html");
+    QFile logoFile(":/signin-logo.svg");
+    if (!templateFile.open(QIODevice::ReadOnly) || !logoFile.open(QIODevice::ReadOnly))
+        return {};
+    // Comments go, so the served page carries none of the notes for
+    // maintainers; the logo's <desc> is one of those too.
+    static const QRegularExpression comment("<!--.*?-->\\s*", QRegularExpression::DotMatchesEverythingOption);
+    static const QRegularExpression description("<desc>.*?</desc>\\s*", QRegularExpression::DotMatchesEverythingOption);
+    QString page = QString::fromUtf8(templateFile.readAll()).remove(comment);
+    const QString logo = QString::fromUtf8(logoFile.readAll()).remove(comment).remove(description).trimmed();
+    const auto text = [](const QString &value) {
+        return value.toHtmlEscaped().replace('{', "&#123;").replace('}', "&#125;");
+    };
+    page.replace("@LANG@", text(language));
+    page.replace("@OK_TITLE@", text(tr("You can go back to DriveSync")));
+    page.replace("@OK_TEXT@", text(tr("DriveSync finishes the sign-in and shows how it went.")));
+    page.replace("@CLOSE_TAB@", text(tr("You can close this tab.")));
+    page.replace("@ERROR_TITLE@", text(tr("Google did not complete the sign-in")));
+    page.replace("@ERROR_TEXT@", text(tr("Go back to DriveSync and try again.")));
+    // Last, so no marker inside the logo could be taken for one of ours.
+    page.replace("@LOGO@", logo);
+    return page.toUtf8();
 }
 
 SignInTools SignInTools::defaults() {
@@ -350,14 +408,15 @@ int runSignInCommand(const QStringList &arguments, const BackendPaths &paths, co
         }
     };
     const StopOnSignal stopOnSignal;
+    const SignInPageFile page(tools.language);
     QJsonObject extra;
     QString error;
     if (!paths.config.isEmpty() && QFile::exists(paths.config)) {
         const auto config = loadSyncConfig(paths.config, &error);
         if (config)
-            error = signInAgain(tools, remoteName(config->remote), configFlags(config->rcloneFlags), onLine);
+            error = signInAgain(tools, remoteName(config->remote), configFlags(config->rcloneFlags), page.path(), onLine);
     } else {
-        error = create(tools, &extra, onLine);
+        error = create(tools, page.path(), &extra, onLine);
     }
     return answer(json, error, extra, out, err);
 }

@@ -1,6 +1,8 @@
 #include "statuscommand.h"
 
+#include <QDir>
 #include <QFileInfo>
+#include <QJsonArray>
 #include <QJsonDocument>
 #include <QProcess>
 
@@ -101,6 +103,12 @@ int toneRank(const QString &tone) {
 }
 
 // One line of "status" as text: the headline and what it leaves out.
+// What a block or an entry calls the account: its label, else its folder's
+// base name (paths built by hand have no label).
+QString displayLabel(const BackendPaths &account) {
+    return account.label.isEmpty() ? QFileInfo(QDir::cleanPath(account.drive)).fileName() : account.label;
+}
+
 QString statusLine(const Snapshot &snapshot) {
     QString line = snapshot.summary.status;
     if (!snapshot.summary.warnings.isEmpty())
@@ -180,17 +188,47 @@ int worstAccount(const QList<Snapshot> &snapshots) {
     return worst;
 }
 
+QJsonObject statusListToJson(const QList<Snapshot> &snapshots, const QList<BackendPaths> &accounts,
+                             const QList<QDateTime> &nextRuns, const QDateTime &now) {
+    // The view with no account stands for an old drive-sync that was not
+    // taken over; with no old log either there is nothing at all to list.
+    const bool nothing = snapshots.isEmpty()
+                         || (snapshots.size() == 1 && accounts.value(0).id.isEmpty()
+                             && snapshots.first().summary.status == "noLog");
+    QJsonArray list;
+    bool canSyncNow = false;
+    if (!nothing) {
+        for (qsizetype i = 0; i < snapshots.size(); ++i) {
+            list.append(accountToJson(snapshots.at(i), accounts.value(i), nextRuns.value(i)));
+            canSyncNow = canSyncNow || snapshots.at(i).canSyncNow;
+        }
+    }
+    const int worst = nothing ? -1 : worstAccount(snapshots);
+    return {{"version", 3},
+            {"now", now.isValid() ? now.toSecsSinceEpoch() : 0},
+            {"tone", worst < 0 ? QString("error") : snapshots.at(worst).tone},
+            {"worst", worst < 0 ? QString() : accounts.value(worst).id},
+            {"canSyncNow", canSyncNow},
+            {"accounts", list}};
+}
+
 int runStatusCommand(const QStringList &arguments, const QList<BackendPaths> &accounts,
                      const QList<AccountNotice> &notices, QTextStream &out, QTextStream &err, int timeoutMs,
                      const OldDriveSyncCheck &oldDriveSync) {
     bool json = false;
+    bool all = false;
+    bool usage = false;
     for (const QString &argument : arguments) {
-        if (argument != "--json") {
-            err << usageText();
-            err.flush();
-            return 1;
-        }
-        json = true;
+        bool *flag = argument == "--json" ? &json : argument == "--all" ? &all : nullptr;
+        if (!flag || *flag)
+            usage = true;
+        else
+            *flag = true;
+    }
+    if (usage || (all && !json)) {
+        err << usageText();
+        err.flush();
+        return 1;
     }
 
     // On stderr, so the bar, which reads stdout, never sees them.
@@ -214,7 +252,9 @@ int runStatusCommand(const QStringList &arguments, const QList<BackendPaths> &ac
     QList<Snapshot> snapshots;
     for (const SnapshotSources &src : gatherAccounts(read, now, timeoutMs, json ? &nextRuns : nullptr, oldDriveSync))
         snapshots << buildSnapshot(src);
-    if (json) {
+    if (json && all) {
+        out << QJsonDocument(statusListToJson(snapshots, read, nextRuns, now)).toJson(QJsonDocument::Compact) << "\n";
+    } else if (json) {
         // Version 2 has room for one account: the one that needs the user most.
         const int worst = worstAccount(snapshots);
         out << QJsonDocument(snapshotToJson(snapshots.at(worst), nextRuns.value(worst), now))
@@ -224,15 +264,15 @@ int runStatusCommand(const QStringList &arguments, const QList<BackendPaths> &ac
         out << statusLine(snapshots.first()) << "\n";
     } else {
         for (qsizetype i = 0; i < snapshots.size(); ++i)
-            out << read.at(i).id << ": " << statusLine(snapshots.at(i)) << "\n";
+            out << displayLabel(read.at(i)) << " (" << read.at(i).id << ")\n  " << statusLine(snapshots.at(i)) << "\n";
     }
     out.flush();
     return 0;
 }
 
 QString usageText() {
-    return "usage: drive-sync [open]\n"
-           "       drive-sync status [--json]\n"
+    return "usage: drive-sync [open [--account <id>]]\n"
+           "       drive-sync status [--json [--all]]\n"
            "       drive-sync sync [--json]\n"
            "       drive-sync pause [--minutes N | --until-tomorrow] [--json]\n"
            "       drive-sync resume [--json]\n"

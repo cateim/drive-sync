@@ -27,10 +27,14 @@
 #include <thread>
 #include <fcntl.h>
 #include <signal.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/file.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
+#include "accountlist.h"
 #include "accountmove.h"
 #include "accounts.h"
 #include "backend.h"
@@ -782,11 +786,18 @@ OAuthClient fakeClient() {
 // version (the version line), create-exit, update-exit, lsjson-exit,
 // lsjson-fails-once, create-hangs (create waits until killed), create-notice
 // (printed on stderr first), create-stderr (printed on a failed create).
+// The file after config_template_file is copied to page-seen.html, and its
+// mode to page-mode, while the call runs.
 QString fakeSignInRclone(const QString &dir) {
     const QString path = dir + "/rclone";
     write(path, QString(R"sh(#!/bin/sh
 for a in "$@"; do printf '%s\t' "$a"; done >> '%1/rclone-calls.log'
 echo >> '%1/rclone-calls.log'
+prev=
+for a in "$@"; do
+  if [ "$prev" = config_template_file ]; then cp "$a" '%1/page-seen.html'; stat -c %a "$a" > '%1/page-mode'; fi
+  prev=$a
+done
 case "$1 $2" in
   "listremotes "*) cat '%1/remotes' 2>/dev/null ;;
   "version "*) cat '%1/version' 2>/dev/null || echo 'rclone v1.75.2' ;;
@@ -853,6 +864,94 @@ SignInTools signInTools(const QString &dir) {
     tools.rclone = fakeSignInRclone(dir);
     tools.client = fakeClient();
     return tools;
+}
+
+// The page a recorded rclone call was given, or an empty string.
+QString pageArgument(const QStringList &call) {
+    const qsizetype at = call.indexOf("config_template_file");
+    return at < 0 ? QString() : call.value(at + 1);
+}
+
+// The temporary pages signin leaves in the temp folder, by name.
+QStringList leftoverPages() {
+    return QDir(QDir::tempPath()).entryList({"drive-sync-signin-*"}, QDir::Files | QDir::Hidden);
+}
+
+// One HTTP/1.0 GET of target on rclone's sign-in port, as the browser makes
+// it when Google sends it back; the body of the answer, or nothing.
+QByteArray getFromRclonePort(const QByteArray &target) {
+    for (int attempt = 0; attempt < 50; ++attempt) {
+        const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0)
+            return {};
+        sockaddr_in address {};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(53682);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof address) != 0) {
+            ::close(fd);
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        const QByteArray request = "GET " + target + " HTTP/1.0\r\nHost: 127.0.0.1:53682\r\n\r\n";
+        if (::send(fd, request.constData(), request.size(), 0) != request.size()) {
+            ::close(fd);
+            return {};
+        }
+        QByteArray answer;
+        char buffer[4096];
+        ssize_t got;
+        while ((got = ::recv(fd, buffer, sizeof buffer, 0)) > 0)
+            answer.append(buffer, got);
+        ::close(fd);
+        const qsizetype body = answer.indexOf("\r\n\r\n");
+        return body < 0 ? QByteArray() : answer.mid(body + 4);
+    }
+    return {};
+}
+
+// "drive-sync signin" against the real rclone: a scratch rclone.conf
+// (confText), Google's token address pointed at a closed local port so no
+// test reaches Google, and a thread that plays the browser coming back with
+// query after the state, once the sandbox's xdg-open was asked to open
+// rclone's link. The page rclone served comes back with the command's answer.
+struct ServedSignIn {
+    CommandResult result;
+    QByteArray page;
+};
+
+ServedSignIn signInThroughRclone(const QString &dir, const BackendPaths &paths, SignInTools tools,
+                                 const QByteArray &confText, const QByteArray &query) {
+    const QByteArray oldConfig = qgetenv("RCLONE_CONFIG");
+    const QString opened = QFileInfo(QString::fromLocal8Bit(oldConfig)).absolutePath() + "/opened.log";
+    write(dir + "/rclone.conf", confText);
+    qputenv("RCLONE_CONFIG", (dir + "/rclone.conf").toLocal8Bit());
+    qputenv("RCLONE_DRIVE_TOKEN_URL", "http://127.0.0.1:9/token");
+    const auto restore = qScopeGuard([&oldConfig] {
+        qputenv("RCLONE_CONFIG", oldConfig);
+        qunsetenv("RCLONE_DRIVE_TOKEN_URL");
+    });
+    const qsizetype openedBefore = readBytes(opened).count('\n');
+    ServedSignIn served;
+    std::atomic<bool> finished{false};
+    std::thread browser([&] {
+        static const QRegularExpression state("state=([A-Za-z0-9_-]+)");
+        while (!finished) {
+            const QList<QByteArray> lines = readBytes(opened).split('\n');
+            if (lines.size() - 1 > openedBefore) {
+                const QRegularExpressionMatch match = state.match(QString::fromUtf8(lines.at(openedBefore)));
+                if (match.hasMatch())
+                    served.page = getFromRclonePort("/?state=" + match.captured(1).toUtf8() + "&" + query);
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    });
+    tools.timeoutMs = 15000;
+    served.result = signInCommand(paths, tools, {});
+    finished = true;
+    browser.join();
+    return served;
 }
 
 
@@ -931,11 +1030,14 @@ QString setupError(const CommandResult &r) {
 // signin-link), or, with no answer, starts two sleeping processes in its own
 // group, rclone (grandchild.pid) and a browser (browser.pid), and waits.
 // Like the real command, a SIGTERM stops only its rclone and logs "cleaned".
-// "setup" prints setup-answer.
+// "setup" prints setup-answer. The call is logged as made; "--account <id>"
+// right after the command is then dropped, so "signin --account account1
+// --json" waits as "signin --json" does.
 QString fakeSetupDrivesync(const QString &dir) {
     const QString path = dir + "/drive-sync";
     write(path, QString(R"sh(#!/bin/sh
 echo "$*" >> '%1/calls.log'
+if [ "$2" = --account ] && [ $# -ge 3 ]; then c=$1; shift 3; set -- "$c" "$@"; fi
 case "$*" in
   "signin --json")
     if [ -f '%1/signin-link' ]; then
@@ -1065,7 +1167,8 @@ QPair<int, QJsonObject> foldersCommand(const BackendPaths &paths, const QString 
     return {code, QJsonDocument::fromJson(output.toUtf8()).object()};
 }
 
-// A drive-sync for the Settings view: records each call in calls.log.
+// A drive-sync for the Settings view: records each call in calls.log, then
+// drops "--account <id>" right after the command, as the window passes it.
 // "settings --json" prints settings.json; a change copies the filters file
 // it was given to filters-sent.txt and prints change-answer.json; "folders"
 // prints folders-root.json, or folders-<PATH>.json for a level below.
@@ -1073,6 +1176,7 @@ QString fakeSettingsDrivesync(const QString &dir) {
     const QString path = dir + "/drive-sync";
     write(path, QString(R"sh(#!/bin/sh
 echo "$*" >> '%1/calls.log'
+if [ "$2" = --account ] && [ $# -ge 3 ]; then c=$1; shift 3; set -- "$c" "$@"; fi
 case "$1" in
   settings)
     if [ "$2" = --json ]; then cat '%1/settings.json'; exit 0; fi
@@ -1161,6 +1265,35 @@ bool makeStatusAccount(const AccountRoots &roots, const QString &dir, const QStr
     if (!configText.isNull())
         return QDir().mkpath(QFileInfo(config).path()) && write(config, configText);
     return writeAccountConfig(config, folder + "/Drive", folder + "/drive-sync.log");
+}
+
+// As makeStatusAccount, with the folder at dir/<folderName> and the log at
+// dir/<id>.log, so two accounts can get the labels Drive and Drive2.
+bool makeLabelledAccount(const AccountRoots &roots, const QString &dir, const QString &id, const QString &folderName,
+                         const QString &logText, const QByteArray &configText = QByteArray()) {
+    const QString folder = dir + "/" + folderName;
+    const QString log = dir + "/" + id + ".log";
+    const QString config = roots.configRoot + "/accounts/" + id + "/config.json";
+    if (!QDir().mkpath(folder) || !write(log, logText.toUtf8()))
+        return false;
+    if (!configText.isNull())
+        return QDir().mkpath(QFileInfo(config).path()) && write(config, configText);
+    return writeAccountConfig(config, folder, log);
+}
+
+// The window's accounts over roots (Task 8 of step 5.2): each Backend made
+// as main makes one, minus the old drive-sync check, which tests never give.
+std::unique_ptr<AccountList> accountListOver(const AccountRoots &roots) {
+    return std::make_unique<AccountList>([roots] { return windowAccounts(roots); },
+                                         [](const BackendPaths &paths) { return new Backend(paths); });
+}
+
+// The Backend the list holds for id, or null.
+Backend *backendOf(const AccountList &list, const QString &id) {
+    for (Backend *backend : list.backends())
+        if (backend->accountId() == id)
+            return backend;
+    return nullptr;
 }
 
 struct StatusAnswer {
@@ -3033,7 +3166,8 @@ private slots:
         const QStringList all = calls(dir.path());
         QVERIFY(all.contains("gdbus call --session --dest org.freedesktop.Notifications --object-path "
                              "/org/freedesktop/Notifications --method org.freedesktop.Notifications.CloseNotification 41"));
-        QVERIFY(all.contains("omarchy notification dismiss Drive stopped syncing"));
+        // Step 5.2: the title names the account (the folder's name here).
+        QVERIFY(all.contains("omarchy notification dismiss Drive stopped syncing (Drive)"));
     }
 
     void notifyNamesTheCause()
@@ -3258,7 +3392,7 @@ private slots:
         QCOMPARE(sent.size(), 2);
         QVERIFY(sent.at(1).contains("-u normal"));
         QVERIFY(sent.at(1).contains("Drive is syncing again"));
-        QVERIFY(calls(dir.path()).contains("omarchy notification dismiss Drive is still stopped"));
+        QVERIFY(calls(dir.path()).contains("omarchy notification dismiss Drive is still stopped (Drive)"));
 
         // Once back, another success says nothing.
         QCOMPARE(runNotifyCommand("success", paths, tools, now.addSecs(1800)), 0);
@@ -5120,6 +5254,293 @@ private slots:
                                  "The Drive fix stopped", "Drive filters changed", "Drive filters still changed"})
             QVERIFY2(strings.contains(text), text);
     }
+
+    // Step 5.2: every per-account card names its account in its title.
+    void cardTitlesNameTheAccount()
+    {
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        {
+            QTemporaryDir dir;
+            BackendPaths paths = controlPaths(dir.path(), true);
+            paths.label = "Drive2";
+            QVERIFY(write(paths.log, failedRun(QDateTime::currentDateTime().addSecs(-60)).toUtf8()));
+            const NotifierPaths tools = fakeNotifier(dir.path());
+            QCOMPARE(runNotifyCommand("exit-code", paths, tools, now), 0);
+            QStringList sent = notifications(dir.path());
+            QCOMPARE(sent.size(), 1);
+            QVERIFY2(sent.at(0).contains("-i dialog-warning Drive stopped syncing (Drive2) "), qPrintable(sent.at(0)));
+            QCOMPARE(runNotifyCommand("success", paths, tools, now.addSecs(900)), 0);
+            const QStringList all = calls(dir.path());
+            QVERIFY(all.contains("omarchy notification dismiss Drive stopped syncing (Drive2)"));
+            QVERIFY(all.contains("omarchy notification dismiss Drive is still stopped (Drive2)"));
+            sent = notifications(dir.path());
+            QCOMPARE(sent.size(), 2);
+            QVERIFY2(sent.at(1).contains("-i dialog-information Drive is syncing again (Drive2) "),
+                     qPrintable(sent.at(1)));
+            for (const QString &call : all)
+                if (call.startsWith("omarchy notification dismiss "))
+                    QVERIFY2(call.endsWith("(Drive2)"), qPrintable(call));
+        }
+        {
+            // The watchdog's timer card, and the card that says it is back.
+            QTemporaryDir dir;
+            BackendPaths paths = controlPaths(dir.path(), true);
+            SyncConfig config = oldUnitConfig();
+            config.runOnlyWhen.clear();
+            config.localPath = dir.filePath("Drive2");
+            const NotifierPaths tools = fakeNotifier(dir.path());
+            paths.systemctl = watchdogSystemctl(dir.path(), "loaded", "inactive", "enabled");
+            QCOMPARE(watchdogOver(paths, config, tools, now), 0);
+            paths.systemctl = watchdogSystemctl(dir.path(), "loaded", "active", "enabled");
+            QCOMPARE(watchdogOver(paths, config, tools, now.addSecs(3600)), 0);
+            const QStringList sent = notifications(dir.path());
+            QCOMPARE(sent.size(), 2);
+            QVERIFY2(sent.at(0).contains(" Drive will not sync (Drive2) "), qPrintable(sent.at(0)));
+            QVERIFY2(sent.at(1).contains(" Drive timer is back (Drive2) "), qPrintable(sent.at(1)));
+            QVERIFY(calls(dir.path()).contains("omarchy notification dismiss Drive will not sync (Drive2)"));
+        }
+        {
+            // The reminder of a pause with no end.
+            QTemporaryDir dir;
+            BackendPaths paths = controlPaths(dir.path(), true);
+            paths.systemctl = watchdogSystemctl(dir.path(), "loaded", "active", "enabled");
+            SyncConfig config = oldUnitConfig();
+            config.runOnlyWhen.clear();
+            config.localPath = dir.filePath("Drive2");
+            const NotifierPaths tools = fakeNotifier(dir.path());
+            const QDateTime start = QDateTime::fromSecsSinceEpoch(1794067200, QTimeZone::UTC);
+            PauseMark mark;
+            mark.present = true;
+            mark.since = start;
+            QVERIFY(writePause(pauseFilePath(paths.appState), mark));
+            QCOMPARE(watchdogOver(paths, config, tools, start.addSecs(86400)), 0);
+            QCOMPARE(notifications(dir.path()).size(), 1);
+            QVERIFY2(notifications(dir.path()).at(0).contains(" DriveSync is still paused (Drive2) "),
+                     qPrintable(notifications(dir.path()).at(0)));
+        }
+        {
+            // The fix's cards and the deletions nobody confirmed.
+            QTemporaryDir dir;
+            BackendPaths paths = controlPaths(dir.path(), true);
+            paths.label = "Drive2";
+            const NotifierPaths tools = fakeNotifier(dir.path());
+            notifyFixNeedsYou(paths, tools, fixAt("questions"), false);
+            notifyFixNeedsYou(paths, tools, fixAt("failed"), true);
+            notifyFixEnded(paths, tools);
+            UnconfirmedDeletes extra;
+            extra.cloudCount = 2;
+            extra.backupDir = dir.filePath("backup");
+            notifyUnconfirmedDeletes(paths, tools, extra);
+            const QStringList sent = notifications(dir.path());
+            QCOMPARE(sent.size(), 4);
+            QVERIFY2(sent.at(0).contains(" The Drive fix is waiting for you (Drive2) "), qPrintable(sent.at(0)));
+            QVERIFY2(sent.at(1).contains(" The Drive fix stopped (Drive2) "), qPrintable(sent.at(1)));
+            QVERIFY2(sent.at(2).contains(" Drive is syncing again (Drive2) "), qPrintable(sent.at(2)));
+            QVERIFY2(sent.at(3).contains(" Drive deleted files you did not confirm (Drive2) "), qPrintable(sent.at(3)));
+            for (const QString &call : calls(dir.path()))
+                if (call.startsWith("omarchy notification dismiss "))
+                    QVERIFY2(call.endsWith("(Drive2)"), qPrintable(call));
+        }
+        // Paths with no label take their folder's base name; with no folder
+        // either, the bare title.
+        BackendPaths bare;
+        QCOMPARE(accountCardTitle("Drive stopped syncing", bare), QString("Drive stopped syncing"));
+        bare.drive = "/h/Mirror/";
+        QCOMPARE(accountCardTitle("Drive stopped syncing", bare), QString("Drive stopped syncing (Mirror)"));
+    }
+
+    // Step 5.2: omarchy notification dismiss closes every card whose title
+    // contains its argument, so no labelled title of one account may sit
+    // inside another account's, in English or in Portuguese.
+    void cardTitlesNeverMatchAnotherAccount()
+    {
+        QFile catalog(QString(SRCDIR) + "/../src/i18n/pt-BR.json");
+        QVERIFY(catalog.open(QIODevice::ReadOnly));
+        const QJsonObject strings = QJsonDocument::fromJson(catalog.readAll()).object();
+        QVERIFY(strings.contains("%1 (%2)"));
+        const QStringList english = accountCardBareTitles();
+        QCOMPARE(english.size(), 14);
+        QStringList portuguese;
+        for (const QString &title : english) {
+            QVERIFY2(strings.value(title).isString(), qPrintable(title));
+            portuguese << strings.value(title).toString();
+        }
+        const QStringList labels{"Drive", "Drive2", "My Drive", "Drive (old)", "a/Drive", "b/Drive"};
+        const auto check = [&](const QStringList &titles, const QString &format) {
+            for (int i = 0; i < titles.size(); ++i)
+                for (int j = 0; j < titles.size(); ++j)
+                    if (i != j)
+                        QVERIFY2(!titles.at(j).contains(titles.at(i)),
+                                 qPrintable(titles.at(i) + " in " + titles.at(j)));
+            for (const QString &a : labels)
+                for (const QString &b : labels) {
+                    if (a == b)
+                        continue;
+                    for (const QString &one : titles)
+                        for (const QString &other : titles) {
+                            const QString mine = format.arg(one, a);
+                            const QString theirs = format.arg(other, b);
+                            QVERIFY2(!theirs.contains(mine), qPrintable(mine + " in " + theirs));
+                        }
+                }
+        };
+        check(english, "%1 (%2)");
+        check(portuguese, strings.value("%1 (%2)").toString());
+        // The English format is the one accountCardTitle builds.
+        BackendPaths account;
+        account.label = "My Drive";
+        QCOMPARE(accountCardTitle(english.first(), account), QString("%1 (%2)").arg(english.first(), "My Drive"));
+    }
+
+    // Step 5.2: one account's recovery closes only that account's cards.
+    void recoveryClosesOnlyItsAccount()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        roots.home = dir.path();
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", QString()));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", QString()));
+        const AccountSet set = resolveAccounts(roots);
+        QCOMPARE(set.accounts.size(), 2);
+        const QDateTime since = QDateTime::currentDateTimeUtc().addSecs(-1800);
+        int id = 41;
+        for (const BackendPaths &account : set.accounts) {
+            QVERIFY(QDir().mkpath(account.appState));
+            QVERIFY(write(account.appState + "/notify-run.json",
+                          QJsonDocument(QJsonObject{{"since", since.toSecsSinceEpoch()},
+                                                    {"last", since.toSecsSinceEpoch()},
+                                                    {"id", id++},
+                                                    {"key", ""}})
+                              .toJson()));
+        }
+        // As main gives it with two accounts: no bare title is ever dismissed.
+        const NotifierPaths tools = fakeNotifier(dir.path());
+        QVERIFY(tools.bareTitlesMark.isEmpty());
+        QCOMPARE(runNotifyCommand("success", set.accounts.at(0), tools, QDateTime::currentDateTimeUtc()), 0);
+        const QStringList all = calls(dir.path());
+        const QStringList dismissed = all.filter(QRegularExpression("^omarchy notification dismiss "));
+        QVERIFY(!dismissed.isEmpty());
+        const QStringList bare = accountCardBareTitles();
+        for (const QString &call : dismissed) {
+            QVERIFY2(call.endsWith("(Drive)"), qPrintable(call));
+            QVERIFY2(!bare.contains(call.mid(QString("omarchy notification dismiss ").size())), qPrintable(call));
+        }
+        const QStringList closedIds = all.filter("CloseNotification");
+        QCOMPARE(closedIds.size(), 1);
+        QVERIFY2(closedIds.first().endsWith(" 41"), qPrintable(closedIds.first()));
+        QVERIFY(!QFile::exists(set.accounts.at(0).appState + "/notify-run.json"));
+        QVERIFY(QFile::exists(set.accounts.at(1).appState + "/notify-run.json"));
+    }
+
+    // Step 5.2: the 5.1 cards had bare titles. They are dismissed once, before
+    // the first labelled card, and only when the mark could be written.
+    void bareTitlesGoOnceWithOneAccount()
+    {
+        const QStringList bare = accountCardBareTitles();
+        const auto bareDismissals = [&bare](const QString &dir) {
+            QStringList found;
+            for (const QString &call : calls(dir))
+                if (call.startsWith("omarchy notification dismiss ")
+                    && bare.contains(call.mid(QString("omarchy notification dismiss ").size())))
+                    found << call;
+            return found;
+        };
+        const QDateTime now = QDateTime::currentDateTimeUtc();
+        {
+            QTemporaryDir dir;
+            const BackendPaths paths = controlPaths(dir.path(), true);
+            QVERIFY(write(paths.log, failedRun(QDateTime::currentDateTime().addSecs(-60)).toUtf8()));
+            NotifierPaths tools = fakeNotifier(dir.path());
+            tools.bareTitlesMark = paths.appState + "/notify-bare-titles.done";
+            QCOMPARE(runNotifyCommand("exit-code", paths, tools, now), 0);
+            QVERIFY(QFile::exists(tools.bareTitlesMark));
+            QCOMPARE(bareDismissals(dir.path()).size(), 14);
+            const QStringList all = calls(dir.path());
+            qsizetype lastBare = -1;
+            for (qsizetype i = 0; i < all.size(); ++i)
+                if (bareDismissals(dir.path()).contains(all.at(i)))
+                    lastBare = i;
+            qsizetype firstNotify = -1;
+            for (qsizetype i = 0; i < all.size() && firstNotify < 0; ++i)
+                if (all.at(i).startsWith("notify-send"))
+                    firstNotify = i;
+            QVERIFY(lastBare >= 0 && firstNotify > lastBare);
+            // The hourly reminder dismisses no bare title.
+            QCOMPARE(runNotifyCommand("exit-code", paths, tools, now.addSecs(3700)), 0);
+            QCOMPARE(notifications(dir.path()).size(), 2);
+            QCOMPARE(bareDismissals(dir.path()).size(), 14);
+        }
+        {
+            // A mark that cannot be written: never a bare title, since each
+            // one would also close the account's own labelled card.
+            QTemporaryDir dir;
+            const BackendPaths paths = controlPaths(dir.path(), true);
+            QVERIFY(write(paths.log, failedRun(QDateTime::currentDateTime().addSecs(-60)).toUtf8()));
+            const QString locked = dir.filePath("locked");
+            QVERIFY(QDir().mkpath(locked));
+            QVERIFY(QFile::setPermissions(locked, QFile::ReadOwner | QFile::ExeOwner));
+            const auto restore = qScopeGuard([&locked] {
+                QFile::setPermissions(locked, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+            });
+            NotifierPaths tools = fakeNotifier(dir.path());
+            tools.bareTitlesMark = locked + "/notify-bare-titles.done";
+            QCOMPARE(runNotifyCommand("exit-code", paths, tools, now), 0);
+            QCOMPARE(runNotifyCommand("exit-code", paths, tools, now.addSecs(3700)), 0);
+            QCOMPARE(notifications(dir.path()).size(), 2);
+            QVERIFY(bareDismissals(dir.path()).isEmpty());
+            QVERIFY(!QFile::exists(tools.bareTitlesMark));
+        }
+        {
+            // While the move's journal is there: nothing, and no mark.
+            QTemporaryDir dir;
+            const BackendPaths paths = controlPaths(dir.path(), true);
+            QVERIFY(write(paths.log, failedRun(QDateTime::currentDateTime().addSecs(-60)).toUtf8()));
+            QVERIFY(QDir().mkpath(paths.globalState()));
+            QVERIFY(write(migrationJournalPath(paths.globalState()), "{}"));
+            NotifierPaths tools = fakeNotifier(dir.path());
+            tools.bareTitlesMark = paths.appState + "/notify-bare-titles.done";
+            QCOMPARE(runNotifyCommand("exit-code", paths, tools, now), 0);
+            QVERIFY(bareDismissals(dir.path()).isEmpty());
+            QVERIFY(!QFile::exists(tools.bareTitlesMark));
+        }
+        {
+            // No mark path (several accounts): never.
+            QTemporaryDir dir;
+            const BackendPaths paths = controlPaths(dir.path(), true);
+            QVERIFY(write(paths.log, failedRun(QDateTime::currentDateTime().addSecs(-60)).toUtf8()));
+            const NotifierPaths tools = fakeNotifier(dir.path());
+            QCOMPARE(runNotifyCommand("exit-code", paths, tools, now), 0);
+            QCOMPARE(runNotifyCommand("success", paths, tools, now.addSecs(900)), 0);
+            QVERIFY(bareDismissals(dir.path()).isEmpty());
+        }
+        {
+            // The watchdog sets the mark itself, with one account only.
+            QTemporaryDir one;
+            const MoveHome h = makeAccountsHome(one.path(), {"account1"});
+            QCOMPARE(runWatchdogCommand(h.roots, h.tools, fakeNotifier(one.path()), now), 0);
+            QVERIFY(QFile::exists(h.roots.stateRoot + "/notify-bare-titles.done"));
+            QCOMPARE(bareDismissals(one.path()).size(), 14);
+            QTemporaryDir two;
+            const MoveHome h2 = makeAccountsHome(two.path(), {"account1", "account2"});
+            QCOMPARE(runWatchdogCommand(h2.roots, h2.tools, fakeNotifier(two.path()), now), 0);
+            QVERIFY(!QFile::exists(h2.roots.stateRoot + "/notify-bare-titles.done"));
+            QVERIFY(bareDismissals(two.path()).isEmpty());
+        }
+    }
+
+    // Step 5.2: the cards about every account keep their bare titles.
+    void globalCardsKeepTheirTitles()
+    {
+        QTemporaryDir dir;
+        const MoveHome h = makeAccountsHome(dir.path(), {"account1"});
+        QVERIFY(write(h.config, "{}\n"));
+        const NotifierPaths tools = fakeNotifier(dir.path());
+        QCOMPARE(runWatchdogCommand(h.roots, h.tools, tools, QDateTime::currentDateTimeUtc()), 0);
+        const QStringList sent = notifications(dir.path());
+        QCOMPARE(sent.size(), 1);
+        QVERIFY2(sent.first().contains("-i dialog-information DriveSync ignores an old config DriveSync ignores "),
+                 qPrintable(sent.first()));
+    }
     void backendReadsTheFixState()
     {
         QTemporaryDir dir;
@@ -6587,7 +7008,8 @@ private slots:
         const QList<QStringList> calls = rcloneCalls(dir.path());
         QVERIFY(calls.size() >= 2);
         QCOMPARE(calls.at(0), QStringList{"listremotes"});
-        QVERIFY(calls.at(1) == createRemoteArguments(kNewRemoteName, fakeClient()));
+        QVERIFY(!pageArgument(calls.at(1)).isEmpty());
+        QVERIFY(calls.at(1) == createRemoteArguments(kNewRemoteName, fakeClient(), pageArgument(calls.at(1))));
         // The token is proven before the window moves on.
         QCOMPARE(calls.last().mid(0, 2), (QStringList{"lsjson", "drive-sync:"}));
         QCOMPARE(remoteName("gdrive:"), QString("gdrive"));
@@ -6644,14 +7066,15 @@ private slots:
         QVERIFY(write(dir.filePath("lsjson-fails-once"), ""));
         r = signInCommand(paths, signInTools(dir.path()), {});
         QVERIFY2(r.code == 0, qPrintable(r.err));
-        QCOMPARE(configCalls(), QList<QStringList>{refreshTokenArguments(kNewRemoteName)});
+        QCOMPARE(configCalls(), QList<QStringList>{refreshTokenArguments(kNewRemoteName, pageArgument(configCalls().value(0)))});
         // No token at all (a sign-in cut short): made again from scratch.
         QVERIFY(QFile::remove(dir.filePath("rclone-calls.log")));
         QVERIFY(write(dir.filePath("dump"), R"({"drive-sync":{"type":"drive","client_id":"fake-client.apps.googleusercontent.com"}})"));
         r = signInCommand(paths, signInTools(dir.path()), {});
         QVERIFY2(r.code == 0, qPrintable(r.err));
         QCOMPARE(configCalls(), (QList<QStringList>{{"config", "delete", "drive-sync"},
-                                                   createRemoteArguments(kNewRemoteName, fakeClient())}));
+                                                   createRemoteArguments(kNewRemoteName, fakeClient(),
+                                                                         pageArgument(configCalls().value(1)))}));
     }
 
     void signinStopsCleanlyOnSigterm()
@@ -6754,7 +7177,7 @@ private slots:
             QVERIFY2(!call.join(' ').contains("fake-client") && !call.join(' ').contains("fake-secret"),
                      qPrintable(call.join(' ')));
         }
-        QCOMPARE(configCalls, QList<QStringList>{refreshTokenArguments("gdrive")});
+        QCOMPARE(configCalls, QList<QStringList>{refreshTokenArguments("gdrive", pageArgument(configCalls.value(0)))});
         QCOMPARE(rcloneCalls(dir.path()).last().mid(0, 2), (QStringList{"lsjson", "gdrive:"}));
 
         // A fix that waits for the user, or stopped (on the token, say),
@@ -6777,7 +7200,8 @@ private slots:
         QVERIFY(QFile::remove(dir.filePath("rclone-calls.log")));
         QCOMPARE(signInCommand(paths, signInTools(dir.path()), {}).code, 0);
         const QList<QStringList> owned = rcloneCalls(dir.path());
-        QCOMPARE(owned.first(), refreshTokenArguments("gdrive") + QStringList({"--config", dir.filePath("own.conf")}));
+        QCOMPARE(owned.first(), refreshTokenArguments("gdrive", pageArgument(owned.first()))
+                                    + QStringList({"--config", dir.filePath("own.conf")}));
         QVERIFY2(owned.last().join(' ').endsWith("--config " + dir.filePath("own.conf")), qPrintable(owned.last().join(' ')));
     }
 
@@ -6790,6 +7214,145 @@ private slots:
         QCOMPARE(r.code, 1);
         QVERIFY2(r.err.contains("this build has no Google client"), qPrintable(r.err));
         QVERIFY(rcloneCalls(dir.path()).isEmpty());
+    }
+
+    // Both browser flows get DriveSync's page in place of rclone's bare one:
+    // a private file that exists only while rclone runs.
+    void signinPassesItsPageOnBothPaths()
+    {
+        const QStringList leftBefore = leftoverPages();
+        QTemporaryDir dir;
+        CommandResult r = signInCommand(controlPaths(dir.path(), false), signInTools(dir.path()), {});
+        QVERIFY2(r.code == 0, qPrintable(r.err));
+        const QStringList create = rcloneCalls(dir.path()).value(1);
+        const QString createPage = pageArgument(create);
+        QVERIFY2(!createPage.isEmpty(), qPrintable(create.join(' ')));
+        QCOMPARE(create, createRemoteArguments(kNewRemoteName, fakeClient(), createPage));
+        QVERIFY2(!QFile::exists(createPage), qPrintable(createPage));
+        QCOMPARE(readBytes(dir.filePath("page-mode")).trimmed(), QByteArray("600"));
+        const QByteArray seen = readBytes(dir.filePath("page-seen.html"));
+        QVERIFY2(seen.contains("{{if .OK}}") && seen.contains("{{.Description}}"), seen.constData());
+        QVERIFY2(seen.contains("You can go back to DriveSync") && seen.contains("You can close this tab."), seen.constData());
+        QVERIFY2(seen.contains("Google did not complete the sign-in"), seen.constData());
+        QVERIFY2(seen.contains("<svg") && seen.contains("lang=\"en\""), seen.constData());
+        QVERIFY2(!seen.contains("@OK_TITLE@") && !seen.contains("@LOGO@") && !seen.contains("<desc>"), seen.constData());
+        // Nothing on the page is fetched: it is served from 127.0.0.1.
+        QVERIFY2(!seen.contains("src=") && !seen.contains("url(") && !seen.contains("@import") && !seen.contains("href=\"http"),
+                 seen.constData());
+        QVERIFY2(!seen.contains("<!--"), seen.constData());
+
+        QTemporaryDir second;
+        BackendPaths paths = controlPaths(second.path(), true);
+        paths.config = second.filePath("config.json");
+        SyncConfig config = oldUnitConfig();
+        config.runOnlyWhen.clear();
+        QString error;
+        QVERIFY(saveSyncConfig(paths.config, config, &error));
+        QVERIFY(QFile::remove(dir.filePath("page-seen.html")));
+        r = signInCommand(paths, signInTools(second.path()), {});
+        QVERIFY2(r.code == 0, qPrintable(r.err));
+        const QStringList update = rcloneCalls(second.path()).value(0);
+        const QString updatePage = pageArgument(update);
+        QVERIFY2(!updatePage.isEmpty(), qPrintable(update.join(' ')));
+        QCOMPARE(update, refreshTokenArguments("gdrive", updatePage));
+        QVERIFY2(!QFile::exists(updatePage), qPrintable(updatePage));
+        QVERIFY(readBytes(second.filePath("page-seen.html")).contains("You can go back to DriveSync"));
+        QCOMPARE(leftoverPages(), leftBefore);
+    }
+
+    // Translated text is escaped before rclone sees it: a translation can
+    // neither add markup nor a Go template action.
+    void signinPageEscapesItsOwnText()
+    {
+        QTemporaryDir dir;
+        QVERIFY(write(dir.filePath("language"), "pt-BR\n"));
+        QVERIFY(write(dir.filePath("pt-BR.json"),
+                      QJsonDocument(QJsonObject{{"You can go back to DriveSync", "<b>{{.Code}}</b> & co"}}).toJson()));
+        const QLocale locale;
+        Translator translator(dir.filePath("language"), dir.path());
+        QVERIFY(QCoreApplication::installTranslator(&translator));
+        const auto restore = qScopeGuard([&] {
+            QCoreApplication::removeTranslator(&translator);
+            QLocale::setDefault(locale);
+        });
+        const QByteArray page = signInPage("pt-BR\"><x");
+        QVERIFY2(page.contains("&lt;b&gt;&#123;&#123;.Code&#125;&#125;&lt;/b&gt; &amp; co"), page.constData());
+        QVERIFY2(!page.contains("<b>") && !page.contains("{{.Code}}"), page.constData());
+        QVERIFY2(page.contains("lang=\"pt-BR&quot;&gt;&lt;x\""), page.constData());
+    }
+
+    // The real rclone serves the page in the user's language when Google
+    // sends the browser back with a code, and the client never shows.
+    void signinServesTheTranslatedPage()
+    {
+        const QString rclone = QStandardPaths::findExecutable("rclone");
+        if (rclone.isEmpty())
+            QSKIP("rclone is not installed");
+        QFile catalog(QString(SRCDIR) + "/../src/i18n/pt-BR.json");
+        QVERIFY(catalog.open(QIODevice::ReadOnly));
+        const QJsonObject strings = QJsonDocument::fromJson(catalog.readAll()).object();
+        for (const char *key : {"You can go back to DriveSync", "DriveSync finishes the sign-in and shows how it went.",
+                                "You can close this tab.", "Google did not complete the sign-in",
+                                "Go back to DriveSync and try again."})
+            QVERIFY2(!strings.value(key).toString().isEmpty(), key);
+
+        QTemporaryDir dir;
+        QVERIFY(write(dir.filePath("language"), "pt-BR\n"));
+        const QLocale locale;
+        Translator translator(dir.filePath("language"), QString(SRCDIR) + "/../src/i18n");
+        QVERIFY(QCoreApplication::installTranslator(&translator));
+        const auto restore = qScopeGuard([&] {
+            QCoreApplication::removeTranslator(&translator);
+            QLocale::setDefault(locale);
+        });
+        const QStringList leftBefore = leftoverPages();
+        SignInTools tools = signInTools(dir.path());
+        tools.rclone = rclone;
+        tools.language = translator.language();
+        const ServedSignIn served = signInThroughRclone(dir.path(), controlPaths(dir.path(), false), tools, "", "code=x");
+        const QByteArray title = strings.value("You can go back to DriveSync").toString().toUtf8();
+        QVERIFY2(served.page.contains(title), served.page.constData());
+        QVERIFY2(served.page.contains(strings.value("You can close this tab.").toString().toUtf8()), served.page.constData());
+        QVERIFY2(served.page.contains("lang=\"pt-BR\""), served.page.constData());
+        QVERIFY2(!served.page.contains("{{") && !served.page.contains("@OK_TITLE@"), served.page.constData());
+        // The code goes to a token address nobody answers: the sign-in fails
+        // after the page, and DriveSync says so.
+        QCOMPARE(served.result.code, 1);
+        for (const QString &text : {served.result.out, served.result.err})
+            QVERIFY2(!text.contains("fake-client") && !text.contains("fake-secret"), qPrintable(text));
+        QCOMPARE(leftoverPages(), leftBefore);
+    }
+
+    // What Google puts in its error redirect reaches the page escaped: rclone
+    // renders it with html/template. Signing in again takes the page too.
+    void signinPageEscapesWhatGoogleSends()
+    {
+        const QString rclone = QStandardPaths::findExecutable("rclone");
+        if (rclone.isEmpty())
+            QSKIP("rclone is not installed");
+        QTemporaryDir dir;
+        BackendPaths paths = controlPaths(dir.path(), true);
+        paths.config = dir.filePath("config.json");
+        SyncConfig config = oldUnitConfig();
+        config.runOnlyWhen.clear();
+        QString error;
+        QVERIFY(saveSyncConfig(paths.config, config, &error));
+        SignInTools tools = signInTools(dir.path());
+        tools.rclone = rclone;
+        const QByteArray conf = "[gdrive]\ntype = drive\nclient_id = fake-client.apps.googleusercontent.com\n"
+                                "client_secret = fake-secret\nscope = drive\n";
+        const QByteArray query = "error=" + QUrl::toPercentEncoding("<script>alert(1)</script>")
+                                 + "&error_description=" + QUrl::toPercentEncoding("<img src=x onerror=alert(2)> & \"q\"");
+        const ServedSignIn served = signInThroughRclone(dir.path(), paths, tools, conf, query);
+        QVERIFY2(served.page.contains("Google did not complete the sign-in"), served.page.constData());
+        QVERIFY2(served.page.contains("Go back to DriveSync and try again."), served.page.constData());
+        QVERIFY2(served.page.contains("&lt;script&gt;alert(1)&lt;/script&gt;"), served.page.constData());
+        QVERIFY2(served.page.contains("&lt;img src=x onerror=alert(2)&gt; &amp; &#34;q&#34;"), served.page.constData());
+        QVERIFY2(!served.page.contains("<script") && !served.page.contains("<img"), served.page.constData());
+        QVERIFY2(!served.page.contains("You can go back to DriveSync"), served.page.constData());
+        QCOMPARE(served.result.code, 1);
+        for (const QString &text : {served.result.out, served.result.err})
+            QVERIFY2(!text.contains("fake-client") && !text.contains("fake-secret"), qPrintable(text));
     }
 
     void abandonKeepsASignedInRemote()
@@ -7478,7 +8041,7 @@ private slots:
         const NotifierPaths tools = fakeNotifier(dir.path());
         FixState state = fixAt("failed");
         state.error = "couldn't fetch token: invalid_grant: maybe token expired? - try refreshing with \"rclone config reconnect drive-sync:\"";
-        notifyFixNeedsYou(tools, state, true);
+        notifyFixNeedsYou(controlPaths(dir.path(), true), tools, state, true);
         const QStringList sent = notifications(dir.path());
         QVERIFY(!sent.isEmpty());
         QVERIFY2(sent.last().contains("sign in again") && !sent.last().contains("reconnect"), qPrintable(sent.last()));
@@ -9007,6 +9570,144 @@ esac
         QCOMPARE(accountLabel(distinct.at(0), {distinct.at(0)}, "/h"), QString("Drive"));
     }
 
+    // Step 5.2: the resolver names each account once, so the cards, the
+    // JSON, the status text and the window read one label.
+    void resolverLabelsEveryAccount()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        roots.home = dir.path();
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", QString()));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", QString()));
+        AccountSet set = resolveAccounts(roots);
+        QCOMPARE(set.accounts.size(), 2);
+        QCOMPARE(set.accounts.at(0).label, QString("Drive"));
+        QCOMPARE(set.accounts.at(1).label, QString("Drive2"));
+
+        // accounts --json reads the same labels.
+        QString jsonText;
+        QString errText;
+        {
+            QTextStream out(&jsonText);
+            QTextStream err(&errText);
+            QCOMPARE(runAccountsCommand({"--json"}, roots, TakeoverPaths{}, out, err), 0);
+        }
+        const QJsonArray listed = QJsonDocument::fromJson(jsonText.toUtf8()).object().value("accounts").toArray();
+        QCOMPARE(listed.size(), 2);
+        QCOMPARE(listed.at(0).toObject().value("label").toString(), QString("Drive"));
+        QCOMPARE(listed.at(1).toObject().value("label").toString(), QString("Drive2"));
+
+        // Two folders with one name: their paths under the home.
+        QTemporaryDir same;
+        AccountRoots sameRoots = accountRoots(same.path());
+        sameRoots.home = same.path();
+        QVERIFY(makeLabelledAccount(sameRoots, same.path(), "account1", "a/Drive", QString()));
+        QVERIFY(makeLabelledAccount(sameRoots, same.path(), "account2", "b/Drive", QString()));
+        set = resolveAccounts(sameRoots);
+        QCOMPARE(set.accounts.size(), 2);
+        QCOMPARE(set.accounts.at(0).label, QString("a/Drive"));
+        QCOMPARE(set.accounts.at(1).label, QString("b/Drive"));
+        jsonText.clear();
+        {
+            QTextStream out(&jsonText);
+            QTextStream err(&errText);
+            QCOMPARE(runAccountsCommand({"--json"}, sameRoots, TakeoverPaths{}, out, err), 0);
+        }
+        const QJsonArray sameListed = QJsonDocument::fromJson(jsonText.toUtf8()).object().value("accounts").toArray();
+        QCOMPARE(sameListed.at(0).toObject().value("label").toString(), QString("a/Drive"));
+        QCOMPARE(sameListed.at(1).toObject().value("label").toString(), QString("b/Drive"));
+
+        // Legacy mode: account1 is named by its folder.
+        QTemporaryDir legacy;
+        AccountRoots legacyRoots = accountRoots(legacy.path());
+        legacyRoots.home = legacy.path();
+        QVERIFY(QDir().mkpath(legacy.filePath("Mirror")));
+        QVERIFY(writeAccountConfig(legacyRoots.configRoot + "/config.json", legacy.filePath("Mirror"),
+                                   legacy.filePath("drive-sync.log")));
+        set = resolveAccounts(legacyRoots);
+        QCOMPARE(set.mode, QString("legacy"));
+        QCOMPARE(set.accounts.size(), 1);
+        QCOMPARE(set.accounts.at(0).label, QString("Mirror"));
+
+        // The view with no account and a new account: the base folder's name.
+        QTemporaryDir none;
+        AccountRoots noneRoots = accountRoots(none.path());
+        noneRoots.home = none.path();
+        QCOMPARE(noAccountPaths(noneRoots).label, QString("Drive"));
+        QCOMPARE(newAccountPaths(noneRoots, "account1").label, QString("Drive"));
+    }
+
+    // Step 5.2: the window lists every account the resolver does, in order,
+    // with the notices; with none, the view with no account.
+    void windowAccountsListsEveryAccount()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        roots.home = dir.path();
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", QString()));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", QString()));
+        QVERIFY(writeAccountConfig(roots.configRoot + "/config.json", dir.filePath("Drive"),
+                                   dir.filePath("drive-sync.log")));
+        const WindowAccounts window = windowAccounts(roots);
+        QCOMPARE(window.accounts.size(), 2);
+        QCOMPARE(window.accounts.at(0).id, QString("account1"));
+        QCOMPARE(window.accounts.at(0).label, QString("Drive"));
+        QCOMPARE(window.accounts.at(1).id, QString("account2"));
+        QCOMPARE(window.accounts.at(1).label, QString("Drive2"));
+        QCOMPARE(window.notices.size(), 1);
+        QCOMPARE(window.notices.at(0).kind, QString("staleConfig"));
+        // 5.1's callers still get the first one.
+        QCOMPARE(windowAccount(roots).paths.id, QString("account1"));
+
+        QTemporaryDir empty;
+        const WindowAccounts nothing = windowAccounts(accountRoots(empty.path()));
+        QCOMPARE(nothing.accounts.size(), 1);
+        QVERIFY(nothing.accounts.at(0).id.isEmpty());
+        QVERIFY(!nothing.accounts.at(0).managed);
+        QVERIFY(nothing.notices.isEmpty());
+    }
+
+    // Step 5.2: drive-sync open --account <id> opens the window on a listed
+    // account; Qt's own options leave the choice to the window.
+    void openTakesAListedAccount()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", QString()));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", QString()));
+        const AccountSet set = resolveAccounts(roots);
+
+        OpenChoice choice = chooseOpenAccount({"--account", "account2"}, set);
+        QCOMPARE(choice.id, QString("account2"));
+        QVERIFY(choice.error.isEmpty());
+
+        choice = chooseOpenAccount({"--account", "account9"}, set);
+        QVERIFY(choice.id.isEmpty());
+        QCOMPARE(choice.error, QString("no account account9; accounts: account1, account2"));
+
+        choice = chooseOpenAccount({"--account"}, set);
+        QVERIFY(choice.id.isEmpty());
+        QCOMPARE(choice.error, QString("usage: drive-sync open [--account <id>]"));
+
+        choice = chooseOpenAccount({"-platform", "offscreen"}, set);
+        QVERIFY(choice.id.isEmpty());
+        QVERIFY(choice.error.isEmpty());
+
+        choice = chooseOpenAccount({}, AccountSet{});
+        QVERIFY(choice.id.isEmpty());
+        QVERIFY(choice.error.isEmpty());
+        choice = chooseOpenAccount({"--account", "account1"}, AccountSet{});
+        QCOMPARE(choice.error, QString("no account account1; accounts: none"));
+
+        QTemporaryDir legacy;
+        AccountRoots legacyRoots = accountRoots(legacy.path());
+        QVERIFY(writeAccountConfig(legacyRoots.configRoot + "/config.json", legacy.filePath("Drive"),
+                                   legacy.filePath("drive-sync.log")));
+        choice = chooseOpenAccount({"--account", "account1"}, resolveAccounts(legacyRoots));
+        QCOMPARE(choice.id, QString("account1"));
+        QVERIFY(choice.error.isEmpty());
+    }
+
     // Step 5.1: the takeover lock is one for every account, in the state
     // root, never in an account's own state folder.
     void takeoverLockLivesInTheStateRoot()
@@ -9200,7 +9901,11 @@ esac
             QVERIFY2(object.value("causeDetail").toString().contains("account3"),
                      qPrintable(object.value("causeDetail").toString()));
             const QStringList text = statusOf({}, accounts).out.split('\n', Qt::SkipEmptyParts);
-            QCOMPARE(text, (QStringList{"account1: ok", "account2: noRuns", "account3: configError"}));
+            // Step 5.2: a block per account, headed by its label (the
+            // folders share a name and the roots no home: absolute paths).
+            QCOMPARE(text, (QStringList{dir.filePath("account1/Drive") + " (account1)", "  ok",
+                                        dir.filePath("account2/Drive") + " (account2)", "  noRuns",
+                                        dir.filePath("Drive") + " (account3)", "  configError"}));
         }
         {
             QTemporaryDir dir;
@@ -9252,7 +9957,8 @@ esac
         QCOMPARE(answer.err, QString());
     }
 
-    // Step 5.1: several accounts print one line each, by id.
+    // Step 5.1: several accounts print one line each, by id. Step 5.2: one
+    // block each, headed by the label and the id.
     void statusTextListsAccounts()
     {
         QTemporaryDir dir;
@@ -9263,7 +9969,8 @@ esac
         roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-400));
         const StatusAnswer answer = statusOf({}, resolveAccounts(roots).accounts);
         QCOMPARE(answer.code, 0);
-        QCOMPARE(answer.out, QString("account1: ok\naccount2: failed\n"));
+        QCOMPARE(answer.out, dir.filePath("account1/Drive") + " (account1)\n  ok\n" + dir.filePath("account2/Drive")
+                                 + " (account2)\n  failed\n");
     }
 
     // Step 5.1: notices go to stderr, one line each, and leave the JSON as it is.
@@ -9324,6 +10031,236 @@ esac
         QVERIFY(seen.filter("list-timers").first().contains("drive-sync@account1.timer drive-sync@account2.timer"));
         QCOMPARE(statusOf({"--json"}, accounts).code, 0);
         QCOMPARE(calls(dir.path()).filter(" show ").size(), 2);
+    }
+
+    // Step 5.2: plain --json stays version 2, byte for byte, for the old
+    // widget. The literal is what the 5.1 code printed for this snapshot.
+    void versionTwoIsUnchanged()
+    {
+        const QDateTime base(QDate(2026, 11, 20), QTime(12, 0), QTimeZone::UTC);
+        Snapshot s;
+        s.summary.status = "failed";
+        s.summary.causeKind = "maxDelete";
+        s.summary.causeDetail = "12 deletions";
+        s.summary.warnings = {"conflicts", "timerDisabled"};
+        s.tone = "error";
+        s.running = false;
+        s.resync = true;
+        s.canSyncNow = true;
+        s.currentRun = QVariantMap{{"start", base.addSecs(-30)}, {"phase", "Synching"}};
+        s.lastSuccess = base.addSecs(-3600);
+        s.lastRunStart = base.addSecs(-900);
+        s.lastRunEnd = base.addSecs(-840);
+        s.lastRunOutcome = "failed";
+        s.failingSince = base.addSecs(-1800);
+        s.typicalSeconds = 42;
+        s.conflicts = 3;
+        s.managed = true;
+        s.paused = true;
+        s.pausedUntil = base.addSecs(7200);
+        const QString expected =
+            "{\"canSyncNow\":true,\"causeDetail\":\"12 deletions\",\"causeKind\":\"maxDelete\","
+            "\"conflicts\":3,\"currentRun\":{\"phase\":\"Synching\",\"start\":1795175970},"
+            "\"failingSince\":1795174200,\"lastRun\":{\"end\":1795175160,\"outcome\":\"failed\","
+            "\"start\":1795175100},\"lastSuccess\":1795172400,\"managed\":true,\"nextRun\":1795176600,"
+            "\"now\":1795176000,\"paused\":true,\"pausedUntil\":1795183200,\"resync\":true,"
+            "\"running\":false,\"status\":\"failed\",\"tone\":\"error\",\"typicalSeconds\":42,"
+            "\"version\":2,\"warnings\":[\"conflicts\",\"timerDisabled\"]}";
+        QCOMPARE(QString::fromUtf8(QJsonDocument(snapshotToJson(s, base.addSecs(600), base)).toJson(QJsonDocument::Compact)),
+                 expected);
+    }
+
+    // Step 5.2: --json --all lists every account, version 3.
+    void statusAllIsVersionThree()
+    {
+        QTemporaryDir dir;
+        const QDateTime now = QDateTime::currentDateTime();
+        AccountRoots roots = accountRoots(dir.path());
+        roots.home = dir.path();
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", successfulRun(now.addSecs(-400), 300)));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", failedRun(now.addSecs(-200))));
+        roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-400));
+        const QList<BackendPaths> accounts = resolveAccounts(roots).accounts;
+        QCOMPARE(accounts.size(), 2);
+        StatusAnswer answer = statusOf({"--json", "--all"}, accounts);
+        QCOMPARE(answer.code, 0);
+        QJsonObject object = QJsonDocument::fromJson(answer.out.toUtf8()).object();
+        QStringList top = object.keys();
+        top.sort();
+        QCOMPARE(top, (QStringList{"accounts", "canSyncNow", "now", "tone", "version", "worst"}));
+        QCOMPARE(object.value("version").toInt(), 3);
+        QCOMPARE(object.value("worst").toString(), QString("account2"));
+        QCOMPARE(object.value("tone").toString(), QString("error"));
+        QVERIFY(object.value("now").toInteger() > 0);
+        QVERIFY(object.value("canSyncNow").toBool());
+        QStringList perAccount{"status", "tone", "causeKind", "causeDetail", "warnings", "running", "resync",
+                               "canSyncNow", "lastSuccess", "lastRun", "currentRun", "nextRun", "failingSince",
+                               "typicalSeconds", "conflicts", "managed", "paused", "pausedUntil", "id", "label",
+                               "folder"};
+        perAccount.sort();
+        const QJsonArray list = object.value("accounts").toArray();
+        QCOMPARE(list.size(), 2);
+        const QStringList labels{"Drive", "Drive2"};
+        for (int i = 0; i < 2; ++i) {
+            const QJsonObject account = list.at(i).toObject();
+            QStringList keys = account.keys();
+            keys.sort();
+            QCOMPARE(keys, perAccount);
+            QCOMPARE(account.value("id").toString(), QString("account%1").arg(i + 1));
+            QCOMPARE(account.value("label").toString(), labels.at(i));
+            QCOMPARE(account.value("folder").toString(), dir.filePath(labels.at(i)));
+            QVERIFY(QDir::isAbsolutePath(account.value("folder").toString()));
+            QVERIFY(account.value("managed").toBool());
+        }
+        QCOMPARE(list.at(0).toObject().value("status").toString(), QString("ok"));
+        QCOMPARE(list.at(1).toObject().value("status").toString(), QString("failed"));
+        QVERIFY(list.at(0).toObject().value("nextRun").toInteger() > 0);
+
+        // Both paused: no account can sync now.
+        for (const BackendPaths &account : accounts) {
+            QVERIFY(QDir().mkpath(account.appState));
+            QVERIFY(write(account.appState + "/paused.json", "{\"since\":1794067200}"));
+        }
+        object = QJsonDocument::fromJson(statusOf({"--all", "--json"}, accounts).out.toUtf8()).object();
+        QCOMPARE(object.value("version").toInt(), 3);
+        QVERIFY(!object.value("canSyncNow").toBool(true));
+        QVERIFY(object.value("accounts").toArray().at(0).toObject().value("paused").toBool());
+    }
+
+    // Step 5.2: with no account, version 3 lists the view with no account
+    // only when an old drive-sync's log is there.
+    void statusAllWithNoAccount()
+    {
+        QTemporaryDir dir;
+        const QDateTime now = QDateTime::currentDateTime();
+        AccountRoots roots = accountRoots(dir.path());
+        roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-400));
+        QVERIFY(QDir().mkpath(dir.filePath("Drive")));
+        StatusAnswer answer = statusOf({"--json", "--all"}, {noAccountPaths(roots)});
+        QCOMPARE(answer.code, 0);
+        QJsonObject object = QJsonDocument::fromJson(answer.out.toUtf8()).object();
+        QCOMPARE(object.value("version").toInt(), 3);
+        QVERIFY(object.value("accounts").toArray().isEmpty());
+        QCOMPARE(object.value("tone").toString(), QString("error"));
+        QCOMPARE(object.value("worst").toString(), QString());
+        QVERIFY(object.contains("worst"));
+        QVERIFY(!object.value("canSyncNow").toBool(true));
+
+        QVERIFY(write(dir.filePath("drive-sync.log"), successfulRun(now.addSecs(-400), 300).toUtf8()));
+        object = QJsonDocument::fromJson(statusOf({"--json", "--all"}, {noAccountPaths(roots)}).out.toUtf8()).object();
+        const QJsonArray list = object.value("accounts").toArray();
+        QCOMPARE(list.size(), 1);
+        QCOMPARE(list.at(0).toObject().value("id").toString(), QString());
+        QVERIFY(list.at(0).toObject().contains("id"));
+        QVERIFY(!list.at(0).toObject().value("managed").toBool(true));
+        QCOMPARE(list.at(0).toObject().value("label").toString(), QString("Drive"));
+        QCOMPARE(object.value("worst").toString(), QString());
+        QVERIFY(object.contains("worst"));
+    }
+
+    // Step 5.2: --all goes with --json, and each option comes once.
+    void statusAllNeedsJson()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        roots.base.systemctl = fakeSystemctl(dir.path(), QDateTime::currentDateTime().addSecs(-400));
+        const QList<BackendPaths> view{noAccountPaths(roots)};
+        for (const QStringList &arguments : {QStringList{"--all"}, QStringList{"--json", "--json"},
+                                             QStringList{"--json", "--all", "--all"}, QStringList{"--json", "-x"}}) {
+            const StatusAnswer answer = statusOf(arguments, view);
+            QCOMPARE(answer.code, 1);
+            QVERIFY(answer.out.isEmpty());
+            QCOMPARE(answer.err, usageText());
+        }
+        QVERIFY2(usageText().contains("drive-sync status [--json [--all]]\n"), qPrintable(usageText()));
+        QVERIFY2(usageText().contains("drive-sync [open [--account <id>]]\n"), qPrintable(usageText()));
+    }
+
+    // Step 5.2: "status --account account2 --json --all" is version 3 with
+    // the one account main hands it.
+    void statusAllForOneAccount()
+    {
+        QTemporaryDir dir;
+        const QDateTime now = QDateTime::currentDateTime();
+        AccountRoots roots = accountRoots(dir.path());
+        roots.home = dir.path();
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", failedRun(now.addSecs(-200))));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", successfulRun(now.addSecs(-400), 300)));
+        roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-400));
+        const AccountSet set = resolveAccounts(roots);
+        const AccountChoice choice = chooseAccounts(set, "status", "account2", roots);
+        QVERIFY(choice.error.isEmpty());
+        const QJsonObject object =
+            QJsonDocument::fromJson(statusOf({"--json", "--all"}, choice.targets).out.toUtf8()).object();
+        const QJsonArray list = object.value("accounts").toArray();
+        QCOMPARE(list.size(), 1);
+        QCOMPARE(list.at(0).toObject().value("id").toString(), QString("account2"));
+        QCOMPARE(list.at(0).toObject().value("label").toString(), QString("Drive2"));
+        QCOMPARE(object.value("worst").toString(), QString("account2"));
+        QCOMPARE(object.value("tone").toString(), QString("ok"));
+    }
+
+    // Step 5.2 (the maintainer's answer to Question 3): one account keeps
+    // the 5.1 line; from two on, a block per account headed by its label
+    // and id.
+    void statusTextPrintsABlockPerAccount()
+    {
+        const QDateTime now = QDateTime::currentDateTime();
+        {
+            QTemporaryDir dir;
+            AccountRoots roots = accountRoots(dir.path());
+            roots.home = dir.path();
+            QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", successfulRun(now.addSecs(-400), 300)));
+            roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-400));
+            QCOMPARE(statusOf({}, resolveAccounts(roots).accounts).out, QString("ok\n"));
+        }
+        {
+            QTemporaryDir dir;
+            AccountRoots roots = accountRoots(dir.path());
+            roots.home = dir.path();
+            QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", successfulRun(now.addSecs(-400), 300)));
+            QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", failedRun(now.addSecs(-200))));
+            QVERIFY(write(dir.filePath("Drive2/a.txt.conflict1"), "x"));
+            roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-400));
+            roots.base.find = QStandardPaths::findExecutable("find");
+            const StatusAnswer answer = statusOf({}, resolveAccounts(roots).accounts);
+            QCOMPARE(answer.code, 0);
+            QCOMPARE(answer.out,
+                     QString("Drive (account1)\n  ok\nDrive2 (account2)\n  failed (warnings: conflicts)\n"));
+        }
+        {
+            QTemporaryDir dir;
+            AccountRoots roots = accountRoots(dir.path());
+            roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-400));
+            QCOMPARE(statusOf({}, {noAccountPaths(roots)}).out, QString("noLog\n"));
+        }
+    }
+
+    // Step 5.2: --all reads every account with the same one show call and
+    // one list-timers.
+    void statusAllMakesOneShowCall()
+    {
+        QTemporaryDir dir;
+        const QDateTime now = QDateTime::currentDateTime();
+        AccountRoots roots = accountRoots(dir.path());
+        QVERIFY(makeStatusAccount(roots, dir.path(), "account1", successfulRun(now.addSecs(-400), 300)));
+        QVERIFY(makeStatusAccount(roots, dir.path(), "account2", successfulRun(now.addSecs(-400), 300)));
+        QVERIFY(QDir().mkpath(dir.filePath("answers")));
+        const QString answers = fakeSystemctl(dir.filePath("answers"), now.addSecs(-400));
+        const QString recording = dir.filePath("systemctl");
+        QVERIFY(write(recording, QString("#!/bin/sh\necho \"systemctl $*\" >> \"%1/calls.log\"\nexec \"%2\" \"$@\"\n")
+                                     .arg(dir.path(), answers)
+                                     .toUtf8()));
+        QFile::setPermissions(recording, QFile::ReadOwner | QFile::WriteOwner | QFile::ExeOwner);
+        roots.base.systemctl = recording;
+        const QList<BackendPaths> accounts = resolveAccounts(roots).accounts;
+        const StatusAnswer answer = statusOf({"--json", "--all"}, accounts);
+        QCOMPARE(answer.code, 0);
+        QCOMPARE(QJsonDocument::fromJson(answer.out.toUtf8()).object().value("accounts").toArray().size(), 2);
+        const QStringList seen = calls(dir.path());
+        QCOMPARE(seen.filter(" show ").size(), 1);
+        QCOMPARE(seen.filter("list-timers").size(), 1);
+        QVERIFY(seen.filter("list-timers").first().contains("drive-sync@account1.timer drive-sync@account2.timer"));
     }
 
     void templatesCarryTheAccount()
@@ -10936,10 +11873,11 @@ esac
         QCOMPARE(unitProperty(dir.path(), "drive-sync.timer", "UnitFileState"), QString("enabled"));
         QCOMPARE(unitProperty(dir.path(), "drive-sync.timer", "ActiveState"), QString("active"));
         // The home is back, and the check that followed was the plain timer's.
-        // The cards' own file is the watchdog's (item 2 of the review).
+        // The cards' own file is the watchdog's (item 2 of the review), and
+        // so is the mark of the bare 5.1 titles (step 5.2).
         auto after = moveHomeFiles(h);
         for (const QString &own : {QString("ids.txt"), QString("notify-send"), QString("gdbus"), QString("omarchy"),
-                                   QString("app/notify-accounts.json")})
+                                   QString("app/notify-accounts.json"), QString("app/notify-bare-titles.done")})
             after.remove(own);
         QCOMPARE(after, before);
         QVERIFY(calls(dir.path()).contains("systemctl --user is-active drive-sync.timer"));
@@ -11807,6 +12745,527 @@ esac
         QVERIFY(write(migrationJournalPath(roots.stateRoot), R"({"stuck": true})"));
         backend.reloadConfig();
         QTRY_VERIFY(!backend.canSyncNow());
+    }
+
+    // Step 5.2, Task 1: the window keeps one name for the selected account,
+    // "backend", and swaps the object behind it. This guards that QML
+    // re-evaluates the bindings and moves the Connections that read a
+    // context property when the property is set again, in a nested file as
+    // the window's dialogs are.
+    void contextPropertySwapRebinds()
+    {
+        QTemporaryDir dir;
+        QVERIFY(write(dir.filePath("Child.qml"),
+                      "import QtQuick\n"
+                      "Item {\n"
+                      "    property string seen: backend.objectName\n"
+                      "    property int heard: 0\n"
+                      "    Connections { target: backend; function onObjectNameChanged() { heard++ } }\n"
+                      "}\n"));
+        QVERIFY(write(dir.filePath("Main.qml"),
+                      "import QtQuick\n"
+                      "Item {\n"
+                      "    property alias seen: child.seen\n"
+                      "    property alias heard: child.heard\n"
+                      "    Child { id: child }\n"
+                      "}\n"));
+        QObject a;
+        a.setObjectName("a");
+        QObject b;
+        b.setObjectName("b");
+        QQmlEngine engine;
+        engine.rootContext()->setContextProperty("backend", &a);
+        QQmlComponent component(&engine, QUrl::fromLocalFile(dir.filePath("Main.qml")));
+        std::unique_ptr<QObject> root(component.create());
+        QVERIFY2(root, qPrintable(component.errorString()));
+        QCOMPARE(root->property("seen").toString(), QString("a"));
+
+        engine.rootContext()->setContextProperty("backend", &b);
+        QTRY_COMPARE(root->property("seen").toString(), QString("b"));
+
+        b.setObjectName("b2");
+        QTRY_COMPARE(root->property("seen").toString(), QString("b2"));
+        QCOMPARE(root->property("heard").toInt(), 1);
+
+        // The old object is no longer heard.
+        a.setObjectName("a2");
+        QCoreApplication::processEvents();
+        QCOMPARE(root->property("heard").toInt(), 1);
+        QCOMPARE(root->property("seen").toString(), QString("b2"));
+    }
+
+    // Step 5.2, Task 7: every command the window runs names the account it
+    // shows, right after the command word (takeAccountOption reads only the
+    // first two arguments); the view with no account names none.
+    void windowChildrenNameTheAccount()
+    {
+        QTemporaryDir dir;
+        const QDateTime start = QDateTime::currentDateTime().addSecs(-600);
+        QDir(dir.path()).mkpath("Drive");
+        QVERIFY(write(dir.filePath("drive-sync.log"), successfulRun(start, 480).toUtf8()));
+        BackendPaths paths{dir.filePath("drive-sync.log"), dir.filePath("Drive"), dir.filePath("state"),
+                           dir.filePath("proc"), fakeSystemctl(dir.path(), start),
+                           QStandardPaths::findExecutable("find"), dir.filePath("app")};
+        paths.managed = true;
+        paths.self = fakeDriveSync(dir.path(), "{}");
+        paths.id = "account2";
+        Backend backend(paths);
+        QCOMPARE(backend.accountId(), QString("account2"));
+        QCOMPARE(backend.paths().id, QString("account2"));
+        QTRY_COMPARE(backend.status(), QString("ok"));
+
+        backend.syncNow();
+        backend.pauseFor(60);
+        backend.pauseUntilTomorrow();
+        backend.pauseUntilResumed();
+        backend.resume();
+        backend.startFix();
+        backend.confirmFix();
+        backend.cancelFix();
+        backend.retryFix();
+        backend.answerFix({});
+        backend.allowDeletes(3);
+        QTRY_COMPARE(calls(dir.path()).size(), 11);
+        QStringList made = calls(dir.path());
+        made.sort();
+        const QString answers = dir.filePath("app") + "/fix-answers.json";
+        QCOMPARE(made, (QStringList{"drive-sync deletes --account account2 --allow 3 --json",
+                                    "drive-sync fix --account account2 --answers " + answers + " --json",
+                                    "drive-sync fix --account account2 --cancel --json",
+                                    "drive-sync fix --account account2 --confirm --json",
+                                    "drive-sync fix --account account2 --retry --json",
+                                    "drive-sync fix --account account2 --start --json",
+                                    "drive-sync pause --account account2 --json",
+                                    "drive-sync pause --account account2 --minutes 60 --json",
+                                    "drive-sync pause --account account2 --until-tomorrow --json",
+                                    "drive-sync resume --account account2 --json",
+                                    "drive-sync sync --account account2 --json"}));
+
+        // The move is about every account: it names none.
+        QVERIFY(QFile::remove(dir.filePath("calls.log")));
+        backend.startMove();
+        QTRY_COMPARE(calls(dir.path()), QStringList{"drive-sync accounts --migrate --json"});
+
+        // The view with no account: as before accounts.
+        QVERIFY(QFile::remove(dir.filePath("calls.log")));
+        paths.id.clear();
+        Backend none(paths);
+        QCOMPARE(none.accountId(), QString());
+        none.syncNow();
+        QTRY_COMPARE(calls(dir.path()), QStringList{"drive-sync sync --json"});
+    }
+
+    void settingsControllerNamesTheAccount()
+    {
+        QTemporaryDir dir;
+        const QJsonObject settings{{"ok", true}, {"error", ""}, {"folder", "/h/Drive"}, {"remote", "gdrive:"},
+                                   {"intervalMinutes", 30}, {"maxDelete", 5}, {"filtersFile", "/h/f.txt"},
+                                   {"filters", "- .git/**\n"}, {"skipped", QJsonArray{"Photos"}}, {"skipError", ""}};
+        QVERIFY(write(dir.filePath("settings.json"), QJsonDocument(settings).toJson(QJsonDocument::Compact)));
+        QVERIFY(write(dir.filePath("change-answer.json"),
+                      QJsonDocument(QJsonObject{{"ok", true}, {"error", ""}, {"fixStarted", false}})
+                          .toJson(QJsonDocument::Compact)));
+        SettingsController controller(fakeSettingsDrivesync(dir.path()));
+        QSignalSpy changes(&controller, &SettingsController::changed);
+        controller.setAccount("account2");
+        QCOMPARE(controller.account(), QString("account2"));
+        QVERIFY(changes.size() >= 1);
+        controller.load();
+        QTRY_VERIFY(controller.loaded());
+        QTRY_COMPARE(controller.state(), QString("idle"));
+        QCOMPARE(controller.intervalMinutes(), 30);
+        QCOMPARE(calls(dir.path()), QStringList{"settings --account account2 --json"});
+
+        // A change keeps the account it was queued with, and so does the read
+        // after it, even when the account changes meanwhile.
+        controller.setInterval(45);
+        controller.setMaxDelete(10);
+        controller.setAccount("account1");
+        QCOMPARE(controller.account(), QString("account1"));
+        QTRY_COMPARE(calls(dir.path()).size(), 4);
+        QTRY_COMPARE(controller.state(), QString("idle"));
+        QCOMPARE(calls(dir.path()).mid(1), (QStringList{"settings --account account2 --interval 45 --json",
+                                                         "settings --account account2 --max-delete 10 --json",
+                                                         "settings --account account2 --json"}));
+        // What account2's read said is not account1's: nothing shows until
+        // account1 is read.
+        QVERIFY(!controller.loaded());
+        controller.load();
+        QTRY_VERIFY(controller.loaded());
+        QCOMPARE(calls(dir.path()).last(), QString("settings --account account1 --json"));
+
+        // Another account while idle drops what was read.
+        controller.setAccount("account2");
+        QVERIFY(!controller.loaded());
+        QCOMPARE(controller.intervalMinutes(), 0);
+
+        // No account: 5.1's exact commands.
+        QTRY_COMPARE(controller.state(), QString("idle"));
+        controller.setAccount("");
+        const int before = int(calls(dir.path()).size());
+        controller.load();
+        QTRY_VERIFY(controller.loaded());
+        controller.setInterval(60);
+        QTRY_COMPARE(calls(dir.path()).size(), before + 3);
+        QTRY_COMPARE(controller.state(), QString("idle"));
+        QCOMPARE(calls(dir.path()).mid(before),
+                 (QStringList{"settings --json", "settings --interval 60 --json", "settings --json"}));
+        QVERIFY(controller.saved());
+    }
+
+    void settingsControllerKeepsFixStartedPerAccount()
+    {
+        QTemporaryDir dir;
+        const QJsonObject settings{{"ok", true}, {"error", ""}, {"folder", "/h/Drive"}, {"remote", "gdrive:"},
+                                   {"intervalMinutes", 30}, {"maxDelete", 5}, {"filtersFile", "/h/f.txt"},
+                                   {"filters", "- .git/**\n"}, {"skipped", QJsonArray{}}, {"skipError", ""}};
+        QVERIFY(write(dir.filePath("settings.json"), QJsonDocument(settings).toJson(QJsonDocument::Compact)));
+        const auto answer = [&](bool fixStarted) {
+            return write(dir.filePath("change-answer.json"),
+                         QJsonDocument(QJsonObject{{"ok", true}, {"error", ""}, {"fixStarted", fixStarted}})
+                             .toJson(QJsonDocument::Compact));
+        };
+        QVERIFY(answer(true));
+        SettingsController controller(fakeSettingsDrivesync(dir.path()));
+        QSignalSpy fixes(&controller, &SettingsController::fixStarted);
+
+        // account2's filters start a fix while the window moves to account1
+        // and reads it: that read waits behind the save.
+        controller.setAccount("account2");
+        controller.setFilters("- *.tmp\n");
+        controller.setAccount("account1");
+        controller.load();
+        QTRY_VERIFY(calls(dir.path()).contains("settings --account account1 --json"));
+        QTRY_COMPARE(controller.state(), QString("idle"));
+        QVERIFY(controller.loaded());
+        // account2's fix is not account1's: Settings stays open on account1.
+        QCOMPARE(fixes.size(), 0);
+
+        // account1's own change goes through at once: no fix to report.
+        QVERIFY(answer(false));
+        controller.setInterval(45);
+        QTRY_COMPARE(calls(dir.path()).last(), QString("settings --account account1 --json"));
+        QTRY_COMPARE(controller.state(), QString("idle"));
+        QCOMPARE(fixes.size(), 0);
+        QVERIFY(controller.saved());
+
+        // Nor is account2's change that applied at once: "saved" would make
+        // account1's Settings take its fields again and say it saved.
+        controller.setAccount("account2");
+        controller.setInterval(60);
+        controller.setAccount("account1");
+        controller.load();
+        QTRY_COMPARE(calls(dir.path()).last(), QString("settings --account account2 --json"));
+        QTRY_COMPARE(controller.state(), QString("idle"));
+        QVERIFY(controller.loaded());
+        QVERIFY(!controller.saved());
+        QCOMPARE(fixes.size(), 0);
+    }
+
+    void folderTreeNamesTheAccount()
+    {
+        QTemporaryDir dir;
+        fakeSettingsDrivesync(dir.path());
+        const auto level = [](const QStringList &paths) {
+            QJsonArray list;
+            for (const QString &path : paths)
+                list.append(QJsonObject{{"name", path.section('/', -1)}, {"path", path}, {"local", true},
+                                        {"unsupported", false}});
+            return QJsonDocument(QJsonObject{{"ok", true}, {"error", ""}, {"folders", list}}).toJson(QJsonDocument::Compact);
+        };
+        QVERIFY(write(dir.filePath("folders-root.json"), level({"Photos", "Work"})));
+        QVERIFY(write(dir.filePath("folders-Work.json"), level({"Work/Old"})));
+        FolderTree tree(dir.filePath("drive-sync"));
+        tree.setAccount("account2");
+        QCOMPARE(tree.account(), QString("account2"));
+        tree.reset({}, "");
+        QTRY_COMPARE(tree.rows().size(), 2);
+        tree.expand(1);
+        QTRY_COMPARE(tree.rows().size(), 3);
+        QCOMPARE(calls(dir.path()), (QStringList{"folders --account account2 --json",
+                                                 "folders --account account2 --json -- Work"}));
+
+        // First setup: DriveSync's own remote, before any account exists.
+        tree.setAccount("");
+        tree.reset({}, "drive-sync:");
+        QTRY_COMPARE(tree.rows().size(), 2);
+        QCOMPARE(calls(dir.path()).last(), QString("folders --remote drive-sync: --json"));
+    }
+
+    void signInAgainNamesTheAccount()
+    {
+        // Again: the account's own remote, and no fallback that would remove
+        // a half-made first-setup remote.
+        QTemporaryDir dir;
+        SetupController controller(fakeSetupDrivesync(dir.path()), dir.filePath("Drive"));
+        controller.signIn("account1");
+        QCOMPARE(controller.state(), QString("signingIn"));
+        QTRY_VERIFY(QFile::exists(dir.filePath("child.pid")) && QFile::exists(dir.filePath("browser.pid")));
+        const qint64 child = readBytes(dir.filePath("child.pid")).trimmed().toLongLong();
+        const qint64 browser = readBytes(dir.filePath("browser.pid")).trimmed().toLongLong();
+        const auto noBrowser = qScopeGuard([browser] { ::kill(static_cast<pid_t>(browser), SIGKILL); });
+        QCOMPARE(calls(dir.path()).first(), QString("signin --account account1 --json"));
+        controller.cancel();
+        QCOMPARE(controller.state(), QString("idle"));
+        QTRY_VERIFY(processGone(child));
+        QTRY_VERIFY(calls(dir.path()).contains("cleaned"));
+        QTest::qWait(500);
+        QVERIFY2(!calls(dir.path()).contains("signin --abandon"), qPrintable(calls(dir.path()).join(" | ")));
+
+        // First setup: no account, and the fallback runs after a cancel.
+        QTemporaryDir first;
+        SetupController setup(fakeSetupDrivesync(first.path()), first.filePath("Drive"));
+        setup.signIn();
+        QTRY_VERIFY(QFile::exists(first.filePath("child.pid")) && QFile::exists(first.filePath("browser.pid")));
+        const qint64 firstBrowser = readBytes(first.filePath("browser.pid")).trimmed().toLongLong();
+        const auto noFirstBrowser = qScopeGuard([firstBrowser] { ::kill(static_cast<pid_t>(firstBrowser), SIGKILL); });
+        QCOMPARE(calls(first.path()).first(), QString("signin --json"));
+        setup.cancel();
+        QTRY_VERIFY(calls(first.path()).contains("signin --abandon"));
+    }
+
+    // Step 5.2, Task 8: one Backend per account the resolver lists.
+    void accountListMakesOneBackendPerAccount()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        const QDateTime now = QDateTime::currentDateTime();
+        roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-1400));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", successfulRun(now.addSecs(-600), 480)));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", successfulRun(now.addSecs(-600), 480)));
+        const auto list = accountListOver(roots);
+        QCOMPARE(list->count(), 2);
+        QVERIFY(list->several());
+        QCOMPARE(list->backends().size(), 2);
+        QCOMPARE(list->backends().at(0)->accountId(), QString("account1"));
+        QCOMPARE(list->backends().at(1)->accountId(), QString("account2"));
+        QCOMPARE(list->backends().at(1)->serviceUnit(), QString("drive-sync@account2.service"));
+        QCOMPARE(list->accounts().at(0).toMap().value("label").toString(), QString("Drive"));
+        QCOMPARE(list->accounts().at(1).toMap().value("label").toString(), QString("Drive2"));
+        QCOMPARE(list->accounts().at(1).toMap().value("folder").toString(), dir.filePath("Drive2"));
+        QCOMPARE(list->current(), list->backends().at(0));
+        QCOMPARE(list->selected(), 0);
+        QCOMPARE(list->currentLabel(), QString("Drive"));
+        QSignalSpy selected(list.get(), &AccountList::selectedChanged);
+        list->select(1);
+        QCOMPARE(selected.size(), 1);
+        QCOMPARE(list->current(), list->backends().at(1));
+        QCOMPARE(list->selected(), 1);
+        QCOMPARE(list->currentLabel(), QString("Drive2"));
+        // The same one again, or one out of range, changes nothing.
+        list->select(1);
+        list->select(5);
+        list->select(-1);
+        QCOMPARE(selected.size(), 1);
+        QCOMPARE(list->selected(), 1);
+    }
+
+    void accountListKeepsTheSelectionById()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        const QDateTime now = QDateTime::currentDateTime();
+        roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-1400));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", successfulRun(now.addSecs(-600), 480)));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account4", "Drive4", successfulRun(now.addSecs(-600), 480)));
+        const auto list = accountListOver(roots);
+        list->select(0);
+        Backend *two = list->current();
+        QCOMPARE(two->accountId(), QString("account2"));
+        QSignalSpy selected(list.get(), &AccountList::selectedChanged);
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account3", "Drive3", successfulRun(now.addSecs(-600), 480)));
+        list->reload();
+        QCOMPARE(list->current(), two);
+        QCOMPARE(list->count(), 3);
+        QStringList ids;
+        for (Backend *backend : list->backends())
+            ids << backend->accountId();
+        QCOMPARE(ids, (QStringList{"account2", "account3", "account4"}));
+        QCOMPARE(selected.size(), 0);
+
+        // account2 stays selected when one appears before it.
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive1", successfulRun(now.addSecs(-600), 480)));
+        list->reload();
+        QCOMPARE(list->current(), two);
+        QCOMPARE(list->selected(), 1);
+        QCOMPARE(selected.size(), 1);  // its index moved
+    }
+
+    void accountListAdoptsInPlaceWithOneAccount()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        const QDateTime now = QDateTime::currentDateTime();
+        roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-1400));
+        const auto list = accountListOver(roots);
+        QCOMPARE(list->count(), 1);
+        QVERIFY(!list->several());
+        Backend *view = list->current();
+        QCOMPARE(view->accountId(), QString());
+        QVERIFY(!view->managed());
+        QSignalSpy selected(list.get(), &AccountList::selectedChanged);
+
+        // A first setup: the view becomes account1, the same object.
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", successfulRun(now.addSecs(-600), 480)));
+        list->reload();
+        QCOMPARE(list->current(), view);
+        QCOMPARE(list->backends(), QList<Backend *>{view});
+        QCOMPARE(view->accountId(), QString("account1"));
+        QVERIFY(view->managed());
+        QCOMPARE(view->serviceUnit(), QString("drive-sync@account1.service"));
+        QCOMPARE(list->currentLabel(), QString("Drive"));
+
+        // Cancelled before its base: back to the view, still the same object.
+        QVERIFY(QDir(roots.configRoot + "/accounts/account1").removeRecursively());
+        list->reload();
+        QCOMPARE(list->current(), view);
+        QCOMPARE(view->accountId(), QString());
+        QVERIFY(!view->managed());
+        QCOMPARE(selected.size(), 0);
+    }
+
+    void accountListFollowsTheMove()
+    {
+        QTemporaryDir dir;
+        MoveHome h = makeMoveHome(dir.path());
+        QVERIFY(write(dir.filePath("drive-sync.log"), successfulRun(QDateTime::currentDateTime().addSecs(-600), 480).toUtf8()));
+        const AccountRoots roots = h.roots;
+        const auto list = accountListOver(roots);
+        Backend *backend = list->current();
+        QCOMPARE(backend->accountId(), QString("account1"));
+        QCOMPARE(backend->serviceUnit(), QString("drive-sync.service"));
+        QSignalSpy selected(list.get(), &AccountList::selectedChanged);
+
+        // A live move caught halfway: the resolver sees no account at all,
+        // and the list keeps account1 until it ends.
+        QVERIFY(write(takeoverLockPath(roots.stateRoot), QByteArray::number(QCoreApplication::applicationPid()) + "\n"));
+        QVERIFY(write(migrationJournalPath(roots.stateRoot), "{}\n"));
+        QVERIFY(QDir().mkpath(roots.configRoot + "/accounts/account1"));
+        list->reload();
+        QTest::qWait(400);
+        QCOMPARE(list->current(), backend);
+        QCOMPARE(backend->accountId(), QString("account1"));
+        QCOMPARE(backend->serviceUnit(), QString("drive-sync.service"));
+        QVERIFY(backend->managed());
+        QVERIFY(QDir(roots.configRoot + "/accounts").removeRecursively());
+        QVERIFY(QFile::remove(migrationJournalPath(roots.stateRoot)));
+        QVERIFY(QFile::remove(takeoverLockPath(roots.stateRoot)));
+
+        const MoveOutcome outcome = moveToAccounts(h.roots, h.tools);
+        QVERIFY2(outcome.result == "moved", qPrintable(outcome.result + ": " + outcome.reason));
+        list->reload();
+        QCOMPARE(list->current(), backend);
+        QCOMPARE(list->backends(), QList<Backend *>{backend});
+        QCOMPARE(backend->serviceUnit(), QString("drive-sync@account1.service"));
+        QVERIFY(backend->managed());
+        QCOMPARE(selected.size(), 0);
+    }
+
+    void accountListDropsAGoneAccount()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        const QDateTime now = QDateTime::currentDateTime();
+        roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-1400));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", successfulRun(now.addSecs(-600), 480)));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", successfulRun(now.addSecs(-600), 480)));
+        const auto list = accountListOver(roots);
+        list->select(1);
+        Backend *one = backendOf(*list, "account1");
+        Backend *two = list->current();
+        QCOMPARE(two->accountId(), QString("account2"));
+        QStringList order;
+        connect(list.get(), &AccountList::selectedChanged, this, [&] {
+            // The window points "backend" at the new one here: it must not be
+            // the one about to go.
+            order << "selected:" + list->current()->accountId();
+        });
+        connect(two, &QObject::destroyed, this, [&] { order << "destroyed"; });
+        QVERIFY(QDir(roots.configRoot + "/accounts/account2").removeRecursively());
+        list->reload();
+        QCOMPARE(list->current(), one);
+        QCOMPARE(list->count(), 1);
+        QTRY_COMPARE(order, (QStringList{"selected:account1", "destroyed"}));
+    }
+
+    void dotsFollowEachBackend()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        const QDateTime now = QDateTime::currentDateTime();
+        roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-1400));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", successfulRun(now.addSecs(-600), 480)));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2",
+                                    successfulRun(now.addSecs(-900), 300) + failedRun(now.addSecs(-200))));
+        const auto list = accountListOver(roots);
+        QCOMPARE(list->selected(), 0);
+        QSignalSpy accounts(list.get(), &AccountList::accountsChanged);
+        // Until systemd answers, every headline is notLoaded.
+        QTRY_COMPARE(list->accounts().at(1).toMap().value("status").toString(), QString("failed"));
+        QCOMPARE(list->accounts().at(1).toMap().value("tone").toString(), QString("error"));
+        QTRY_COMPARE(list->accounts().at(0).toMap().value("tone").toString(), QString("ok"));
+        // A run that ends well reaches the dot of an account not shown.
+        QFile log(dir.filePath("account2.log"));
+        QVERIFY(log.open(QIODevice::Append));
+        log.write(successfulRun(now.addSecs(-60), 50).toUtf8());
+        log.close();
+        QTRY_COMPARE(list->accounts().at(1).toMap().value("tone").toString(), QString("ok"));
+        QVERIFY(accounts.size() >= 1);
+        QCOMPARE(list->selected(), 0);
+    }
+
+    void selectWraps()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        const QDateTime now = QDateTime::currentDateTime();
+        roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-1400));
+        for (const QString &id : {QString("account1"), QString("account2"), QString("account3")})
+            QVERIFY(makeLabelledAccount(roots, dir.path(), id, "Drive" + id.right(1), successfulRun(now.addSecs(-600), 480)));
+        const auto list = accountListOver(roots);
+        list->selectPrevious();
+        QCOMPARE(list->selected(), 2);
+        list->selectNext();
+        QCOMPARE(list->selected(), 0);
+        list->selectNext();
+        QCOMPARE(list->selected(), 1);
+        list->selectPrevious();
+        QCOMPARE(list->selected(), 0);
+
+        // With one account there is nothing to move to.
+        QTemporaryDir single;
+        AccountRoots singleRoots = accountRoots(single.path());
+        singleRoots.base.systemctl = fakeSystemctl(single.path(), now.addSecs(-1400));
+        QVERIFY(makeLabelledAccount(singleRoots, single.path(), "account1", "Drive", successfulRun(now.addSecs(-600), 480)));
+        const auto one = accountListOver(singleRoots);
+        QSignalSpy selected(one.get(), &AccountList::selectedChanged);
+        one->selectNext();
+        one->selectPrevious();
+        QCOMPARE(one->selected(), 0);
+        QCOMPARE(selected.size(), 0);
+    }
+
+    void openSelectsTheAccount()
+    {
+        QTemporaryDir dir;
+        AccountRoots roots = accountRoots(dir.path());
+        const QDateTime now = QDateTime::currentDateTime();
+        roots.base.systemctl = fakeSystemctl(dir.path(), now.addSecs(-1400));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account1", "Drive", successfulRun(now.addSecs(-600), 480)));
+        QVERIFY(makeLabelledAccount(roots, dir.path(), "account2", "Drive2", successfulRun(now.addSecs(-600), 480)));
+        const auto list = accountListOver(roots);
+        QVERIFY(list->selectId("account2"));
+        QCOMPARE(list->current()->accountId(), QString("account2"));
+        QVERIFY(!list->selectId("account9"));
+        QCOMPARE(list->current()->accountId(), QString("account2"));
+
+        // What "drive-sync open" checks before the window exists.
+        const AccountSet set = resolveAccounts(roots);
+        QCOMPARE(chooseOpenAccount({"--account", "account2"}, set).id, QString("account2"));
+        QCOMPARE(chooseOpenAccount({"--account", "account9"}, set).error,
+                 QString("no account account9; accounts: account1, account2"));
+        const OpenChoice plain = chooseOpenAccount({"-platform", "offscreen"}, set);
+        QVERIFY(plain.id.isEmpty() && plain.error.isEmpty());
     }
 };
 

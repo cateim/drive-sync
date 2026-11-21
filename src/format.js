@@ -1,4 +1,5 @@
 .pragma library
+.import QtCore as Core
 
 // Times, durations and sizes in the Omarchy language. Callers pass `now`
 // so relative times move with the window's clock, and read
@@ -47,7 +48,14 @@ function size(bytes) {
     return Qt.locale().formattedDataSize(bytes, 1)
 }
 
-// "~/Drive" reads better than "/home/someone/Drive".
+// "~/Drive" reads better than "/home/someone/Drive". The home is the one Qt
+// reads from $HOME, so a home outside /home (and the harness's temporary
+// HOME, whose pictures go in the README) reads as "~" too.
+var homeDir = decodeURIComponent(Core.StandardPaths.writableLocation(Core.StandardPaths.HomeLocation)
+                                 .toString().replace(/^file:\/\//, "")).replace(/\/+$/, "")
+
 function home(path) {
+    if (homeDir !== "" && (path === homeDir || path.startsWith(homeDir + "/")))
+        return "~" + path.slice(homeDir.length)
     return path.replace(/^\/home\/[^/]+/, "~")
 }

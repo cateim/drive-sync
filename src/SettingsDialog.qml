@@ -65,6 +65,9 @@ Popup {
         loadedFilters = ""
         treeShown = false
         treeFromRead = false
+        // Every command names the account shown; set before the read.
+        settingsController.account = backend.accountId
+        folderTree.account = backend.accountId
         settingsController.load()
         showPage(0)
     }
@@ -204,7 +207,9 @@ Popup {
         spacing: 12
 
         Label {
-            text: qsTr("Settings")
+            // From two accounts on, the title names the account these
+            // settings belong to.
+            text: accountList.several ? qsTr("Settings: %1").arg(accountList.currentLabel) : qsTr("Settings")
             textFormat: Text.PlainText
             font.pixelSize: 18
             font.weight: Font.DemiBold

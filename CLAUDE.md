@@ -56,7 +56,7 @@ one window, one job, keyboard first, follows the Omarchy theme and language.
 `drive-sync.sh` and `drive-sync-aviso`. The AUR has an unrelated `drivesync`, so
 that name must never come back. The repository was `drivesync` until
 2026-11-20 and is now `drive-sync` (`github.com/CaTeIM/drive-sync`, the page
-at `cateim.github.io/drive-sync`); what was named after it followed:
+at `drive-sync.selflabs.org` since 2026-11-20); what was named after it followed:
 `drive-sync.pro`, `tests/drive-sync-tests.*`, `fakeDriveSync` and the bar's
 `action.open` i18n key. `drivesync` stays only where it names the app's old
 name (the legacy migration, the plugin swap, `takeoverLockHeld` and their tests).
@@ -76,6 +76,7 @@ bin/build               qmake6 + make into build/drive-sync
 bin/test                builds and runs build/tests/drive-sync-tests offscreen
 bin/install             bin/build, then makepkg -fsi with BUILDDIR/PKGDEST under build/
 bin/harness             builds tools/harness into build/harness and runs it with the given options
+src/accountlist.{h,cpp}  the window's accounts: one Backend per account the resolver lists (or the view with no account), the selection, in-place adoption with one; QML's "backend" is current()
 src/accounts.{h,cpp}    the one resolver: legacy or accounts mode, every account's BackendPaths (paths and unit names), notices, labels; --account and chooseAccounts (which accounts a command acts on)
 src/accountmove.{h,cpp}  the move of the single config to account1: plannedMoves, moveBlocker, moveToAccounts with its journal and rollback; `drive-sync accounts [--migrate]`
 src/main.cpp            commands run headless (status, sync, pause, resume, takeover, fix, deletes, signin, setup, settings, folders, accounts, and run-condition, run, notify, watchdog, fix-run for the units); otherwise the window
@@ -98,6 +99,7 @@ src/notifier.{h,cpp}    notify (ExecStopPost) and watchdog: the port of drive-sy
 src/takeover.{h,cpp}    detect, apply with rollback, undo; `drive-sync takeover`; checkPackagedUnits and foreignDropIns (packaged units and template instances, by Id); findOldDriveSync (an old drive-sync next to accounts)
 src/oauthclient.{h,cpp}  shippedOAuthClient(): the Google client, compiled in only from the git-ignored src/oauthclient.local.h (template: src/oauthclient.local.h.example)
 src/signin.{h,cpp}      `drive-sync signin [--abandon]`: rclone's browser flow creates the drive-sync remote, or refreshes the config's remote
+src/signin-page.{html,qrc}  the page rclone shows after Google (a Go html/template with @MARKER@ text slots), compiled in with the logo; signInPage() fills it
 src/firstsetup.{h,cpp}  `drive-sync setup --folder`: refusals, default filters, the new user's config, startFix, then the timers
 src/setupcontroller.{h,cpp}  the window's side of signin and setup; Cancel sends SIGTERM to the signin child alone
 src/settingscommand.{h,cpp}  `drive-sync settings`: show; interval (config + timer drop-in) and guard at once; folder, filters and --skip through startFix with the settings-change mark
@@ -112,6 +114,7 @@ src/pluginsetup.{h,cpp} links the shipped bar widget and enables it through `oma
 src/theme.{h,cpp}       Omarchy accent and Hyprland rounding (from the skill template)
 src/translator.{h,cpp}  Omarchy language, JSON catalogs (from the skill template)
 src/Main.qml            window, shortcuts, layout
+src/AccountSelector.qml one chip per account (dot in its tone, label) from two accounts on; a click, [ or ] shows another, never while a dialog or the help is open
 src/StatusPanel.qml     headline, details, the resolver's notices, progress, warning chips
 src/RunsPage.qml        run list; RunDetail.qml shows the picked run
 src/ConflictsPage.qml   conflict copies
@@ -134,8 +137,8 @@ src/format.js           relative times, durations, sizes
 src/i18n/*.json         en (plural forms only) and pt-BR
 tests/                  Qt Test suite
 tools/harness/          offscreen harness: the real Main.qml over a made-up drive-sync, saved as a PNG
-plugin/                 Omarchy bar widget (id drive-sync), installed to /usr/share/drive-sync/omarchy-plugin; reads `drive-sync status --json`
-site/                   project page on GitHub Pages (cateim.github.io/drive-sync): index.html, privacy.html, terms.html, style.css, i18n.js (pt-BR and the EN/PT switch)
+plugin/                 Omarchy bar widget (id drive-sync), installed to /usr/share/drive-sync/omarchy-plugin; reads `drive-sync status --json --all` (version 3)
+site/                   project page on GitHub Pages (drive-sync.selflabs.org): index.html, privacy.html, terms.html, style.css, i18n.js (pt-BR and the EN/PT switch)
 .github/workflows/pages.yml  publishes site/, copying the icon and window-runs.png in from assets/
 docs/superpowers/       git-ignored, local only: design (specs/) and step plans (plans/)
 pkgbuild/               PKGBUILD, .desktop, units/ (/usr/lib/systemd/user: the plain drive-sync, drive-sync-watchdog and drive-sync-fix user units, and the templates drive-sync@.service, drive-sync@.timer and drive-sync-fix@.service, one instance per account)
@@ -147,17 +150,19 @@ assets/images/          README pictures: window-*.png from bin/harness over a ma
 
 ```sh
 bin/build            # about 30 s from clean
-bin/test             # 388 cases, about 34 s (twelve run real rclone on temp folders)
+bin/test             # 421 cases, about 38 s (fourteen run real rclone on temp folders)
 bin/install          # needs sudo (pacman -U); run it in a real terminal
 bin/harness --scenario running --clock "h:mm AP" --out build/shot.png   # the window offscreen, made-up data; options atop tools/harness/harness.cpp
 makepkg -f           # from pkgbuild/, with BUILDDIR and PKGDEST set as in bin/install, to check packaging without sudo
-build/drive-sync status --json   # the state as the bar sees it (0.13 s with a fresh conflict cache)
+build/drive-sync status --json --all   # the state as the bar sees it, every account, version 3 (0.13 s with a fresh conflict cache)
 build/drive-sync status --account account1 --json   # one account; --account <id> comes first, on every command but setup, takeover, watchdog, accounts
-(cd plugin && node --test tests/*.test.mjs)   # bar widget, 29 cases; the glob is required on Node 22
+drive-sync open --account account2   # the window on that account (an id not listed: exit 1, chooseAccounts' message); the bar's rows run it
+(cd plugin && node --test tests/*.test.mjs)   # bar widget, 51 cases; the glob is required on Node 22
 build/drive-sync takeover --check              # read-only: what a takeover would move, or what blocks it
 drive-sync accounts [--json]                   # read-only: mode, accounts, and whether the move to account1 can go (installed binary only; --migrate moves)
 bin/harness --scenario setup-offer --keys o --out build/shot.png   # first setup; also setup-signing-in, setup-folder, signin-needed
 bin/harness --managed --keys ",w^2w>w" --out build/shot.png   # Settings, Cloud folders page; ^3 Filters, ~X types an X
+bin/harness --scenario two-accounts --keys "]" --out build/shot.png   # the selector, account2 shown; [ the previous, --select <id> before the keys
 omarchy plugin validate plugin                # needs the folder path, not the plugin id
 ```
 
@@ -177,6 +182,14 @@ there may be none, and an old `config.json` is then ignored and reported
 `BackendPaths::defaults()` is the first account, else `noAccountPaths` (no
 config, plain units, not managed). The takeover lock and the move's
 `migration.json` live in the state root (`BackendPaths::globalState()`).
+The resolver also names each account (`BackendPaths::label`, `accountLabel`
+over the whole set with `AccountRoots::home`: the folder's base name, or its
+path under the home when two folders share one), so the cards, the JSON, the
+status text and the window read one label; `noAccountPaths` and
+`newAccountPaths` take their folder's base name, and paths built by hand
+have none. `windowAccounts(roots)` lists every account the window can show
+(the view with no account alone when there is none), and
+`chooseOpenAccount` reads `drive-sync open --account <id>`.
 
 `buildSnapshot()` (`src/snapshot.cpp`, pure, tested) is the only place: the
 window's `Backend`, `drive-sync status` and, through its JSON, the bar widget
@@ -242,11 +255,48 @@ journal and `singleConfigGone` (no `accounts/`, no `disconnected/`, no
 enabled or active means the single config vanished (the card pre-5.1
 watchdogs gave, "config cannot be read"); a timer that is off (a new
 machine) or a user unit of that name (an undone takeover) says nothing.
-Titles carry no account label in 5.1.
+Since 5.2 every per-account card, and every title a close names, is
+`<title> (<label>)` (`accountCardTitle`, through `tr("%1 (%2)")`: the
+account's label, else its folder's base name): the first card, the
+reminder, the recovery, the timer, the pause and fix reminders, the fix's
+cards and the unconfirmed deletions. The cards about every account (an old
+drive-sync, the move stuck or undone, a stale config, the config gone) keep
+their bare titles. The 14 bare 5.1 titles (`accountCardBareTitles`) are
+dismissed once, before the first labelled card, and only while the resolver
+lists exactly one account: `notify` and `fix-run` (in `main`) and the
+watchdog (after its resolve) set `NotifierPaths::bareTitlesMark` to
+`<stateRoot>/notify-bare-titles.done` then, and `dismissBareTitlesOnce`
+writes that mark first and dismisses only when the write succeeded, never
+while the move's journal exists. With two accounts each bare title is part
+of both accounts' labelled ones, so it is never dismissed.
 
-The window follows the resolver (`windowAccount(roots)`: the first account,
-else `noAccountPaths`, and the notices). `main` gives the `Backend` a
-resolver (`setResolver`), which `reloadConfig` asks first: another id,
+The window holds one `Backend` per account through `AccountList`
+(`src/accountlist.cpp`, step 5.2) over `windowAccounts(roots)` (every
+account, else `noAccountPaths`, and the notices). QML reads the account
+shown as the context property `backend`, which `main` (and the harness)
+sets again to `accountList.current()` on `selectedChanged`, connected
+before the load so it runs before QML's handlers (Task 1 of 5.2 checked
+that bindings and `Connections` follow the swap); `Main.qml` then takes the
+new account's fix step as seen, so a waiting fix shows its banner and never
+opens its dialog by itself. `drive-sync open --account <id>` selects that
+account at start (an id not listed exits 1 before the window exists).
+From two accounts on (`accountList.several`), `AccountSelector` shows one
+chip per account over `accountList.accounts` (rebuilt on every `Backend`'s
+`changed`, so each dot follows its own account); a click, `[` or `]` (both
+wrap) changes the selection, and all three are off while a dialog or the
+help overlay is open, so a typed count, a fix confirmation or a Settings
+save stays with the account it was opened for. Settings' title then names
+`accountList.currentLabel` (its own `currentLabelChanged`). With one
+account none of it shows.
+Each `Backend` gets a resolver from the list that resolves the whole set,
+returns its own entry (by id; with one `Backend` and one entry, that entry
+whatever the id, so a first setup, a takeover, a cancelled setup and the
+move keep the same object) and queues one coalesced `reconcile()`, which
+makes a `Backend` for an account that appeared (through a factory: `main`
+gives each the old drive-sync check), drops the one of an account that
+went (selecting the first and emitting `selectedChanged` before
+`deleteLater`), stores each label and waits like the `Backend` during a
+live move. A `Backend`'s resolver, asked by `reloadConfig` first: another id,
 config, state folder or unit means the window drops every watch (log,
 state folder, config folder) and adopts the new paths, so a first setup, a
 takeover, a cancelled first setup and the move need no restart. Besides the
@@ -260,12 +310,13 @@ asks again each second: between `mkdir accounts/account1` and the config's
 rename the resolver sees no account at all. A systemd answer, or a `find`,
 started for the paths it left is dropped and asked again. `notices`
 (`{kind, path}`) are lines in `StatusPanel`. When the layout is legacy or a
-journal exists, `main` calls `startMove()`: a child `drive-sync accounts
+journal exists, `main` calls `startMove()` once, on the selected `Backend`
+(never per `Backend`): a child `drive-sync accounts
 --migrate --json` with no parent, no timeout and its output to
 `/dev/null`, since a move killed halfway waits for the next trigger to
 roll back; then `reloadConfig`. Its exit code is never shown: a stuck move
-shows through the notice. The window's own commands still carry no
-`--account` (5.2 adds it).
+shows through the notice. Every other command the window runs names the
+account it shows (`Backend.accountId`) right after the command word.
 
 - A run is "running" when systemd says the service is active, when the resync
   pause mark holds a live `drive-sync.sh` pid, or when the open run wrote to
@@ -282,14 +333,25 @@ shows through the notice. The window's own commands still carry no
   first error that is not the generic "Bisync aborted" line.
 - The JSON (`snapshotToJson`, version 2) always has the same 20 keys (version
   1 plus `managed`, `paused`, `pausedUntil`); times are Unix seconds, `0` when
-  unknown. The widget rejects any other version, so a change to the keys means
-  a new version and a widget that reads it, installed together. With several
+  unknown. The widget accepts one version only (version 3, through `--all`,
+  since 5.2), so a change to the keys means a new version and a widget that
+  reads it, installed together. With several
   accounts, `status` reads them all with one `show` and one `list-timers`
   (`gatherAccounts`), `--json` prints the worst one (`worstAccount`: error,
-  warning, busy, ok, the first on a tie), and the text prints
-  `<id>: <status>` per account (one account: the old single line). The
-  resolver's notices (`staleConfig`, `moveStuck`) go to stderr only, so the
-  bar never reads them.
+  warning, busy, ok, the first on a tie), and the text prints a block per
+  account from two on, `<label> (<id>)` then the line indented by two
+  spaces (one account, or the view with no account: the old single line,
+  byte for byte). `--json --all` (`statusListToJson`, version 3; `--all`
+  needs `--json`) has exactly `version`, `now`, `tone`, `worst` (the worst
+  account's id), `canSyncNow` (any account's) and `accounts`, each built by
+  `accountToJson`: the 18 keys version 2 has besides `version` and `now`,
+  plus `id`, `label` and `folder`. Both build those 18 keys through one
+  helper, so plain `--json` keeps version 2's bytes for an older widget
+  (`versionTwoIsUnchanged`); the 5.2 widget reads `--all`. With no account,
+  the view with no account is listed (empty `id`, `managed` false) unless
+  its headline is `noLog`: then `accounts` is empty, `tone` `error` and
+  `worst` empty. The resolver's notices (`staleConfig`, `moveStuck`) go to
+  stderr only, so the bar never reads them.
 - A pause is a mark file, not a stopped timer: `run-condition` skips each tick
   while it holds and clears it at the first tick after its end, so "paused"
   lasts until a run really starts and survives a reboot.
@@ -563,6 +625,27 @@ shows through the notice. The window's own commands still carry no
   hand; `drive-sync.pro` and the test project define `HAVE_LOCAL_OAUTH` only
   when it exists, and qmake must run again after it appears (`bin/build`
   does).
+- **The page after Google is DriveSync's, through rclone** (tried with
+  rclone 1.75.2 on 2026-11-20). `config create` and `config update ...
+  config_refresh_token true` both take `config_template_file <file>`, and
+  rclone serves that file at `http://127.0.0.1:53682/` when the browser comes
+  back; the option is not written into `rclone.conf`. `signin` passes
+  `signInPage()` (`src/signin-page.html`, its text through `tr()` in the
+  Omarchy language, escaped with braces as `&#123;`, comments and the logo's
+  `<desc>` stripped) from a 0600 `QTemporaryFile` that lives as long as the
+  command; when it cannot be written the option is left out and rclone shows
+  its own page. rclone renders it with Go's html/template, so what Google's
+  error redirect carries comes out escaped: `.Name` is always rclone's
+  "Auth Error", `.Description` is "No code returned by remote server:
+  <error>: <error_description>" in rclone's English, and `.Code` and
+  `.HelpURL` were empty.
+  The page shows with `.OK` true as soon as Google returns a code, before
+  rclone trades it for the token, so its text never says the sign-in
+  worked: DriveSync shows that. A path that does not exist stops rclone
+  before the browser opens, and a template that does not parse (a stray
+  double brace, even inside an HTML comment) crashes rclone when the browser
+  comes back. The real-rclone tests set `RCLONE_DRIVE_TOKEN_URL` to a closed
+  local port (create honours it too), so no test reaches Google.
 - **Every test reaches rclone in a sandbox.** `initTestCase` points
   `RCLONE_CONFIG` at a temp file and puts a fake `xdg-open` first on `PATH`
   for the whole binary. An rclone `alias` remote names bisync's listings after
@@ -581,19 +664,44 @@ shows through the notice. The window's own commands still carry no
   take 14 s of CPU. `synclog.cpp` builds fixed-offset times by hand, and
   `Backend` compares against `currentDateTimeUtc()`. Parsing the 3 MB tail of
   the real log takes about 90 ms.
+- **`omarchy notification dismiss` matches any substring of a title on
+  screen.** `/usr/bin/omarchy-notification-dismiss` passes its argument to
+  `omarchy-shell -q notifications dismiss`, whose handler
+  (`/usr/share/omarchy/shell/plugins/notifications/Service.qml`, checked
+  2026-11-20) closes every toast whose summary contains it: case
+  sensitive, plain substring, all at once. So a label always sits between
+  fixed text (`<title> (<label>)`): put first, `Drive stopped syncing` would
+  close `My Drive stopped syncing`. A new per-account title must not be a
+  substring of another one (`cardTitlesNeverMatchAnotherAccount`).
 - **Do not watch `~/.local/state` itself**: other programs write there all
   the time. The folder is watched only while the log does not exist.
 - **The repo lives under `~/Drive`**, mirrored by drive-sync. Its filters skip
   `/GitHub/**/build/**`, so every build output (qmake, tests, makepkg) goes
   under `build/`. Do not let makepkg write `pkgbuild/src` or `pkgbuild/pkg`.
-- **The bar widget depends on two names.** It runs `drive-sync status --json`
-  from the PATH, and its `W` key (`plugin/open-history.sh`) focuses the window
-  whose Hyprland class is exactly `drive-sync`. Renaming the binary or changing
+- **The bar widget depends on two names.** It runs `drive-sync status --json
+  --all` from the PATH, and its `W` key (`plugin/open-history.sh`) focuses the
+  window whose Hyprland class is exactly `drive-sync`, or starts it, with
+  `drive-sync open --account <id>` when a click names an account. Renaming
+  the binary, the `open` command or its `--account` option, or changing
   `setDesktopFileName` breaks it, so change the widget in the same commit.
 - `QString::arg` reads `%1000` as placeholder `%10`: build microsecond values
   as numbers, never by appending zeros after `%1`.
 - clangd shows "file not found" for every Qt header because there is no
   `compile_commands.json`; the qmake build is the truth.
+- **After the repository moves, `make -B` once in `build/tests`.** The test
+  object compiled before the 2026-11-20 rename kept the old `SRCDIR`
+  (`.../GitHub/drivesync/...`): qmake's new `DEFINES` do not make `make`
+  rebuild it, so 8 cases failed on paths until
+  `make -B -j"$(nproc)"` there. A failure naming the old folder is that.
+- **QML follows a swapped context property.** The window switches accounts
+  by setting `backend` again to another `Backend` (`setContextProperty` on
+  `selectedChanged`): every binding and `Connections` in every QML file
+  then reads the new object and stops hearing the old one (checked on Qt
+  6.12 by `contextPropertySwapRebinds`, and in `qrc:/Main.qml` through the
+  harness's `--select`). That connection is made before `engine.load`, so
+  it runs before QML's own `onSelectedChanged` handlers, which therefore
+  already see the new `backend`. Never delete the old `Backend` before the
+  swap: `AccountList` emits `selectedChanged` first, then `deleteLater`.
 - Looking at the window without touching the desktop: `bin/harness` loads
   `qrc:/Main.qml` offscreen with fake `BackendPaths` (a made-up log, Drive,
   state dir, a fake `systemctl`), a fake `omarchy`, a fake `drive-sync` for
@@ -605,12 +713,22 @@ shows through the notice. The window's own commands still carry no
   with no drive-sync at all, which shows the setup banner. A new context property in
   `main.cpp` needs the same line in `tools/harness/harness.cpp`, and a new
   source file the window uses needs `tools/harness/harness.pro`. Like
-  `main`, it gives the `Backend` a resolver, over made-up roots in its temp
-  folder (`config/`, `app/`, `units/`, the fake paths as the base): an
-  account the roots hold wins (`config-error`, `stale-config`,
-  `move-stuck`), and with none the fake paths stand in, so the older
-  scenarios (a managed drive-sync with no config file) look as they did.
-  It calls `startMove()` as `main` does, and the fake `drive-sync` answers
+  `main`, it builds an `AccountList` (context property `accountList`, and
+  `backend` moved to `current()` on `selectedChanged`) over made-up roots
+  in its temp folder (`config/`, `app/`, `units/`, the fake paths as the
+  base, `home` the temp folder it exports as `HOME`): an account the roots
+  hold wins (`config-error`, `stale-config`, `move-stuck`, `two-accounts`),
+  and with none the fake paths stand in, so the older scenarios (a managed
+  drive-sync with no config file) look as they did. `--select <id>` selects
+  that account after the load and the first wait, through the same swap a
+  click or `]` makes (`--keys` sends `[` and `]` too); the status line
+  prints the shown account's headline and `account=<id> accounts=<count>`.
+  The harness has no pointer, so a chip's click and its tooltip are seen
+  only in the real window. Its fake `drive-sync` logs each call as
+  made, then drops `--account <id>` after the command before it answers;
+  its `settings --json` answer is the same made-up folder for every
+  account.
+  It calls `startMove()` once, as `main` does, and the fake `drive-sync` answers
   `accounts --migrate --json` (`stuck` for `move-stuck`, else
   `notNeeded`); never with `--real`, where `self` would move this machine.
 - The Material `Button` background (an elevation effect) does not render in
@@ -655,7 +773,16 @@ shows through the notice. The window's own commands still carry no
   plain `run-condition` with no account at all and `singleConfigGone`
   exits 255 with the loader's error, a failure systemd records, not a skip
   (`configGone` is its card). An instance whose account is not listed
-  still skips (1). The window's children pass no `--account` in 5.1.
+  still skips (1). Since 5.2 every child the window runs names its account
+  at index 1 (`sync --account account1 --json`): `Backend::control` (sync,
+  pause, resume, fix, deletes), `SettingsController` (built when queued, so
+  a queued change and the read after it keep their account; its `account`
+  is set when Settings opens, and a read of another account fills nothing),
+  `FolderTree` in Settings and `SetupController::signIn(account)` for a
+  sign-in again (no `signin --abandon` after cancelling one). The view with
+  no account (empty id) passes none, and `accounts --migrate`, `takeover`,
+  `setup`, and the first setup's `signin`, `signin --abandon` and
+  `folders --remote drive-sync:` never carry one.
 - **The move to accounts (step 5.1, `src/accountmove.cpp`).** `accounts/`
   under `~/.config/drive-sync` decides the mode, so `config.json` moves last
   and `<configRoot>/accounts/account1` is made just before it: until then
@@ -781,8 +908,39 @@ shows through the notice. The window's own commands still carry no
   for a few seconds the icon shows the unknown state. Every reload also logs
   "ShellIpc ... another handler is registered"; IPC keeps answering.
 - The IPC function cannot be named `sync`: it collides with the
-  `DriveSyncService` id. It is `syncNow()`, and it checks `canSyncNow` first.
-- `drive-sync status --json` output is parsed in
+  `DriveSyncService` id. It is `syncNow()`: it answers `started` when any
+  account can sync now (`anyCanSync`) and runs one sync per such account.
+- The widget polls `drive-sync status --json --all` and accepts version 3
+  only (`parseStatus` in `DriveSyncModel.js`); plain `--json` stays version
+  2 for an older widget still loaded until the shell reloads. The icon shows
+  the account the JSON names `worst` (`shownAccount`); an empty list is
+  `noLog`. With one account the panel is 5.1's; from two on, a `Repeater`
+  lists each account with its own sync, pause or resume and folder, and a
+  general row syncs every account that can, pauses all or resumes the paused
+  ones, and opens the window. The cursor walks `panelTargets`; `S`, `P`, `O`
+  and `W` act on the account under it (`cursorAccount`), else on all. The
+  quick sync (right click, `S`, IPC `syncNow()`) runs one `drive-sync sync
+  --account <id>` per account whose `canSyncNow` is true, in turn, because
+  the plain `sync` stops at the first account that refuses.
+- Untrusted JSON on its way to argv: every command comes from a builder in
+  `DriveSyncModel.js` (`syncCommand`, `pauseCommand`, `resumeCommand`,
+  `openArgs`...), which puts `--account <id>` right after the command word
+  and returns null for an id that does not match `^account([1-9][0-9]?)$`;
+  an entry with such an id is dropped whole by `parseAccount`. A folder is
+  kept only when absolute with no control character, and the folder button,
+  `O` and the middle click open the account's own `folder` from the JSON
+  (`folderToOpen`): `$HOME/Drive` only when no account is known at all, and
+  nothing for an account whose folder was refused. Labels (folder names) go
+  into translated text through `fillText`, never chained `arg()`, which
+  would fill a `%2` inside a label. A source-level test checks that every
+  `command` in `DriveSyncService.qml` comes from those builders.
+- `open-history.sh` takes one optional argument, the account to open the
+  window on: only `^account[1-9][0-9]?$` passes, as one argument to
+  `drive-sync open --account`; anything else starts the window with no
+  account. An open window is only focused, whatever the argument. Its node
+  test runs it with nothing but fakes on `PATH`, so a missing fake can never
+  reach the real `uwsm-app` and open this machine's window.
+- `drive-sync status --json --all` output is parsed in
   `StdioCollector.onStreamFinished`, never in `onExited`: the two have no
   fixed order. A binary that fails to start ends the process without ending
   the stream or emitting `exited`, so `onRunningChanged` applies an empty
@@ -795,6 +953,13 @@ shows through the notice. The window's own commands still carry no
   it at 200 characters on one line.
 - `open-history.sh` finds the window by exact class `drive-sync`, because
   `omarchy-launch-or-focus` also matches titles.
+- A catalog key the installed widget reads never changes meaning: a new
+  meaning is a new key. Until `omarchy restart shell` the running shell keeps
+  the old widget, but Omarchy's `Translations.qml` reloads `plugin/i18n/*.json`
+  as soon as the package replaces them, so a key whose text changed (`Open
+  %1` where 5.1 read `Open ~/Drive`) shows a bare `%1` there. The node test
+  `keys the installed widget reads keep their text` compares every key the
+  widget at HEAD reads with its HEAD text in both catalogs.
 
 ## Deploy
 
@@ -821,13 +986,20 @@ and open the HTML file; delete the copies afterwards, since `site/` syncs to Dri
 
 - **`site/privacy.html` and `site/terms.html` are what Google's sign-in
   screen links to.** The Branding of the DriveSync Google Cloud project
-  points at `https://cateim.github.io/drive-sync/`, `.../privacy.html` and
-  `.../terms.html`, with `cateim.github.io` as the authorized domain
-  (verified in Search Console through the `cateim.github.io` user-site
-  repository). A change in what the app reads, stores or sends changes the
+  points at `https://drive-sync.selflabs.org/`, `.../privacy.html` and
+  `.../terms.html`, with `selflabs.org` as the authorized domain (the
+  brand was never approved on `cateim.github.io`, so on 2026-11-20 the page
+  moved to its own subdomain). The page is GitHub Pages with a custom
+  domain: the repo's Pages `cname` is `drive-sync.selflabs.org` (set
+  through the API, no CNAME file, since the workflow publishes), Cloudflare
+  has a DNS-only CNAME to `cateim.github.io` (never proxied, or GitHub's
+  certificate fails), and `selflabs.org` is a verified Pages domain of the
+  CaTeIM account (TXT `_github-pages-challenge-cateim`), which keeps anyone
+  else from taking the subdomain. `cateim.github.io/drive-sync/` redirects
+  there. A change in what the app reads, stores or sends changes the
   privacy page, its date and its pt-BR text in `site/i18n.js` in the same
-  commit. Renaming either page or the repository moves the URL with no
-  redirect, so it means updating the Branding links the same day.
+  commit. Renaming either page moves the URL with no redirect, so it means
+  updating the Branding links the same day.
 - Every element with `data-i18n` (or `-content`, `-alt`) needs its pt-BR
   line in `site/i18n.js`; a missing one stays English and warns in the
   console.

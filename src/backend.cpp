@@ -809,7 +809,12 @@ void Backend::pauseUntilResumed() { control({"pause"}); }
 void Backend::resume() { control({"resume"}); }
 
 void Backend::control(const QStringList &arguments) {
-    run(m_paths.self, arguments + QStringList{"--json"}, [this](bool, const QByteArray &output) {
+    // The account goes right after the command word: takeAccountOption reads
+    // only the first two arguments, so a value can never pass for it.
+    QStringList full = arguments;
+    if (!m_paths.id.isEmpty() && !full.isEmpty())
+        full = QStringList{full.first(), "--account", m_paths.id} + full.mid(1);
+    run(m_paths.self, full + QStringList{"--json"}, [this](bool, const QByteArray &output) {
         const QJsonObject answer = QJsonDocument::fromJson(output).object();
         if (!answer.value("ok").toBool()) {
             const QString error = answer.value("error").toString();

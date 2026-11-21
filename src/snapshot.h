@@ -118,11 +118,18 @@ struct Snapshot {
     QDateTime pausedUntil;            // invalid while paused means until the user resumes
 };
 
+struct BackendPaths;
+
 Snapshot buildSnapshot(const SnapshotSources &src);
 // Version 2 of the "drive-sync status --json" contract (version 1 plus
 // managed, paused and pausedUntil). Every key is always
-// present; times are Unix seconds, 0 when unknown. The bar widget reads it.
+// present; times are Unix seconds, 0 when unknown. The 5.1 bar widget reads
+// it, so its bytes never change.
 QJsonObject snapshotToJson(const Snapshot &s, const QDateTime &nextRun, const QDateTime &now);
+// One account of version 3 ("drive-sync status --json --all"): the 18 keys
+// version 2 has besides version and now, plus id, label (the account's, else
+// its folder's base name) and folder (the clean path of its synced folder).
+QJsonObject accountToJson(const Snapshot &s, const BackendPaths &account, const QDateTime &nextRun);
 // "ok" | "busy" | "warning" | "error": how urgent a headline is.
 QString toneFor(const QString &status);
 // The two systemctl calls every reader makes, so they cannot drift apart.

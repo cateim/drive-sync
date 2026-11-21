@@ -663,7 +663,7 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
                const NotifierPaths &notify, const QString &configError) {
     // A fix unit killed during a final run let through (TimeoutStartSec, a
     // power cut) left that run unchecked, and this unit has no ExecStopPost.
-    notifyUnconfirmedDeletes(notify, checkConfirmedRun(paths.appState, config.logFile));
+    notifyUnconfirmedDeletes(paths, notify, checkConfirmedRun(paths.appState, config.logFile));
     // A change made in Settings becomes the config in the preparing step.
     SyncConfig current = config;
     // Read again after every step: the unit works until the fix waits for
@@ -689,7 +689,7 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
             else {
                 UnconfirmedDeletes extra;
                 error = finishStep(paths.appState, current, tools, &state, &extra);
-                notifyUnconfirmedDeletes(notify, extra);
+                notifyUnconfirmedDeletes(paths, notify, extra);
             }
         }
         if (!error.isEmpty()) {
@@ -706,7 +706,7 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
                 const FixLock lock(paths.appState);
                 writeFix(paths.appState, state);
             }
-            notifyFixNeedsYou(notify, state, true);
+            notifyFixNeedsYou(paths, notify, state, true);
             return 1;
         }
         // From the first base on, the config is no longer one to undo.
@@ -735,6 +735,6 @@ int runFixUnit(const BackendPaths &paths, const SyncConfig &config, const FixToo
         if (!written)
             return 1;
         if (fixWaiting(state.step))
-            notifyFixNeedsYou(notify, state, false);
+            notifyFixNeedsYou(paths, notify, state, false);
     }
 }

@@ -21,6 +21,9 @@
 //                                        that is ignored (implies --managed)
 //                                        move-stuck: the move to accounts stopped halfway (its journal says
 //                                        stuck; implies --managed)
+//                                        two-accounts: account1 (Drive, the usual runs and conflict copies) and
+//                                        account2 (Drive2, the same runs, then lost listings) in accounts/
+//   --select <id>                        selects that account after the window is up, as a click or ] does
 //   --clock "<Qt format>"                the bar clock; without it, the system locale's hours
 //   --pause none|hour|forever|ended      a pause mark; --managed: DriveSync's own units
 //   --takeover managed|none|offer|running|blocked|failed   managed by default: "none" means no
@@ -33,8 +36,9 @@
 //                                        s Space, p P, o T, f F, D D, c C, l L, x X, r Enter,
 //                                        b Backspace, w waits a second, I I, Q Q (typed into a field
 //                                        it must not quit), "," the settings, ^ Ctrl with the next
-//                                        key (^2 Ctrl+2, ^s Ctrl+S), > Right, < Left, ~ the next
-//                                        character typed as it is (~J types a J)
+//                                        key (^2 Ctrl+2, ^s Ctrl+S), > Right, < Left, [ and ] the
+//                                        previous and the next account, ~ the next character typed
+//                                        as it is (~J types a J)
 //   --settings-interval N --settings-max-delete N   what the fake "settings --json" says (15 and 5)
 //   --slow-settings                      that answer takes a second, as a slow disk or a busy CPU can
 //   --width N --height N                 1000x700 by default
@@ -54,6 +58,7 @@
 #include <QTemporaryDir>
 #include <QtTest>
 
+#include "accountlist.h"
 #include "accounts.h"
 #include "backend.h"
 #include "clockformat.h"
@@ -231,20 +236,39 @@ esac
                       dir.filePath("proc"), systemctl, QStandardPaths::findExecutable("find"), dir.filePath("app"),
                       QString(), QString()};
     fake.managed = args.contains("--managed") || fix != "none" || scenario == "signin-needed" || scenario == "config-error"
-                   || scenario == "stale-config" || scenario == "move-stuck";
+                   || scenario == "stale-config" || scenario == "move-stuck" || scenario == "two-accounts";
     // The resolver reads these made-up roots, as the window reads the home.
     AccountRoots roots;
     roots.configRoot = dir.filePath("config");
     roots.stateRoot = fake.appState;
     roots.userUnits = dir.filePath("units");
     roots.base = fake;
-    // A valid config for account1, naming the made-up log and folder.
-    auto writeConfig = [&](const QString &file) {
-        const QJsonObject config{{"version", 1}, {"remote", "gdrive:"}, {"localPath", fake.drive},
+    // The HOME exported above: labels are made as on a real home.
+    roots.home = dir.path();
+    // A valid config, naming the made-up log and folder (account1's unless
+    // told otherwise).
+    auto writeConfig = [&](const QString &file, const QString &drive = QString(), const QString &logFile = QString()) {
+        const QJsonObject config{{"version", 1}, {"remote", "gdrive:"}, {"localPath", drive.isEmpty() ? fake.drive : drive},
                                  {"workDir", fake.appState + "/bisync"}, {"filtersFile", dir.filePath("config/filters.txt")},
-                                 {"logFile", fake.log}, {"rcloneFlags", QJsonArray()}, {"runOnlyWhen", ""}};
+                                 {"logFile", logFile.isEmpty() ? fake.log : logFile}, {"rcloneFlags", QJsonArray()},
+                                 {"runOnlyWhen", ""}};
         put(file, QJsonDocument(config).toJson());
     };
+    if (scenario == "two-accounts") {
+        // account2: its own folder with two files, and its log the same runs
+        // then the failed scenario's lost listings.
+        writeConfig(dir.filePath("config/accounts/account1/config.json"));
+        writeConfig(dir.filePath("config/accounts/account2/config.json"), dir.filePath("Drive2"),
+                    dir.filePath("drive-sync-2.log"));
+        put(dir.filePath("Drive2/Notes/plan.md"), "x");
+        put(dir.filePath("Drive2/budget.ods"), "x");
+        const QDateTime s = now.addSecs(-200);
+        put(dir.filePath("drive-sync-2.log"),
+            (log + L(s, "INFO", kStart)
+             + L(s, "ERROR", "Bisync critical error: cannot find prior Path1 or Path2 listings, likely due to critical error on prior run ")
+             + L(s, "ERROR", "Bisync aborted. Error is retryable without --resync due to --resilient mode."))
+                .toUtf8());
+    }
     if (scenario == "stale-config") {
         writeConfig(dir.filePath("config/accounts/account1/config.json"));
         writeConfig(dir.filePath("config/config.json"));
@@ -356,7 +380,11 @@ esac
                                                  {"Archive", "Documents", "Notes", "Photos", "Spreadsheets"}));
     put(dir.filePath("folders-Archive.json"), level({"Archive/2019", "Archive/2020"}, {"Archive/2019", "Archive/2020"}));
     put(dir.filePath("drive-sync"),
-        QString("#!/bin/sh\necho \"$*\" >> '%2'\n[ \"$*\" = 'signin --json' ] && { %3; }\n"
+        QString("#!/bin/sh\necho \"$*\" >> '%2'\n"
+                // Logged as made; then "--account <id>" right after the
+                // command is dropped, so the answers below match either way.
+                "if [ \"$2\" = --account ] && [ $# -ge 3 ]; then c=$1; shift 3; set -- \"$c\" \"$@\"; fi\n"
+                "[ \"$*\" = 'signin --json' ] && { %3; }\n"
                 "case \"$1\" in\n"
                 "  settings) if [ \"$2\" = --json ]; then %5cat '%4/settings.json'; else echo '{\"ok\":true,\"error\":\"\",\"fixStarted\":false}'; fi; exit 0 ;;\n"
                 "  accounts) echo '%6'; exit %7 ;;\n"
@@ -381,20 +409,21 @@ esac
     // account there, the made-up paths stand in for one, so every older
     // scenario (a managed drive-sync with no config file) looks as before.
     const AccountRoots realRoots = real ? AccountRoots::defaults() : AccountRoots();
-    const std::function<WindowAccount()> resolve = [&]() -> WindowAccount {
+    const std::function<WindowAccounts()> resolve = [&]() -> WindowAccounts {
         if (real)
-            return windowAccount(realRoots);
-        WindowAccount account = windowAccount(roots);
-        if (account.paths.id.isEmpty())
-            account.paths = fake;
-        return account;
+            return windowAccounts(realRoots);
+        WindowAccounts window = windowAccounts(roots);
+        if (window.accounts.size() == 1 && window.accounts.first().id.isEmpty())
+            window.accounts.first() = fake;
+        return window;
     };
-    Backend backend(resolve().paths);
-    backend.setResolver(resolve);
-    // The move runs as a child of the fake drive-sync, never with --real,
-    // where it would be this machine's move.
+    // One Backend per account, as main makes them; none looks for an old
+    // drive-sync, which would read this machine.
+    AccountList accountList(resolve, [](const BackendPaths &paths) { return new Backend(paths); });
+    // The move runs once, as a child of the fake drive-sync, never with
+    // --real, where it would be this machine's move.
     if (!real && (readAccountLayout(roots.configRoot).mode == "legacy" || moveInProgress(roots.stateRoot)))
-        backend.startMove();
+        accountList.current()->startMove();
     TakeoverSetup takeoverSetup(dir.filePath("drive-sync"));
     takeoverSetup.check();
     SetupController setupController(dir.filePath("drive-sync"), dir.filePath("Drive"));
@@ -432,7 +461,13 @@ esac
     engine.rootContext()->setContextProperty("clockFormat", &clockFormat);
     engine.rootContext()->setContextProperty("translator", &translator);
     engine.rootContext()->setContextProperty("theme", &theme);
-    engine.rootContext()->setContextProperty("backend", &backend);
+    // As main: "backend" is the account shown, moved on every selection,
+    // connected before the load so it runs before QML's own handlers.
+    engine.rootContext()->setContextProperty("accountList", &accountList);
+    engine.rootContext()->setContextProperty("backend", accountList.current());
+    QObject::connect(&accountList, &AccountList::selectedChanged, &engine, [&engine, &accountList] {
+        engine.rootContext()->setContextProperty("backend", accountList.current());
+    });
     engine.rootContext()->setContextProperty("pluginSetup", &pluginSetup);
     engine.rootContext()->setContextProperty("takeoverSetup", &takeoverSetup);
     engine.rootContext()->setContextProperty("setupController", &setupController);
@@ -452,6 +487,12 @@ esac
         writeTheFix();
         QTest::qWait(400);
     }
+    // After the load, so it goes through the same swap a click or ] makes.
+    if (const QString select = opt("--select", ""); !select.isEmpty()) {
+        if (!accountList.selectId(select))
+            printf("no account %s\n", qPrintable(select));
+        QTest::qWait(1000);
+    }
 
     bool ctrl = false, literal = false;
     for (const QChar k : keys) {
@@ -468,6 +509,8 @@ esac
         else if (k == ',') QTest::keyClick(window, Qt::Key_Comma);
         else if (k == '>') QTest::keyClick(window, Qt::Key_Right);
         else if (k == '<') QTest::keyClick(window, Qt::Key_Left);
+        else if (k == '[') QTest::keyClick(window, Qt::Key_BracketLeft);
+        else if (k == ']') QTest::keyClick(window, Qt::Key_BracketRight);
         else if (k == 't') QTest::keyClick(window, Qt::Key_Tab);
         else if (k == 'h') QTest::keyClick(window, Qt::Key_Question, Qt::ShiftModifier);
         else if (k == 'd') QTest::keyClick(window, Qt::Key_Down);
@@ -490,8 +533,10 @@ esac
     }
     QTest::qWait(400);
     window->grabWindow().save(out);
-    printf("status=%s runs=%lld conflicts=%lld -> %s\n", qPrintable(backend.status()), (long long)backend.runs().size(),
-           (long long)backend.conflicts().size(), qPrintable(out));
+    const Backend *shown = accountList.current();
+    printf("status=%s runs=%lld conflicts=%lld account=%s accounts=%d -> %s\n", qPrintable(shown->status()),
+           (long long)shown->runs().size(), (long long)shown->conflicts().size(), qPrintable(shown->accountId()),
+           accountList.count(), qPrintable(out));
     // What the filters editor holds, when it is on screen: typing into it
     // must reach it and nothing else.
     if (QObject *editor = window->findChild<QObject *>("filtersEditor"); editor && keys.contains('~'))

@@ -22,12 +22,19 @@ and a bar widget, driven from the keyboard.
 - **Bar widget**: a cloud on the Omarchy bar with the same state as the
   window (a check when in sync, arrows while syncing, a clock while paused,
   an alert on trouble), and a panel with the last sync, the next run and what
-  failed.
+  failed. With two or more accounts the icon shows the one that needs you
+  most, and the panel has one block per account.
+- **Accounts**: each synced folder is an account with its own config, state
+  and units. From two accounts on, the window shows one chip per account
+  above the headline, and a click, `[` or `]` shows another; every key and
+  button then acts on that one. With one account it looks as it always did.
 - **Controls**: sync now; once DriveSync runs drive-sync, pause for an hour,
   until the next 8:00 or until you resume. A pause survives a reboot.
 - **Notifications**: a card when a run fails, a reminder every hour while it
   keeps failing, and a note once it works again; an hourly check for a timer
-  that is off; a daily reminder of a pause with no end.
+  that is off; a daily reminder of a pause with no end. Each card about one
+  account names it in its title (`Drive stopped syncing (Drive2)`), so one
+  account's recovery never closes another account's card.
 - **First setup**: with no drive-sync at all, signs in to Google in the
   browser, takes the folder you pick and starts the sync after a dry run you
   confirm; when Google later drops the sign-in, `I` signs in again.
@@ -75,6 +82,10 @@ afterwards.
 | ------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | <img src="assets/images/window-run-details.png" width="400" alt="A run with what it copied each way, file by file"> | <img src="assets/images/window-conflicts.png" width="400" alt="The conflict copies tab with two copies to sort out, each with its folder, age and size"> |
 
+<p align="center">
+  <img src="assets/images/window-accounts.png" width="600" alt="Two accounts as chips above the headline, Drive with an orange dot and Drive2 with a red one; Drive2 is shown, with its failed sync and the Fix banner">
+</p>
+
 > [!NOTE]
 > The window pictures are the real app drawn offscreen over a made-up log
 > (`bin/harness`), under another Omarchy theme. The bar pictures come from a
@@ -94,6 +105,7 @@ button names its key when the pointer rests on it.
 | `Enter`          | Show the picked conflict copy in the file manager               |
 | `S`              | Sync now                                                        |
 | `O`              | Open the Drive folder                                           |
+| `[`, `]`         | Show the previous or the next account, with two or more         |
 | `P`              | Pause for 1 hour, until 8:00 or until resumed                   |
 | `U`              | Resume, and start a run                                         |
 | `T`              | Set up drive-sync, or take over the one you have, when offered  |
@@ -153,13 +165,24 @@ bar's layout is only changed through `omarchy plugin`. `N` says no, and the
 offer does not come back; delete `~/.local/state/drive-sync-app/bar-declined` to
 be asked again. After a package upgrade, `omarchy restart shell` loads the new
 widget. In its panel, `S` syncs now, `P` pauses for an hour or resumes, and
-`?` lists every key; hovering an icon says what it does.
+`?` lists every key; hovering an icon says what it does. The folder icon,
+`O` and a middle click open the account's own folder, the one DriveSync
+syncs, wherever it is.
 
-The widget reads `drive-sync status --json` (version 2), so it shows what
-the window shows, for the account that needs you most: an account whose
-`config.json` cannot be read is an error of its own ("This account's
-DriveSync config cannot be read", `configError`), and an old drive-sync
-found next to DriveSync's accounts is a line in the panel.
+The widget reads `drive-sync status --json --all` (version 3), so it shows
+what the window shows. The icon is the account that needs you most: an
+account whose `config.json` cannot be read is an error of its own ("This
+account's DriveSync config cannot be read", `configError`), and an old
+drive-sync found next to DriveSync's accounts is a line in the panel. With
+one account the panel is the one above. From two accounts on, it lists one
+block per account (its label, headline, last sync, next run and, when it
+fails, why), each with its own sync now, pause or resume, and folder, and a
+click on a block opens DriveSync on that account (a window that is already
+open is only focused). Below them, one row syncs every account that can,
+pauses every account for an hour or resumes the paused ones, and opens
+DriveSync. `S`, `P`, `O` and `W` act on the account under the cursor, else
+on every account (`O`: the folder of the account the icon shows); a right
+click syncs every account that can.
 
 ## First setup
 
@@ -169,7 +192,9 @@ dialog goes through five steps, and nothing is copied before the last one:
 1. **Sign in to Google.** Your browser opens Google's sign-in page for
    DriveSync, through rclone's own flow (`rclone config create`): the token
    goes from Google into `rclone.conf` and never through DriveSync. The new
-   rclone remote is called `drive-sync`. If the browser does not open, the
+   rclone remote is called `drive-sync`. After Google, the browser shows a
+   DriveSync page that says to go back to DriveSync, where the dialog shows
+   whether the sign-in worked. If the browser does not open, the
    dialog shows the local address to open by hand. Closing the dialog or the
    window while the browser waits (or Ctrl+C on `drive-sync signin`) stops
    rclone alone, never the browser, and removes the half-made remote. A
@@ -398,8 +423,10 @@ restore them in `~/Drive` (or from the Drive trash) and sync again.
 
 ```sh
 drive-sync                 # the window (also: drive-sync open)
-drive-sync status           # one line: the status and any warnings
-drive-sync status --json    # the same state as JSON, for the bar and scripts
+drive-sync open --account <id>   # the window on that account (what a bar row runs)
+drive-sync status           # one line: the status and any warnings (one block per account from two on)
+drive-sync status --json    # the same state as JSON, for scripts (version 2: the account that needs you most)
+drive-sync status --json --all   # every account as JSON (version 3), what the bar reads
 drive-sync sync             # one run now
 drive-sync pause [--minutes N | --until-tomorrow]   # no flag: until resumed
 drive-sync resume           # end the pause and start a run
@@ -420,10 +447,13 @@ Every command but `setup`, `takeover`, `watchdog` and `accounts` takes
 `--account <id>` (`account1`...) as its first two arguments:
 `drive-sync settings --account account1 --interval 30`. Without it,
 `status`, `sync`, `pause` and `resume` act on every account, and the others
-on the only one (with several they ask for `--account`). With one account,
-`status` prints the same line as before; with several, one
-`<id>: <status>` line each. `status --json` describes the account that needs
-you most, and `sync`, `pause` and `resume --json` add `accounts`, one
+on the only one (with several they ask for `--account`). `open --account
+<id>` opens the window on that account; an id DriveSync does not list exits
+1 and names the ones it does. With one account,
+`status` prints the same line as before; from two on, one block per
+account: `<label> (<id>)`, then its line indented by two spaces.
+`status --json` describes the account that needs you most, `status --json
+--all` lists them all (`--all` needs `--json`), and `sync`, `pause` and `resume --json` add `accounts`, one
 `{"id", "ok", "error"}` each. `accounts --json` answers `{"ok", "error",
 "mode", "accounts": [{"id", "label", "folder", "configError"}],
 "moveBlocker", "notices"}`, plus `move` (`{"result", "reason"}`, the result
@@ -451,6 +481,17 @@ The JSON is version 2 of a fixed contract: `version`, `now`, `status`,
 (`start`, `end`, `outcome`), `currentRun` (`start`, `phase`), `nextRun`,
 `failingSince`, `typicalSeconds`, `conflicts`, `managed`, `paused` and
 `pausedUntil`. Times are Unix seconds, `0` when unknown.
+
+`status --json --all` is version 3: exactly `version` (3), `now`, `tone`
+(the worst account's), `worst` (that account's id), `canSyncNow` (true when
+any account can sync now) and `accounts`, in the resolver's order. Each
+account has exactly 21 keys: the 18 of version 2 besides `version` and
+`now`, plus `id`, `label` (what the window and the cards call it) and
+`folder` (its synced folder, an absolute path). With no account, an old
+drive-sync that was not taken over is one entry with an empty `id` and
+`managed` false; with nothing at all (no old log either) `accounts` is
+empty, `tone` is `error` and `worst` is empty. Plain `--json` stays version
+2, byte for byte, for an older widget.
 
 ## When the move to accounts stops
 

@@ -50,6 +50,8 @@ Popup {
         filtersPopup.reload()
         if (signedIn && !again) {
             field.forceActiveFocus()
+            // The tree is Settings' too: a first setup names no account.
+            folderTree.account = ""
             folderTree.reset([], "drive-sync:")
         }
     }
@@ -62,6 +64,7 @@ Popup {
             if (dialog.visible && !dialog.again) {
                 field.forceActiveFocus()
                 // DriveSync's own remote, before any config names it.
+                folderTree.account = ""
                 folderTree.reset([], "drive-sync:")
             }
         }
@@ -82,7 +85,8 @@ Popup {
         if (!canAccept)
             return
         if (again || !signedIn)
-            setupController.signIn()
+            // Again: the account shown, with its own remote.
+            setupController.signIn(dialog.again ? backend.accountId : "")
         else
             setupController.start(field.text.trim(), folderTree.skipped, filtersPopup.text())
     }

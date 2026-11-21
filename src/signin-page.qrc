@@ -1,0 +1,6 @@
+<RCC>
+    <qresource prefix="/">
+        <file alias="signin-page.html">signin-page.html</file>
+        <file alias="signin-logo.svg">../assets/icons/drive-sync.svg</file>
+    </qresource>
+</RCC>

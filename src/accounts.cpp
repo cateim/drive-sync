@@ -51,6 +51,9 @@ void applyAccountConfig(BackendPaths *paths, const QString &fallbackLog, const Q
     paths->drive = fallbackDrive;
 }
 
+// The base name of a folder, as a label for paths with no set around them.
+QString folderName(const QString &drive) { return QFileInfo(QDir::cleanPath(drive)).fileName(); }
+
 bool journalStuck(const QString &journal) {
     QFile file(journal);
     if (!file.open(QIODevice::ReadOnly))
@@ -76,6 +79,7 @@ AccountRoots AccountRoots::defaults() {
     roots.configRoot = home + "/.config/drive-sync";
     roots.stateRoot = home + "/.local/state/drive-sync-app";
     roots.userUnits = home + "/.config/systemd/user";
+    roots.home = home;
     BackendPaths &base = roots.base;
     base.log = home + "/.local/state/drive-sync.log";
     base.drive = home + "/Drive";
@@ -84,7 +88,10 @@ AccountRoots AccountRoots::defaults() {
     base.systemctl = QStandardPaths::findExecutable("systemctl");
     base.find = QStandardPaths::findExecutable("find");
     base.appState = roots.stateRoot;
-    base.self = QCoreApplication::applicationFilePath();
+    // "drive-sync open --account <id>" resolves before the window's
+    // application exists, and only compares ids: no program path then,
+    // rather than Qt's warning.
+    base.self = QCoreApplication::instance() ? QCoreApplication::applicationFilePath() : QString();
     return roots;
 }
 
@@ -131,6 +138,10 @@ AccountSet resolveAccounts(const AccountRoots &roots) {
             set.accounts << paths;
         }
     }
+    // Named only now: a label depends on every other account's folder.
+    const QList<BackendPaths> unlabelled = set.accounts;
+    for (BackendPaths &account : set.accounts)
+        account.label = accountLabel(account, unlabelled, roots.home);
     if (layout.staleConfig)
         set.notices << AccountNotice{"staleConfig", roots.configRoot + "/config.json"};
     // A journal nobody is working on (no live drive-sync holds the lock) is a
@@ -142,8 +153,29 @@ AccountSet resolveAccounts(const AccountRoots &roots) {
 }
 
 WindowAccount windowAccount(const AccountRoots &roots) {
+    const WindowAccounts window = windowAccounts(roots);
+    return {window.accounts.first(), window.notices};
+}
+
+WindowAccounts windowAccounts(const AccountRoots &roots) {
     const AccountSet set = resolveAccounts(roots);
-    return {set.accounts.isEmpty() ? noAccountPaths(roots) : set.accounts.first(), set.notices};
+    return {set.accounts.isEmpty() ? QList<BackendPaths>{noAccountPaths(roots)} : set.accounts, set.notices};
+}
+
+OpenChoice chooseOpenAccount(const QStringList &afterOpen, const AccountSet &set) {
+    QStringList rest = afterOpen;
+    QString id;
+    if (!takeAccountOption(&rest, &id))
+        return {QString(), "usage: drive-sync open [--account <id>]"};
+    if (id.isEmpty())
+        return {};
+    QStringList ids;
+    for (const BackendPaths &account : set.accounts) {
+        if (account.id == id)
+            return {id, QString()};
+        ids << account.id;
+    }
+    return {QString(), QString("no account %1; accounts: %2").arg(id, ids.isEmpty() ? QString("none") : ids.join(", "))};
 }
 
 BackendPaths newAccountPaths(const AccountRoots &roots, const QString &id) {
@@ -154,6 +186,7 @@ BackendPaths newAccountPaths(const AccountRoots &roots, const QString &id) {
     paths.managed = false;
     if (const auto config = loadSyncConfig(paths.config, nullptr))
         applySyncConfig(&paths, *config);
+    paths.label = folderName(paths.drive);
     return paths;
 }
 
@@ -168,6 +201,7 @@ BackendPaths noAccountPaths(const AccountRoots &roots) {
     paths.stateRoot = roots.stateRoot;
     paths.accountsMode = false;
     paths.managed = false;
+    paths.label = folderName(paths.drive);
     return paths;
 }
 
@@ -180,8 +214,9 @@ QString accountLabel(const BackendPaths &account, const QList<BackendPaths> &all
             shared = true;
     if (!shared)
         return name;
+    // Roots built by hand have no home: the absolute path then.
     const QString cleanHome = QDir::cleanPath(home);
-    if (folder.startsWith(cleanHome + "/"))
+    if (!cleanHome.isEmpty() && folder.startsWith(cleanHome + "/"))
         return folder.mid(cleanHome.size() + 1);
     return folder;
 }

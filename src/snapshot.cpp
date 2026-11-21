@@ -1,5 +1,7 @@
 #include "snapshot.h"
 
+#include <QDir>
+#include <QFileInfo>
 #include <QJsonArray>
 #include <QTimeZone>
 #include <algorithm>
@@ -120,12 +122,10 @@ namespace {
 
 qint64 unixOrZero(const QDateTime &when) { return when.isValid() ? when.toSecsSinceEpoch() : 0; }
 
-}  // namespace
-
-QJsonObject snapshotToJson(const Snapshot &s, const QDateTime &nextRun, const QDateTime &now) {
+// The keys version 2 and each account of version 3 share, built once so the
+// two contracts cannot drift apart.
+QJsonObject sharedKeys(const Snapshot &s, const QDateTime &nextRun) {
     return {
-        {"version", 2},
-        {"now", unixOrZero(now)},
         {"status", s.summary.status},
         {"tone", s.tone},
         {"causeKind", s.summary.causeKind},
@@ -148,6 +148,24 @@ QJsonObject snapshotToJson(const Snapshot &s, const QDateTime &nextRun, const QD
         {"paused", s.paused},
         {"pausedUntil", unixOrZero(s.pausedUntil)},
     };
+}
+
+}  // namespace
+
+QJsonObject snapshotToJson(const Snapshot &s, const QDateTime &nextRun, const QDateTime &now) {
+    QJsonObject object = sharedKeys(s, nextRun);
+    object.insert("version", 2);
+    object.insert("now", unixOrZero(now));
+    return object;
+}
+
+QJsonObject accountToJson(const Snapshot &s, const BackendPaths &account, const QDateTime &nextRun) {
+    const QString folder = QDir::cleanPath(account.drive);
+    QJsonObject object = sharedKeys(s, nextRun);
+    object.insert("id", account.id);
+    object.insert("label", account.label.isEmpty() ? QFileInfo(folder).fileName() : account.label);
+    object.insert("folder", folder);
+    return object;
 }
 
 QString toneFor(const QString &status) {

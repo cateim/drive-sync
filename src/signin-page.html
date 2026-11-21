@@ -1,0 +1,121 @@
+<!doctype html>
+<!--
+  The page rclone shows when Google sends the browser back to
+  http://127.0.0.1:53682/ during "drive-sync signin". rclone renders it with
+  Go's html/template, so double braces are its actions (never write them in
+  this comment, which rclone parses too) and the error fields come out
+  escaped. DriveSync fills the at-sign markers with translated, escaped text
+  before it hands the file to rclone (signInPage in signin.cpp). rclone shows
+  it as soon as Google answers, before it trades the code for a token, so the
+  success text never says the sign-in is done: DriveSync shows that.
+  Nothing here loads from the network.
+-->
+<html lang="@LANG@">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DriveSync</title>
+<style>
+:root {
+  --bg: #101010;
+  --surface: #181818;
+  --line: #2c2c2c;
+  --text: #f5f1e8;
+  --muted: #a8a49b;
+  --accent: #82fb9c;
+  --danger: #ff8f8f;
+  --code: #0a0a0a;
+  --radius: 12px;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f7f5f0;
+    --surface: #ffffff;
+    --line: #dedad0;
+    --text: #1a1a1a;
+    --muted: #5e5a52;
+    --accent: #1f9d46;
+    --danger: #b3261e;
+    --code: #efece4;
+  }
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  height: 100%;
+}
+body {
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px 16px;
+  background: var(--bg);
+  color: var(--text);
+  font: 16px/1.65 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+main {
+  width: 100%;
+  max-width: 440px;
+  padding: 32px 28px;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  text-align: center;
+}
+.logo svg {
+  width: 96px;
+  height: 96px;
+}
+/* The green check says it worked, so the error page shows the bare cloud:
+   the badge is the circles and path right under the drawing's group, while the
+   cloud's own circles sit in defs and are drawn through use. */
+.logo.failed svg > g > circle,
+.logo.failed svg > g > path {
+  display: none;
+}
+h1 {
+  margin: 12px 0 8px;
+  font-size: 1.35rem;
+  line-height: 1.3;
+}
+h1.error {
+  color: var(--danger);
+}
+p {
+  margin: 0 0 8px;
+  color: var(--muted);
+}
+code {
+  display: block;
+  margin: 16px 0 0;
+  padding: 12px 14px;
+  background: var(--code);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  font: 0.85em/1.5 ui-monospace, "JetBrains Mono", "Cascadia Code", Menlo, monospace;
+  text-align: left;
+  overflow-wrap: anywhere;
+}
+</style>
+</head>
+<body>
+<main>
+<div class="logo{{if not .OK}} failed{{end}}">@LOGO@</div>
+{{if .OK}}
+<h1>@OK_TITLE@</h1>
+<p>@OK_TEXT@</p>
+<p>@CLOSE_TAB@</p>
+{{else}}
+<h1 class="error">@ERROR_TITLE@</h1>
+<p>@ERROR_TEXT@</p>
+<code>{{.Name}}{{if .Description}}: {{.Description}}{{end}}</code>
+{{end}}
+</main>
+</body>
+</html>

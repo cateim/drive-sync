@@ -12,7 +12,7 @@ class QProcess;
 // window. Cancelling sends SIGTERM to "drive-sync signin" alone: it stops the
 // rclone that waits for the browser on port 53682 and removes the half-made
 // remote itself, and "drive-sync signin --abandon" runs after it as a
-// fallback. The browser is never signalled.
+// fallback, for a first setup's sign-in only. The browser is never signalled.
 class SetupController : public QObject {
     Q_OBJECT
     // "idle" | "signingIn" | "signedIn" | "settingUp" | "failed" (the sign-in
@@ -35,7 +35,9 @@ public:
     QString folder() const { return m_folder; }
     QString link() const { return m_link; }
 
-    Q_INVOKABLE void signIn();
+    // account: "signin --account <id>" to sign in again for that account;
+    // empty for a first setup, which makes DriveSync's own remote.
+    Q_INVOKABLE void signIn(const QString &account = QString());
     // Only a sign-in waiting for the browser can be cancelled; a setup takes
     // seconds and stopping it halfway would leave a config with no fix.
     Q_INVOKABLE void cancel();
@@ -63,6 +65,8 @@ private:
     QString m_detail;
     QString m_folder;
     QString m_link;
+    // The account the running sign-in is for; empty for a first setup's.
+    QString m_signInAccount;
     QProcess *m_child = nullptr;
     QByteArray m_output;  // what the running child printed so far
 };

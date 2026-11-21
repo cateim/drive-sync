@@ -6,6 +6,7 @@ TEMPLATE = app
 
 HEADERS += \
     src/accountmove.h \
+    src/accountlist.h \
     src/accounts.h \
     src/backend.h \
     src/blockeddeletes.h \
@@ -43,6 +44,7 @@ HEADERS += \
 SOURCES += \
     src/main.cpp \
     src/accountmove.cpp \
+    src/accountlist.cpp \
     src/accounts.cpp \
     src/backend.cpp \
     src/blockeddeletes.cpp \
@@ -77,7 +79,7 @@ SOURCES += \
     src/theme.cpp \
     src/translator.cpp
 
-RESOURCES += src/resources.qrc
+RESOURCES += src/resources.qrc src/signin-page.qrc
 
 # The Google OAuth client is compiled in only from the git-ignored
 # src/oauthclient.local.h (see src/oauthclient.local.h.example); without it

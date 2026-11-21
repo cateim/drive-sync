@@ -2,6 +2,7 @@
 
 #include <QList>
 #include <QObject>
+#include <QSet>
 #include <QString>
 #include <QStringList>
 
@@ -29,6 +30,9 @@ class SettingsController : public QObject {
     Q_PROPERTY(QStringList skipped READ skipped NOTIFY changed)
     // The selective-sync block cannot be read (edited by hand): why.
     Q_PROPERTY(QString skipError READ skipError NOTIFY changed)
+    // The account every command names ("--account <id>" right after
+    // "settings"); empty names none (the view with no account).
+    Q_PROPERTY(QString account READ account WRITE setAccount NOTIFY changed)
 
 public:
     explicit SettingsController(const QString &program, QObject *parent = nullptr);
@@ -45,6 +49,8 @@ public:
     QString filters() const { return m_filters; }
     QStringList skipped() const { return m_skipped; }
     QString skipError() const { return m_skipError; }
+    QString account() const { return m_account; }
+    void setAccount(const QString &account);
 
     Q_INVOKABLE void load();
     Q_INVOKABLE void setInterval(int minutes);
@@ -71,6 +77,7 @@ private:
     void finished(const QStringList &arguments, const QByteArray &output);
 
     QString m_program;
+    QString m_account;
     QString m_state = "idle";
     QString m_error;
     bool m_saved = false;
@@ -81,5 +88,7 @@ private:
     QStringList m_skipped;
     QList<Pending> m_queue;
     QProcess *m_child = nullptr;
-    bool m_fixStarted = false;
+    // The accounts whose save started a fix that was not reported yet: the
+    // fix is reported at the last change of that account's own save.
+    QSet<QString> m_fixStarted;
 };

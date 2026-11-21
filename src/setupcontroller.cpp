@@ -25,19 +25,26 @@ SetupController::~SetupController() {
     m_child->setParent(nullptr);
 }
 
-void SetupController::signIn() {
+void SetupController::signIn(const QString &account) {
     if (m_state == "signingIn" || m_state == "settingUp")
         return;
     m_state = "signingIn";
     m_detail.clear();
+    m_signInAccount = account;
     emit changed();
-    run({"signin", "--json"});
+    // Again: the account's own remote. A first setup names none.
+    if (account.isEmpty())
+        run({"signin", "--json"});
+    else
+        run({"signin", "--account", account, "--json"});
 }
 
 void SetupController::cancel() {
     if (m_state != "signingIn")
         return;
-    stopSignIn(true);
+    // "signin --abandon" removes a half-made first-setup remote; after a
+    // sign-in again the remote is the account's, and stays.
+    stopSignIn(m_signInAccount.isEmpty());
     m_state = "idle";
     m_detail.clear();
     m_link.clear();

@@ -11,6 +11,7 @@
 #include <QTextStream>
 #include <QUrl>
 
+#include "accountlist.h"
 #include "accountmove.h"
 #include "accounts.h"
 #include "backend.h"
@@ -88,8 +89,15 @@ int main(int argc, char *argv[]) {
                     return runFixCommand(rest, paths, out, err);
                 if (command == "deletes")
                     return runDeletesCommand(rest, paths, out, err);
-                if (command == "signin")
-                    return runSignInCommand(rest, paths, SignInTools::defaults(), out, err);
+                if (command == "signin") {
+                    // The page the browser shows after Google is read by a
+                    // person, in the Omarchy language, like the cards.
+                    Translator translator;
+                    app.installTranslator(&translator);
+                    SignInTools tools = SignInTools::defaults();
+                    tools.language = translator.language();
+                    return runSignInCommand(rest, paths, tools, out, err);
+                }
                 // With nothing configured, setup writes account1 in the
                 // accounts layout.
                 if (command == "setup")
@@ -102,7 +110,14 @@ int main(int argc, char *argv[]) {
                     // The cards are read by a person, in the Omarchy language.
                     Translator translator;
                     app.installTranslator(&translator);
-                    const NotifierPaths tools = NotifierPaths::defaults(Translator::formatLocale(translator.language()));
+                    NotifierPaths tools = NotifierPaths::defaults(Translator::formatLocale(translator.language()));
+                    // The bare 5.1 titles go once, and only with one account:
+                    // each is part of every account's labelled title, so with
+                    // two it would close both. The watchdog decides it after
+                    // its own resolve.
+                    if (command != "watchdog")
+                        tools.bareTitlesMark =
+                            set.accounts.size() == 1 ? paths.globalState() + "/notify-bare-titles.done" : QString();
                     const QDateTime now = QDateTime::currentDateTimeUtc();
                     if (command == "notify")
                         return runNotifyCommand(qEnvironmentVariable("SERVICE_RESULT"), paths, tools, now);
@@ -140,6 +155,21 @@ int main(int argc, char *argv[]) {
         QTextStream(stderr) << usageText();
         return 1;
     }
+    // "open --account <id>" opens the window on that account. Checked before
+    // the window exists, so a wrong id fails at once, with no display, and
+    // with chooseAccounts' words, as every command that takes --account.
+    QString openAccount;
+    if (command == "open") {
+        QStringList afterOpen;
+        for (int i = 2; i < argc; ++i)
+            afterOpen << QString::fromLocal8Bit(argv[i]);
+        const OpenChoice choice = chooseOpenAccount(afterOpen, resolveAccounts(AccountRoots::defaults()));
+        if (!choice.error.isEmpty()) {
+            QTextStream(stderr) << "drive-sync: " << choice.error << "\n";
+            return 1;
+        }
+        openAccount = choice.id;
+    }
 
     QGuiApplication app(argc, argv);
     app.setApplicationName("drive-sync");
@@ -160,18 +190,24 @@ int main(int argc, char *argv[]) {
     Theme theme;
     // Clock times show 12 or 24 hours like the clock on the Omarchy bar.
     ClockFormat clockFormat;
-    // The window shows the account the resolver gives and follows it: a first
-    // setup, a takeover or the move to account1 needs no restart.
+    // One Backend per account the resolver lists, and the one the window
+    // shows; it follows the resolver, so a first setup, a takeover, the move
+    // to account1 or an account added or gone needs no restart.
     const AccountRoots roots = AccountRoots::defaults();
-    Backend backend(windowAccount(roots).paths);
-    backend.setResolver([roots] { return windowAccount(roots); });
-    // The window looks for an old drive-sync next to accounts in this home.
-    backend.setOldDriveSyncCheck(oldDriveSyncCheck(TakeoverPaths::defaults()));
+    const OldDriveSyncCheck oldDriveSync = oldDriveSyncCheck(TakeoverPaths::defaults());
+    AccountList accountList([roots] { return windowAccounts(roots); }, [oldDriveSync](const BackendPaths &paths) {
+        auto *backend = new Backend(paths);
+        // Each window Backend looks for an old drive-sync next to accounts.
+        backend->setOldDriveSyncCheck(oldDriveSync);
+        return backend;
+    });
+    if (!openAccount.isEmpty())
+        accountList.selectId(openAccount);
     // The move to account1, in a child, when there is something to move or a
     // journal to roll back; the watchdog and "drive-sync accounts --migrate"
-    // start it too.
+    // start it too. Once, whatever the number of accounts.
     if (readAccountLayout(roots.configRoot).mode == "legacy" || moveInProgress(roots.stateRoot))
-        backend.startMove();
+        accountList.current()->startMove();
     // Links the bar widget shipped in the package; enabling it waits for the user.
     PluginSetup pluginSetup;
     pluginSetup.check();
@@ -192,7 +228,13 @@ int main(int argc, char *argv[]) {
     engine.rootContext()->setContextProperty("translator", &translator);
     engine.rootContext()->setContextProperty("theme", &theme);
     engine.rootContext()->setContextProperty("clockFormat", &clockFormat);
-    engine.rootContext()->setContextProperty("backend", &backend);
+    // QML reads the account shown as "backend": moved to the selected one,
+    // connected before the load so it runs before QML's own handlers.
+    engine.rootContext()->setContextProperty("accountList", &accountList);
+    engine.rootContext()->setContextProperty("backend", accountList.current());
+    QObject::connect(&accountList, &AccountList::selectedChanged, &engine, [&engine, &accountList] {
+        engine.rootContext()->setContextProperty("backend", accountList.current());
+    });
     engine.rootContext()->setContextProperty("pluginSetup", &pluginSetup);
     engine.rootContext()->setContextProperty("takeoverSetup", &takeoverSetup);
     engine.rootContext()->setContextProperty("setupController", &setupController);

@@ -620,7 +620,7 @@ int runAccountsCommand(const QStringList &arguments, const AccountRoots &roots, 
         QJsonArray accounts;
         for (const BackendPaths &account : set.accounts)
             accounts.append(QJsonObject{{"id", account.id},
-                                        {"label", accountLabel(account, set.accounts, QDir::homePath())},
+                                        {"label", account.label},
                                         {"folder", account.drive},
                                         {"configError", accountConfigError(account)}});
         QJsonArray notices;
@@ -640,8 +640,7 @@ int runAccountsCommand(const QStringList &arguments, const AccountRoots &roots, 
     }
     out << "mode: " << set.mode << "\n";
     for (const BackendPaths &account : set.accounts)
-        out << account.id << "  " << accountLabel(account, set.accounts, QDir::homePath()) << "  " << account.drive
-            << "\n";
+        out << account.id << "  " << account.label << "  " << account.drive << "\n";
     for (const AccountNotice &notice : set.notices)
         out << notice.kind << ": " << notice.path << "\n";
     if (move)

@@ -35,6 +35,9 @@ struct AccountRoots {
     // drive-sync.sh's state folder, /proc, systemctl, find, appState (the
     // state root) and this program.
     BackendPaths base;
+    // The user's home, under which a label shows a folder's path when two
+    // accounts' folders share a name. Empty in roots built by hand.
+    QString home{};
 
     static AccountRoots defaults();
 };
@@ -75,6 +78,27 @@ struct WindowAccount {
 };
 
 WindowAccount windowAccount(const AccountRoots &roots);
+
+// Every account the window can show, in the resolver's order (the view with
+// no account alone when there is none), and the notices about the set.
+// windowAccount() is the first of them.
+struct WindowAccounts {
+    QList<BackendPaths> accounts;
+    QList<AccountNotice> notices;
+};
+
+WindowAccounts windowAccounts(const AccountRoots &roots);
+
+// The account "drive-sync open --account <id>" opens the window on. The
+// option is taken only as the first two arguments (takeAccountOption), so
+// Qt's own options (-platform offscreen) leave id empty and no error. An id
+// the set does not list, or --account with no id, is an error.
+struct OpenChoice {
+    QString id;
+    QString error;
+};
+
+OpenChoice chooseOpenAccount(const QStringList &afterOpen, const AccountSet &set);
 
 // The paths a new account <id> gets in the accounts layout (first setup):
 // its config, state folder and log, whether or not the config exists yet.

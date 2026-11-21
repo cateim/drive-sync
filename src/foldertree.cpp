@@ -51,6 +51,13 @@ QStringList FolderTree::reticked() const {
     return found;
 }
 
+void FolderTree::setAccount(const QString &account) {
+    if (account == m_account)
+        return;
+    m_account = account;
+    emit changed();
+}
+
 void FolderTree::reset(const QStringList &skipped, const QString &remote) {
     stopChildren();
     m_remote = remote;
@@ -95,6 +102,9 @@ void FolderTree::load(const QString &path) {
     if (m_children.contains(path))
         return;
     QStringList arguments{"folders"};
+    // Right after the command: takeAccountOption reads only the first two.
+    if (!m_account.isEmpty())
+        arguments << "--account" << m_account;
     if (!m_remote.isEmpty())
         arguments << "--remote" << m_remote;
     arguments << "--json";
